@@ -29,6 +29,23 @@ int main() {
     put(osd+0x6a8,0); assert(motorstorm_keyboard_context()==MAC_KEYBOARD_CONTEXT_GAMEPLAY);
     put(osd+0x6a8,2); assert(motorstorm_keyboard_context()==MAC_KEYBOARD_CONTEXT_PAUSE);
     put(osd+0x6a8,4); assert(motorstorm_keyboard_context()==MAC_KEYBOARD_CONTEXT_FRONTEND);
+    // The race's outer FSM remains in state 5 at the results menu.
+    // A held driving key must not select an item as that menu appears.
+    MacKeyboardContext previous=MAC_KEYBOARD_CONTEXT_GAMEPLAY;
+    uint64_t keys[2]={0,UINT64_C(1)<<(125-64)}, blocked[2]={0,0};
+    put(osd+0x6a8,7);
+    auto context=static_cast<MacKeyboardContext>(motorstorm_keyboard_context());
+    assert(context==MAC_KEYBOARD_CONTEXT_FRONTEND);
+    mac_keyboard_context_transition(context,&previous,keys,blocked);
+    auto pad=mac_keyboard_pad_state(keys[0]&~blocked[0],keys[1]&~blocked[1],context);
+    assert(pad.buttons==0);
+    keys[1]=0; mac_keyboard_context_transition(context,&previous,keys,blocked);
+    keys[0]=UINT64_C(1)<<36; keys[1]=UINT64_C(1)<<(125-64);
+    mac_keyboard_context_transition(context,&previous,keys,blocked);
+    pad=mac_keyboard_pad_state(keys[0]&~blocked[0],keys[1]&~blocked[1],context);
+    assert((pad.buttons&0x4040)==0x4040); // Down navigates, Enter confirms.
+    assert(!(pad.buttons&0x0300));       // Neither driving trigger is sent.
+    put(osd+0x6a8,0); assert(motorstorm_keyboard_context()==MAC_KEYBOARD_CONTEXT_GAMEPLAY);
     put(machine,8); assert(motorstorm_keyboard_context()==MAC_KEYBOARD_CONTEXT_FRONTEND);
     put(machine,5); put(osd,0); assert(motorstorm_keyboard_context()==MAC_KEYBOARD_CONTEXT_UNKNOWN);
     put(osd,0x100e7640); put(0x1013b584,0xfffffff0);
@@ -42,5 +59,5 @@ int main() {
     put(wrapper,machine); put(0x1013b5e4,0xfffffff0); assert(motorstorm_keyboard_context()==MAC_KEYBOARD_CONTEXT_UNKNOWN);
     put(0x1013b5e4,server); ppu_vm_size=0x10000; assert(motorstorm_keyboard_context()==MAC_KEYBOARD_CONTEXT_UNKNOWN);
     munmap(vm_base,UINT64_C(1)<<32);
-    std::puts("keyboard context: race/pause/resume/confirmation, high guest addresses and bounds guards passed");
+    std::puts("keyboard context: race/pause/results/retry, held keys, confirmation and bounds guards passed");
 }

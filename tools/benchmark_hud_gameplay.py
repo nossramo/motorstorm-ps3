@@ -14,6 +14,9 @@ p.add_argument('--lead-in', type=float, default=2)
 p.add_argument('--seconds', type=int, default=240)
 p.add_argument('--cancel-menu-on-hud', action='store_true',
                help='Cancel remaining menu-script presses after the first racing HUD; require native acknowledgement')
+p.add_argument('--menu-script',
+    default='5:0x4000,15:0x4000,25:0x4000,35:0x4000,45:0x4000,49:0x4000,53:0x4000,57:0x20,61:0x20,65:0x4000,80:0x4000,100:0x4000',
+    help='Timed PS3 button presses before HUD detection; use confirm-only for repeatable default vehicle selection')
 p.add_argument('--race-time-min', type=float, help='Arm only after this OCR-verified race-clock time')
 p.add_argument('--race-time-tolerance', type=float, default=1.5,
                help='Reject a race-time gate overshoot larger than this many seconds')
@@ -50,7 +53,7 @@ for key in ('PAD_CLOCK', 'PAD_AUTOPRESS', 'PAD_STICK', 'PAD_SWEEP', 'PAD_SCRIPT_
     env.pop(key, None)
 env.update(PS3_FTRACE=f'{a.lead_in}:{a.duration}:{out}/trace.txt',
     PS3_FTRACE_TRIGGER=str(trigger), PS3_FTRACE_MIN_US='0', PAD_FILE=str(pad),
-    PAD_SCRIPT='5:0x4000,15:0x4000,25:0x4000,35:0x4000,45:0x4000,49:0x4000,53:0x4000,57:0x20,61:0x20,65:0x4000,80:0x4000,100:0x4000',
+    PAD_SCRIPT=a.menu_script,
     PS3RECOMP_METAL_FRAME_DUMP=str(out/'current.ppm'),
     PS3RECOMP_METAL_FRAME_DUMP_EVERY='15',
     PS3RECOMP_METAL_FRAME_DUMP_PAUSE_DURING_TRACE='1')

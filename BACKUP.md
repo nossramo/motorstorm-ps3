@@ -58,7 +58,22 @@ Generation also restores the manually authored job-wait wrapper with
 `tools/patch_job_wait.py`. That tool stores the wrapper and an expected
 fingerprint, not the original game function. It refuses to patch an unexpected
 function. The SPU overlays and policy are also generated from the local game.
+`tools/build_port.sh` additionally generates the three checked Multistream DSP
+overlays with `tools/lift_motorstorm_audio.py`. The generator and authored NEON
+helpers are preserved; generated DSP code, its byte signatures and audio replay
+captures are excluded. Replay tests require the matching local captures under
+`logs/`, while the conversion and runtime handoff tests use synthetic inputs.
+The build also invokes `tools/specialize_audio_worker.py` to regenerate four
+checked Multistream loop replacements in ignored `build/`. The authored
+generator, `port/spu_audio_worker.h` and differential replay harness are backed
+up; the specialized game source and its input snapshots are not.
 Existing installations and saved state under `gamedata/` are not backed up.
+
+The runtime patch also preserves the compact Metal B8 initialization path and
+the optional fast SPU dispatch checks, with synthetic GPU/dispatcher regression
+tests. `tools/test_surface_gpu_seed.sh`, `tools/test_dispatch_checks.sh` and
+`tools/profile_manual_gameplay.py` are authored source. Their local gameplay
+profiles, executable snapshots and Instruments traces under `logs/` are excluded.
 
 All 91 changed/new runtime files were restored byte-for-byte in a temporary
 directory from upstream source plus the patch. The wait wrapper was also

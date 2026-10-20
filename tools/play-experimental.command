@@ -25,6 +25,8 @@ export RSX_FP_CACHED_SIZE="${RSX_FP_CACHED_SIZE:-1}"
 export RSX_FP_RELOCATE_CACHE="${RSX_FP_RELOCATE_CACHE:-1}"
 # Initialize linear ARGB/B8 surfaces using their actual guest format and pitch.
 export RSX_SURFACE_TYPED_SEED="${RSX_SURFACE_TYPED_SEED:-1}"
+# Expand compact B8 rows on Metal, in order before the first consumer.
+export RSX_SURFACE_GPU_SEED="${RSX_SURFACE_GPU_SEED:-1}"
 # Exact ARM64 arithmetic for the signature-checked culling block.
 export MOTORSTORM_CULL_FAST_BOUNDS="${MOTORSTORM_CULL_FAST_BOUNDS:-1}"
 # Ignore unused texture dimensions when identifying a fragment pipeline.

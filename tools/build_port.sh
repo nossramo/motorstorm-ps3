@@ -2,6 +2,9 @@
 set -eu
 cd "$(dirname "$0")/.."
 export DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}"
+if [ -f game/PS3_GAME/USRDIR/EBOOT.elf ] && [ -d port/spu ]; then
+  python3 tools/lift_motorstorm_audio.py
+fi
 cmake -S port -B build/game -G Ninja \
   -DPS3RECOMP_DIR="$PWD/vendor/ps3recomp" -DCMAKE_BUILD_TYPE=Release \
   -DPS3RECOMP_FFMPEG_RUNTIME=ON

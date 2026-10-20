@@ -170,7 +170,7 @@ elseif(PORT_ENABLE_SPU)
              "${PS3RECOMP_DIR}/runtime/spu/spu_dispatch_mt.c")
         # Generated beside the lift; each is present only once its generator
         # has been run, so each is included only if it is actually here.
-        foreach(gen IN ITEMS spu_workloads.c jobmods_register.c taskset_policy_bytes.c wws_policy_register.c)
+        foreach(gen IN ITEMS spu_workloads.c jobmods_register.c taskset_policy_bytes.c wws_policy_register.c motorstorm_audio_register.c)
             if(EXISTS "${SPU_DIR}/${gen}")
                 list(APPEND SPU_SOURCES "${SPU_DIR}/${gen}")
             else()
@@ -220,6 +220,23 @@ if(SEMAPHORE_ORIGINAL IN_LIST SPU_SOURCES)
     list(APPEND SPU_SOURCES "${SEMAPHORE_SPECIALIZED}")
 endif()
 
+set(AUDIO_WORKER_IMAGE "spu_1136862334bb6208f794040f3a7f26e4991cd6b00eac6229331432566f1535d1")
+set(AUDIO_WORKER_ORIGINAL "${SPU_DIR}/${AUDIO_WORKER_IMAGE}/spu_recomp.c")
+if(AUDIO_WORKER_ORIGINAL IN_LIST SPU_SOURCES AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    set(AUDIO_WORKER_SPECIALIZED "${CMAKE_CURRENT_BINARY_DIR}/spu_audio_worker.c")
+    add_custom_command(OUTPUT "${AUDIO_WORKER_SPECIALIZED}"
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../tools/specialize_audio_worker.py"
+            --generate "${AUDIO_WORKER_SPECIALIZED}"
+        DEPENDS "${AUDIO_WORKER_ORIGINAL}" "${SPU_DIR}/${AUDIO_WORKER_IMAGE}/code.bin"
+            "${SPU_DIR}/${AUDIO_WORKER_IMAGE}/functions.json"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../tools/specialize_audio_worker.py"
+            "${PS3RECOMP_DIR}/tools/spu_lifter.py" "${PS3RECOMP_DIR}/tools/spu_disasm.py"
+        VERBATIM)
+    list(REMOVE_ITEM SPU_SOURCES "${AUDIO_WORKER_ORIGINAL}")
+    list(APPEND SPU_SOURCES "${AUDIO_WORKER_SPECIALIZED}")
+endif()
+
 add_executable(${PROJECT_NAME}
     main.cpp
     gpu_read_sync.cpp
@@ -249,6 +266,25 @@ if(SPU_SOURCES)
     endif()
 endif()
 
+# Only the measured audio image and its checked DSP overlays use these exact
+# NEON conversions. Other workloads and the interpreter keep the reference.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
+    foreach(audio_image IN ITEMS
+        spu_1136862334bb6208f794040f3a7f26e4991cd6b00eac6229331432566f1535d1
+        motorstorm_audio_dsp motorstorm_audio_2FEF0 motorstorm_audio_32770)
+        set(audio_source "${SPU_DIR}/${audio_image}/spu_recomp.c")
+        if(audio_source IN_LIST SPU_SOURCES)
+            set_property(SOURCE "${audio_source}" APPEND PROPERTY
+                COMPILE_OPTIONS "-include;${CMAKE_CURRENT_SOURCE_DIR}/spu_audio_conversions.h")
+        endif()
+    endforeach()
+endif()
+
+# The checked audio worker also uses shared, exact ARM64 arithmetic helpers.
+if(AUDIO_WORKER_SPECIALIZED)
+    set_property(SOURCE "${AUDIO_WORKER_SPECIALIZED}" APPEND PROPERTY
+        INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR};${SPU_DIR}/${AUDIO_WORKER_IMAGE}")
+endif()
 # Opt-in diagnostic; normal builds retain exact SPU arithmetic.
 if(MOTORSTORM_CULL_SCOPE)
     set_property(SOURCE "${CULL_SPECIALIZED}" APPEND PROPERTY

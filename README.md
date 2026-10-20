@@ -10,8 +10,10 @@ The user confirmed audible game audio after the repair. The existing SDL/CoreAud
 output was opening correctly, but the Multistream SPU task terminated on a call
 into runtime-loaded DSP code at LS `0x2F810`. Both launchers now enable
 `SPU_INTERP_UNLIFTED=1` through `tools/play.command`: those unlifted overlays run
-through the existing interpreter and return to compiled SPU code. This is still
-a compatibility path, not a claim that all audio code is native ARM64.
+through the existing interpreter and return to compiled SPU code. The three
+measured processing entries now have checked native bodies (see below); small
+initializers and unknown overlays retain this compatibility path. This is not
+a claim that all audio code is native ARM64.
 `SPU_INTERP_UNLIFTED=0` explicitly disables the fallback.
 
 Audio output queries also used incorrect guest struct layouts, making the game
@@ -25,14 +27,333 @@ Configure/GetConfiguration/GetState now agree on the selected LPCM mode.
 passes afterward. Two bounded runs are saved locally under `logs/audio-01` and
 `logs/audio-02`. The first had silent output and a terminated audio worker.
 The fallback-enabled run produced nonzero stereo samples through CoreAudio,
-and the user confirmed hearing sound. Extended race coverage and the audio
-fallback's performance cost have not been measured.
+and the user confirmed hearing sound. Subsequent race checks found audible
+dropouts: output is not yet correct throughout gameplay.
+
+The stereo mixer now follows [RPCS3's 7.1 channel matrix](https://github.com/RPCS3/rpcs3/blob/master/rpcs3/Emu/Audio/AudioBackend.h) and preserves floating
+point headroom until host output; `sh tools/test_audio_ring.sh` checks those
+properties and ring wraparound. This does **not** resolve all race audio gaps.
+In the visually verified run under `logs/keyboard-context-05`, later gameplay
+windows contain roughly 28–36% entirely zero audio blocks while the host
+consumes approximately 187.5 blocks/second (48 kHz). These are observations of
+missing guest PCM, not proof of a particular SPU or synchronization cause.
+The four-second gameplay sample under `logs/audio-race-profile-06` finds
+246 of 568 samples of the Multistream worker inside the SPU interpreter;
+this is a sampled worker breakdown, not a percentage of total frame time.
+Producer timing still needs investigation before claiming a complete audio fix.
+An experimental stereo-only capability report in `logs/audio-race-stereo-07`
+made the game select two output channels, but comparable five-second race
+windows still contained about 47–58% zero blocks (46–60% in run 06).
+It did not resolve the gaps and was removed from the implementation. The
+sampling interval itself perturbs timing and is excluded from that comparison.
+
+### Race audio: checked native DSP processing
+
+Further source comparison covered [ps3recomp's porting guide](https://github.com/sp00nznet/ps3recomp/blob/master/docs/GAME_PORTING_GUIDE.md),
+[the Scott Pilgrim port](https://github.com/sp00nznet/scottpilgrim),
+[RPCS3's SPU compiler](https://github.com/RPCS3/rpcs3/blob/master/rpcs3/Emu/Cell/SPULLVMRecompiler.cpp)
+and [its cellAudio producer/output timing](https://github.com/RPCS3/rpcs3/blob/master/rpcs3/Emu/Cell/Modules/cellAudio.cpp).
+These provide useful implementation patterns, not a finished MotorStorm audio
+replacement. RPCS3 compiles SPU code and verifies code identity; this port uses
+ahead-of-time compilation from the user's local executable, with whole-code
+checks before entering each native DSP overlay. No RPCS3 implementation was
+copied into the runtime.
+
+The fallback was also crossing a live caller's return address (`0x4140`), which
+is not itself a registered function entry. This could interpret the caller's
+continuation and execute it again on the native stack. The fallback now stops
+at the actual link/active drain boundary and resumes interpreted continuations
+after native helper calls. All 17 cases in
+`python3 vendor/ps3recomp/tools/test_spu_interpreter_handoff.py` pass, including
+the newly added high-local-store return/rejoin regressions.
+
+`tools/lift_motorstorm_audio.py`, invoked by `tools/build_port.sh`, now generates
+three native Multistream overlays at LS `0x30720`, `0x2FEF0` and `0x32770`.
+Generation rejects an unexpected EBOOT hash. Runtime dispatch checks the image,
+entry, policy mode and **every code byte** of the respective loaded overlay;
+unknown versions/placements retain the interpreter. `MOTORSTORM_NATIVE_AUDIO=0`
+disables these native bodies for diagnosis; `MOTORSTORM_AUDIO_TRACE=1` reports
+their first verified dispatch. Generated code and signatures remain ignored
+under `port/spu/`, and are not source-backup content.
+
+`sh tools/test_audio_dsp.sh logs/audio-dsp-capture-13` replays local inputs and
+DMA/channel transcripts without booting the game. All 128 registers, all
+256 KiB of local store, return PC/status and channel operations match the
+captured reference for all three processing entries. Identity/mutation guards
+are checked too. The latest isolated `0x30720` replay measured **2.035 ms in
+the interpreter versus 0.292 ms native** over 100 calls, including transcript
+checks. These are per-call timings, not whole-game FPS or an audio deadline.
+Captures contain game data and remain local under ignored `logs/`.
+
+The sampled native audio worker also spent time in scalar number conversions.
+`port/spu_audio_conversions.h` provides integer-only ARM64 NEON equivalents,
+scoped to this worker and its three DSP overlays. It preserves SPU truncation,
+extended float range, saturation and denormal flushing without changing the
+host rounding mode. `sh tools/test_audio_conversions.sh` checks each of four
+operations against the scalar reference over all 256 scale encodings and more
+than 18 million input lanes, with undefined-behavior checks. The DSP replay
+also passes with these conversions enabled. Other workloads are unaffected.
+
+**Race audio is still incomplete.** In `logs/audio-native-three-15`, the sampled
+audio worker no longer contains interpreter frames; startup helpers can still
+be interpreted. Producer DMA throughput improved, but often remains below the
+1,536,000 bytes/s required for 48 kHz, eight-channel float PCM. The subsequent
+bounded run `logs/audio-native-neon-16` reaches a visually verified race; its
+last ten complete five-second output windows contain **4.4–49.5% zero blocks,
+22.3% on average**, mostly at the correct 187.5 blocks/s output cadence.
+Earlier runs had more missing PCM, but changing vehicle/camera conditions and
+sampling overhead prevent a controlled percentage-speedup claim. This is not
+evidence of acceptable audio quality. Music and effects share the Multistream
+output, so producer gaps can disrupt both; a channel conflict is not established.
+These measurements precede the main-worker optimization described below.
+
+A bounded producer-wait experiment based on RPCS3 readiness handling did not
+fix the deficit and was removed. Output buffering cannot sustain audio if the
+producer remains slower than real time. The remaining sampled work is in the
+native Multistream main image, including resampling at `0x99E0`, many small
+processing blocks and dispatch/check overhead. No voices, music, sample rate
+or arithmetic accuracy were reduced.
+
+### Main audio worker: measured ARM64 arithmetic scopes
+
+`tools/specialize_audio_worker.py` now uses the lifter's existing chunk-merging
+facility for four measured loops, rooted at `0x5238`, `0x5670`, `0x5848` and
+`0x98D8`. It checks the complete input-code hash and reproduces each original
+entry before replacing it. The original local generated source is preserved;
+the specialized output belongs only in ignored `build/`. Other functions and
+their registered entry points remain available.
+
+Merging alone saves little. The larger improvement comes from bounded ARM64
+NEON arithmetic scopes using the existing exact SPU float helpers: the host
+rounding mode is saved once for a loop, and restored at every exit and guest
+call boundary. Extended-range values retain the exact fallback. Image/policy
+checks and diagnostic guards prevent callbacks from running in guest rounding
+mode. `MOTORSTORM_AUDIO_MERGE=2` is the default; `1` selects merging without
+the arithmetic scope and `0` selects the original worker for comparison.
+
+`sh tools/test_audio_worker.sh logs/audio-worker-capture-17` compares all 128
+registers, all 256 KiB of local store, PC/status and restored host FPCR for
+32 locally captured inputs, 100 replays per mode/input. It also checks four
+million arithmetic lanes, including extended floats and boundary cases.
+All pass. Mean isolated call times across the eight inputs per loop are
+approximately 0.0248→0.0121 ms, 0.0320→0.0155 ms, 0.0291→0.0144 ms and
+0.0184→0.0107 ms: **1.7–2.1× faster in these loops**, not a whole-game speedup.
+
+The bounded reference run `logs/audio-worker-reference-17` has 26.02% entirely
+zero output blocks on average in its last ten complete five-second windows.
+With the scopes enabled, `logs/audio-worker-clean-19` has **2.77%** in its last
+ten windows, ranging from 0–13.6%. Five of those windows have no zero blocks.
+Output cadence is mostly 187.4–187.6 blocks/s; one window is 182.5 blocks/s.
+Neither run uses an external sampler in this comparison. Vehicle/camera and
+traffic are not deterministic, so this is encouraging bounded-run evidence,
+not a precise causal percentage improvement. The user independently reports
+normal-sounding stretches with intermittent stutter; audio is **not yet fixed**.
+The intervening run 18 was disturbed by an external sampler near the end, so
+its last two windows are not used for performance conclusions.
+
+Opt-in `MOTORSTORM_AUDIO_WORKER_TIMING=1` samples the audio thread's CPU and
+wall clocks every 128 selected calls, reporting once a second. Run 19 spends
+about 80% of one CPU thread's wall interval executing over its last 60 reports;
+this is not a percentage of total frame time. `MOTORSTORM_AUDIO_WORKER_CAPTURE`
+records at most eight local input snapshots per selected entry; it is disabled
+normally and does not reserve a large capture buffer in every thread's TLS.
+Captures and raw audio remain under ignored `logs/` and must not be committed.
+The probes are bounded and stop automatically; no recurring run was started.
+
+The clean run also identified a host scheduling mismatch: the verified audio
+worker used macOS DEFAULT QoS (21), while render/main threads used
+USER_INTERACTIVE (33). The dedicated Multistream thread now requests
+USER_INTERACTIVE once, before entering scoped arithmetic. It leaves guest
+priority, core selection and other workloads alone. This uses Apple's
+[pthread QoS API](https://developer.apple.com/library/archive/documentation/Performance/Conceptual/power_efficiency_guidelines_osx/PrioritizeWorkAtTheTaskLevel.html),
+also available on iOS, and is not a real-time scheduling guarantee.
+`MOTORSTORM_AUDIO_QOS=0` restores the old host priority for comparison.
+
+With that change, `logs/audio-worker-qos-20` confirms actual QoS 33 and has
+**zero entirely silent blocks in its final twelve five-second windows**.
+The last 60 audio-worker CPU reports average 64.7% of elapsed wall time,
+versus 80.1% in run 19. The final 50 guest-FPS reports average 29.28 FPS,
+ranging from 25.90 to 30.20 FPS. The user reports that the sound now seems
+correct. This supports keeping the change enabled, but does not prove an
+entire race is dropout-free or that frame pacing is consistently 30 FPS.
+
+The final default-settings confirmation `logs/audio-worker-default-21` has no
+audio mode/QoS override and no worker timing instrumentation. It confirms QoS
+33 and reaches a visually verified buggy race. Nine of the final ten complete
+five-second windows have zero silent blocks; one has 0.9%, alongside reduced
+output cadence (176.9 blocks/s). Its final 40 FPS reports average 29.18 FPS,
+with one 18.11 FPS report. Thus the sustained producer deficit is greatly
+reduced, but occasional broader stalls remain; do not label the port entirely
+stutter-free. This confirmation used a different vehicle from run 20 and is
+not a controlled comparison. All bounded probes have stopped.
 
 On macOS, `AUDIO_PEAK=1` now reports mixed-buffer levels; `AUDIO_WAV=<path>`
 records raw float32 stereo 48 kHz output (despite the legacy variable name,
 it is not a WAV container). These diagnostics remain opt-in and recordings
 must stay under ignored `logs/`. A missing optional firmware ATRAC module is
 still reported; complete codec coverage is not established.
+
+## Frame stability: 30 FPS target, 20 October 2026
+
+The current target is stable **30 FPS at 1280×720**, with unchanged visual
+quality and less CPU overhead that can also benefit a later iOS port. There is
+no 60 FPS target. The following bounded work addresses measured costs; it does
+not establish that all large hitches have been removed.
+
+A separate five-second Instruments Time Profiler recording in
+`logs/hitch-cpu-23/` contains 24,387 ms of sampled CPU activity across threads.
+`spu_task_launch_check` accounts for 1,714 ms inclusive (about 7% of the sampled
+CPU work, **not** 7% of frame latency). The main thread's largest observed wait
+overlaps busy native SPURS workers. Those workers execute game code and policy
+code; this is not evidence that they are merely spinning. Shader translation
+misses do not explain the largest hitches in the initial trace.
+
+Two concrete changes were implemented:
+
+* `RSX_SURFACE_GPU_SEED=1` copies compact linear B8 guest rows into the existing
+  fenced Metal staging pool and expands them to the same RGBA8 values on the
+  GPU, before their first consumer. The largest 4096-square source needs a
+  16 MiB snapshot rather than a CPU-expanded 64 MiB upload. The nine related
+  target initializations measured **22.77 ms CPU before and 0.686 ms after**
+  in runs 22/24. This is a localized CPU saving; GPU work and texture memory
+  still exist. The checked path is now a normal experimental-launcher default;
+  `RSX_SURFACE_GPU_SEED=0` retains the original CPU implementation.
+* `SPU_FAST_DISPATCH=1` removes the always-on diagnostic PC history and probe
+  checks from ordinary nonzero-PC transfers. Job step counts, stack switches,
+  interrupts and LS-zero exits remain intact. Explicit diagnostic settings
+  and active flow recording use the original path. Reordered stack-reset
+  guards avoid an unnecessary thread-local lookup for policy jobs. The fast
+  dispatch option remains **opt-in pending a player-driven comparison**;
+  `SPU_FAST_DISPATCH=0` keeps the complete diagnostic hook.
+
+`sh tools/test_surface_gpu_seed.sh` verifies all 256 B8 values, a 4096-square
+image, odd/padded/tight-final-row layouts, source immutability, seed/snapshot/
+clear ordering, retired resource lifetime and staging rollover in both upload
+modes. `sh tools/test_surface_seed.sh` verifies dispatcher selection and CPU
+fallback. `sh tools/test_dispatch_checks.sh` compares 2,048 contexts/exits with
+the original hook, including stack switches and diagnostic fallback. The real
+SPU thread-group suite passes all 97 checks with fast dispatch enabled and
+disabled, including one-way stack resets.
+
+All gameplay checks use unchanged graphics and audio, with screenshot readback
+paused for each 30-second trace. Run 22 measured 26.73 FPS, 48.40 ms p95 and
+246.32 ms maximum. Run 24 (GPU seed) measured 28.83 FPS, 43.04 ms p95 and
+74.44 ms maximum; run 25 (both changes) measured 28.70 FPS, 42.52 ms p95 and
+217.33 ms maximum. **These are observations, not a controlled FPS improvement:**
+the timed menu script selected different vehicles, and collisions/routes
+differed. A confirm-only control run 26 measured 28.53 FPS, 44.17 ms p95 and
+79.06 ms maximum; it is not a matched counterfactual for run 25. The remaining
+217 ms outlier is a reason to keep investigating, not to claim stable 30 FPS.
+
+The user will choose the same track/vehicle and drive subsequent comparisons.
+`tools/profile_manual_gameplay.py start --out logs/<fresh-name>` launches the
+normal game without automated buttons, screenshots or an external sampler.
+`arm --out logs/<name>` starts one 60-second trace after a one-second lead-in;
+`report --out logs/<name>` analyzes it only after the runtime confirms the file
+is complete. The game stays open. `--env SPU_FAST_DISPATCH=1` on `start` enables
+the candidate for a deliberate comparison. Raw captures, logs and game-derived
+data remain local and ignored. No recurring test or automatic goal was started.
+
+### Player-driven confirmation (run 27)
+
+The player drove the running game during one explicitly armed 60-second trace
+under `logs/manual-driving-27/`, with compact GPU seed and fast dispatch enabled.
+It recorded 1,796 guest flips: **29.93 FPS**, 33.36 ms median, **34.33 ms p95**,
+36.35 ms p99, and 69.65 ms maximum. Only two completed intervals exceeded 50 ms
+(69.65 and 60.31 ms); both began within the first half-second of the trace.
+There were no shader or pipeline builds and no dropped trace records. This is
+an encouraging player-driven interval, not a controlled old/new speedup or a
+guarantee for every race. The earlier reported 2–3 freezes occurred before the
+trace was armed, so their causes cannot be recovered from this recording.
+
+The two longest frames include GPU-completion waits of 42.75 and 32.43 ms,
+also visible in the corresponding PPU GPU-read requests. Their RSX CPU work is
+9.98/12.38 ms and main PPU CPU work is 13.72/13.02 ms. The long GPU command-buffer
+intervals localize these stalls to the GPU completion path; they do not yet
+identify a particular draw, resource-residency event or driver cause.
+Across the whole interval, process CPU averages 116.24 ms per 33.41 ms frame
+(about 3.48 CPU-seconds per elapsed second, summed across threads), RSX CPU
+12.57 ms, main PPU CPU 13.31 ms, policy/native-job CPU 47.26 ms across workers,
+and GPU execution 10.60 ms. CPU/GPU lanes overlap and must not be added.
+
+The player's Activity Monitor snapshot separately shows 284.6% process CPU
+and 49.91% system-wide idle time. Reducing CPU work and frequent wakeups remains
+valuable for energy use even when frame pacing is near 30 FPS. Apple's
+[CPU scheduling guidance](https://developer.apple.com/documentation/xcode/scheduling-cpu-work-efficiently)
+prefers notification-driven work over polling. The existing timed guest waits
+cannot simply be lengthened or removed without checking wakeup correctness.
+
+The player clarified that high-boost blur is expected, while blur on ordinary
+turns/jumps without boost is unwanted. This remains an open visual defect, not
+an accepted motion-blur behavior. The timing trace contains no image evidence
+to resolve it. For the next controlled visual check, manual `start --capture
+--note "turning without boost" --out logs/<fresh-name>` prepares a two-frame
+Metal capture and shader sources; `arm` records when the player is ready.
+Capture requires a fresh game launch, briefly perturbs rendering and must not
+be used as a performance benchmark. `report` verifies capture completion;
+neither capture nor timing mode automatically closes the game.
+
+### No-boost visual capture (manual run 28)
+
+After the player authorized a restart and then explicitly armed capture while
+driving without boost, `logs/manual-blur-28/race.gputrace` saved two Metal
+frames. Xcode replay shows a motorcycle at race clock **00:01.19**, with a
+1280x720 final drawable. This is early in the race; it does not establish that
+the strongest reported turn/jump symptom was captured.
+
+Draw **380364**, render encoder **354**, command buffer **18**, fragment
+`main0 (23)` adds a visible blur contribution to the terrain and grass. Its
+source is `MTLLibrary 25 / 331653370493EE02`, matching guest fragment dump
+`shaders/pipe41.ps.hlsl` (FP hash `bee573902f3b2824`). In the saved replay only,
+replacing the initial Texture 0 velocity sample with zero sharpens these
+regions. The original and diagnostic outputs, scene input, raw RG16Float
+velocity texture, constants, and hashes are retained alongside `evidence.json`.
+The original shader was restored and reloaded; its extracted source matches
+the pre-test source exactly. No runtime or visual-quality change was made.
+
+The sampled velocity resource (Texture 806, 1440x1280) contains finite values,
+but that alone cannot validate its scale, coordinates, or frame history. The
+comparison localizes a blur contribution, **not a proven translation error**.
+Disabling all motion blur is a diagnostic, not an accepted fix; the intended
+high-boost effects must remain intact.
+
+### Velocity texture sampling correction — 21 October 2026
+
+The saved capture exposed a concrete mismatch with RPCS3's treatment of
+`Y16_X16_FLOAT` (format `0x9F`). Our uploader preserved the two half-floats in
+guest memory order, but sampled them like ordinary RGBA data. RPCS3 combines
+[`decoded_remap`](https://github.com/RPCS3/rpcs3/blob/master/rpcs3/Emu/RSX/RSXTexture.cpp)
+with the format's
+[`component mapping`](https://github.com/RPCS3/rpcs3/blob/master/rpcs3/Emu/RSX/VK/VKFormats.cpp)
+and presents stored halves **1,0,1,0** as RGBA. Our captured velocity view
+presented **0,1,zero,one**. The composite consumes `.xy`, so its velocity axes
+were reversed. The shared texture-layout code now uses the format's fixed
+selectors and honors its high-word override and zero/one controls. The draw
+engine preserves the complete remap word in views and texture-cache keys,
+including the CPU fallback.
+
+In command **377664**, all **3,686,400** half-word bit patterns from the
+RGBA8 source match the RG16Float output exactly; the conversion itself was
+not changed. A replay-only `.yxyx` correction at draw **380364** changes the
+blur direction on the same captured scene. The original replay shader was
+restored byte-for-byte afterwards. The corrected replay image and checks are
+in `logs/manual-blur-28/remap-evidence.json`. This is a comparison with RPCS3
+**source semantics**, not a matched frame rendered by RPCS3.
+
+Validation: the new format test fails before the correction and passes after;
+the texture-layout and sampled-dimensions/draw-engine suites pass. Real Metal
+sampling agrees for both GPU aliases and CPU uploads, with and without the
+override. The existing exhaustive half-bit conversion and depth tests pass,
+and the Release executable builds. No boost parameters, blur strengths,
+resolution, frame pacing or game data were changed. This fixes a demonstrated
+sampling defect; elimination of the reported turn/jump symptom and visual
+boost behavior still require a live driving check. No new FPS claim is made.
+
+In the subsequent run `logs/startup-hitch-31`, the player reports completing
+a whole event with satisfactory graphics and requests no further graphics
+changes. Its timing trigger was never armed, so that report is player feedback,
+not a new CPU/GPU benchmark. The current priority is reduced CPU work while
+preserving the accepted graphics, audio and 30 FPS target.
 
 ## Source backup and paused status
 
@@ -191,12 +512,22 @@ precedence over the keyboard. Stop the process with Ctrl-C in its Terminal
 window. Closing the rendering window alone does not yet guarantee that every
 guest thread exits. This remains a research build.
 
-The keyboard bridge uses the game's front-end FSM and OSD pause state
+The keyboard bridge uses the game's front-end FSM and OSD menu state
 to switch between menu navigation and race controls. The keyboard report tests
 cover throttle pressure, independent stick lean, pause navigation, held-key
 transitions, modifier releases and loss of focus. `sh tools/test_keyboard_context.sh`
 checks the pinned guest layouts and invalid-pointer guards;
 `sh tools/test_pad_reports.sh` checks the resulting guest controller packets.
+
+The post-race Continue/Retry/Exit menu keeps the outer FSM in race state 5;
+its OSD state is 7. The bridge now recognizes that state as a menu, enabling
+arrow navigation and Enter confirmation instead of throttle/brake. The guest
+dispatcher at `0x0055FAFC` enters that menu from state 6 and handles its three
+choices at `0x005609CC`. A regression test fails before the correction and passes
+after it, including suppressing a held driving key across the transition.
+The controller-packet suite and Release build also pass. Evidence is local in
+`logs/finish-menu-32`; an actual completed-race check with the rebuilt executable
+is still needed.
 
 The launch scripts locate FFmpeg in `/opt/homebrew/lib`; override
 `PS3RECOMP_FFMPEG_AVCODEC` and `PS3RECOMP_FFMPEG_AVUTIL` for other installations.

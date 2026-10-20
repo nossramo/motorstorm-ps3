@@ -289,7 +289,7 @@ index bfa9c6d..c081d69 100644
  }
  
 diff --git a/libs/audio/cellAudio.c b/libs/audio/cellAudio.c
-index 9e3a2d9..d6aec58 100644
+index 9e3a2d9..f9305f6 100644
 --- a/libs/audio/cellAudio.c
 +++ b/libs/audio/cellAudio.c
 @@ -188,6 +188,8 @@ static int audio_backend_init(void)
@@ -301,7 +301,95 @@ index 9e3a2d9..d6aec58 100644
      return 0;
  }
  
-@@ -614,9 +616,36 @@ static void* audio_mix_thread_func(void* arg)
+@@ -455,13 +457,14 @@ static void audio_mix_one_block(void)
+         u32 block_offset = block_idx * CELL_AUDIO_BLOCK_SAMPLES * nch;
+         float* src = port->buffer + block_offset;
+ 
+-        /* AUDIO_PEAK diag: which blocks of this port's WHOLE ring hold data,
+-         * vs which block the read cursor is on -- distinguishes "writer never
+-         * writes" from "writer and reader cycle out of phase". */
+-        { static int s_pk = -1; if (s_pk < 0) s_pk = getenv("AUDIO_PEAK") ? 1 : 0;
+-          if (s_pk) { static _Thread_local unsigned _c;
+-            if ((++_c % 400) == 0) {
+-                char map[36]; u32 b;
++        /* AUDIO_RING=1 samples the actual guest-written ring before consuming
++         * a block. The map covers every block and chpeak reports decoded BE
++         * PCM in the current block, so racing audio can be distinguished from
++         * a missing producer, a silent channel layout, or the host mixer. */
++        { static int s_ring = -1; if (s_ring < 0) s_ring = getenv("AUDIO_RING") ? 1 : 0;
++          if (s_ring) { static _Thread_local unsigned _c;
++            if ((++_c % 188) == 0) {
++                char map[36]; u32 b; float chpeak[8] = {0};
+                 for (b = 0; b < nblock && b < 32; b++) {
+                     const float* bp = port->buffer + b * CELL_AUDIO_BLOCK_SAMPLES * nch;
+                     int nz = 0;
+@@ -470,8 +473,19 @@ static void audio_mix_one_block(void)
+                     map[b] = nz ? '#' : '.';
+                 }
+                 map[b] = 0;
+-                fprintf(stderr, "[audio-ring] port %d ridx=%llu blk=%u ring=[%s]\n",
+-                        p, (unsigned long long)port->read_index, block_idx, map);
++                for (u32 s2 = 0; s2 < CELL_AUDIO_BLOCK_SAMPLES; ++s2)
++                    for (u32 ch = 0; ch < nch && ch < 8; ++ch) {
++                        float a = ld_be_f32(&src[s2 * nch + ch]);
++                        if (a < 0) a = -a;
++                        if (a > chpeak[ch]) chpeak[ch] = a;
++                    }
++                fprintf(stderr, "[audio-ring] port=%d read=%llu guest=%llu blk=%u ring=[%s] chpeak=",
++                        p, (unsigned long long)port->read_index,
++                        (unsigned long long)(port->read_idx_addr ? vm_read64((u32)port->read_idx_addr) : 0),
++                        block_idx, map);
++                for (u32 ch = 0; ch < nch && ch < 8; ++ch)
++                    fprintf(stderr, "%s%.4g", ch ? "," : "", chpeak[ch]);
++                fputc('\n', stderr);
+             } } }
+ 
+         for (u32 s = 0; s < CELL_AUDIO_BLOCK_SAMPLES; s++) {
+@@ -484,16 +498,20 @@ static void audio_mix_one_block(void)
+                 left = right = ld_be_f32(&src[s]) * level;
+             }
+ 
+-            /* If 7.1, mix center and other channels into stereo */
++            /* PS3 7.1 order is L, R, C, LFE, rear L/R, side L/R. Follow
++             * RPCS3's stereo downmix: center and combined rear/side at -3dB;
++             * LFE is omitted for a stereo destination. */
+             if (nch == 8) {
+-                float center = ld_be_f32(&src[s * 8 + 2]) * level * 0.707f;
+-                float lfe    = ld_be_f32(&src[s * 8 + 3]) * level * 0.5f;
+-                float rl     = ld_be_f32(&src[s * 8 + 4]) * level * 0.5f;
+-                float rr     = ld_be_f32(&src[s * 8 + 5]) * level * 0.5f;
+-                float sl     = ld_be_f32(&src[s * 8 + 6]) * level * 0.3f;
+-                float sr     = ld_be_f32(&src[s * 8 + 7]) * level * 0.3f;
+-                left  += center + lfe + rl + sl;
+-                right += center + lfe + rr + sr;
++                const float center = ld_be_f32(&src[s * 8 + 2]) * level;
++                const float rear_left = ld_be_f32(&src[s * 8 + 4]) * level;
++                const float rear_right = ld_be_f32(&src[s * 8 + 5]) * level;
++                const float side_left = ld_be_f32(&src[s * 8 + 6]) * level;
++                const float side_right = ld_be_f32(&src[s * 8 + 7]) * level;
++                const float center_mix = center * 0.70710678f;
++                const float surround_left = (rear_left + side_left) * 0.70710678f;
++                const float surround_right = (rear_right + side_right) * 0.70710678f;
++                left  += center_mix + surround_left;
++                right += center_mix + surround_right;
+             }
+ 
+             s_mix_buffer[s * 2 + 0] += left;
+@@ -515,11 +533,8 @@ static void audio_mix_one_block(void)
+ 
+     mutex_unlock(&s_audio_mutex);
+ 
+-    /* Clip to [-1.0, 1.0] */
+-    for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) {
+-        if (s_mix_buffer[i] > 1.0f) s_mix_buffer[i] = 1.0f;
+-        if (s_mix_buffer[i] < -1.0f) s_mix_buffer[i] = -1.0f;
+-    }
++    /* Preserve floating-point headroom through the F32 host backends, matching
++     * RPCS3's float path. Any future S16 output path must clamp during conversion. */
+ }
+ 
+ /* ---------------------------------------------------------------------------
+@@ -614,13 +629,63 @@ static void* audio_mix_thread_func(void* arg)
  {
      (void)arg;
      printf("[cellAudio] Mixing thread started\n");
@@ -310,6 +398,10 @@ index 9e3a2d9..d6aec58 100644
 +    FILE* capture = capture_path ? fopen(capture_path, "wb") : NULL;
 +    unsigned blocks = 0, silent = 0, invalid = 0;
 +    float peak = 0;
++    const int rate_trace = getenv("AUDIO_RATE") != NULL;
++    struct timespec rate_start = {0, 0};
++    unsigned rate_blocks = 0, rate_silent = 0;
++    if (rate_trace) clock_gettime(CLOCK_MONOTONIC, &rate_start);
 +    if (capture_path && !capture) perror("[cellAudio] AUDIO_WAV");
  
      while (s_mix_thread_running) {
@@ -338,7 +430,30 @@ index 9e3a2d9..d6aec58 100644
          audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
          audio_notify_event_queues();
  
-@@ -628,6 +657,7 @@ static void* audio_mix_thread_func(void* arg)
+         u32 queued = audio_backend_queued_samples();
++        if (rate_trace) {
++            struct timespec now;
++            clock_gettime(CLOCK_MONOTONIC, &now);
++            ++rate_blocks;
++            int nonzero = 0;
++            for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; ++i)
++                if (s_mix_buffer[i] != 0.0f) { nonzero = 1; break; }
++            if (!nonzero) ++rate_silent;
++            double elapsed = (double)(now.tv_sec - rate_start.tv_sec) +
++                (double)(now.tv_nsec - rate_start.tv_nsec) / 1000000000.0;
++            if (elapsed >= 5.0) {
++                fprintf(stderr, "[audio-rate] %.1f blocks/s (187.5 real-time), silent=%.1f%% queued=%u frames\n",
++                        rate_blocks / elapsed,
++                        rate_blocks ? 100.0 * rate_silent / rate_blocks : 0.0,
++                        queued);
++                rate_blocks = rate_silent = 0;
++                rate_start = now;
++            }
++        }
+         if (queued > CELL_AUDIO_BLOCK_SAMPLES * 4) {
+             usleep(5000);
+         } else {
+@@ -628,6 +693,7 @@ static void* audio_mix_thread_func(void* arg)
          }
      }
  
@@ -346,6 +461,79 @@ index 9e3a2d9..d6aec58 100644
      printf("[cellAudio] Mixing thread stopped\n");
      return NULL;
  }
+diff --git a/libs/audio/tests/test_audio_ring.c b/libs/audio/tests/test_audio_ring.c
+index b6252c9..f06d307 100644
+--- a/libs/audio/tests/test_audio_ring.c
++++ b/libs/audio/tests/test_audio_ring.c
+@@ -17,6 +17,18 @@ void spu_coh_notify_write(uint32_t a) { (void)a; }
+ void spu_lockline_lock(void) {}
+ void spu_lockline_unlock(void) {}
+ 
++static void put_be_f32(float* where, float value)
++{
++    uint32_t bits;
++    uint8_t bytes[4];
++    memcpy(&bits, &value, sizeof(bits));
++    bytes[0] = (uint8_t)(bits >> 24);
++    bytes[1] = (uint8_t)(bits >> 16);
++    bytes[2] = (uint8_t)(bits >> 8);
++    bytes[3] = (uint8_t)bits;
++    memcpy(where, bytes, sizeof(bytes));
++}
++
+ int main(void)
+ {
+     vm_base = mmap(NULL, 0x100000000ULL, PROT_READ | PROT_WRITE,
+@@ -40,6 +52,49 @@ int main(void)
+         }
+         free(port->buffer);
+     }
++    /* Verify ordinary stereo stays linear and the 7.1-to-stereo matrix uses
++     * -3 dB center/surround coefficients, excludes LFE, and preserves F32 headroom. */
++    AudioPortSlot* test_port = &s_ports[0];
++    memset(test_port, 0, sizeof(*test_port));
++    test_port->in_use = test_port->running = 1;
++    test_port->param.nChannel = 2;
++    test_port->param.nBlock = 8;
++    test_port->param.level = 1.0f;
++    test_port->buffer = calloc(8 * CELL_AUDIO_BLOCK_SAMPLES * 2, sizeof(float));
++    assert(test_port->buffer);
++    put_be_f32(&test_port->buffer[0], 0.25f);
++    put_be_f32(&test_port->buffer[1], -0.5f);
++    audio_mix_one_block();
++    assert(fabsf(s_mix_buffer[0] - 0.25f) < 0.0001f);
++    assert(fabsf(s_mix_buffer[1] + 0.5f) < 0.0001f);
++    free(test_port->buffer);
++
++    memset(test_port, 0, sizeof(*test_port));
++    test_port->in_use = test_port->running = 1;
++    test_port->param.nChannel = 8;
++    test_port->param.nBlock = 8;
++    test_port->param.level = 1.0f;
++    test_port->buffer = calloc(8 * CELL_AUDIO_BLOCK_SAMPLES * 8, sizeof(float));
++    assert(test_port->buffer);
++    put_be_f32(&test_port->buffer[0], 0.4f);
++    put_be_f32(&test_port->buffer[1], -0.5f);
++    put_be_f32(&test_port->buffer[2], 0.2f);
++    put_be_f32(&test_port->buffer[3], 10.0f); /* LFE must not enter stereo */
++    put_be_f32(&test_port->buffer[4], 0.1f);
++    put_be_f32(&test_port->buffer[5], 0.2f);
++    put_be_f32(&test_port->buffer[6], 0.3f);
++    put_be_f32(&test_port->buffer[7], 0.4f);
++    audio_mix_one_block();
++    assert(fabsf(s_mix_buffer[0] - (0.4f + 0.2f * 0.70710678f + 0.4f * 0.70710678f)) < 0.0001f);
++    assert(fabsf(s_mix_buffer[1] - (-0.5f + 0.2f * 0.70710678f + 0.6f * 0.70710678f)) < 0.0001f);
++    memset(test_port->buffer, 0, 8 * CELL_AUDIO_BLOCK_SAMPLES * 8 * sizeof(float));
++    test_port->read_index = 0;
++    put_be_f32(&test_port->buffer[0], 1.25f);
++    put_be_f32(&test_port->buffer[1], -1.1f);
++    audio_mix_one_block();
++    assert(fabsf(s_mix_buffer[0] - 1.25f) < 0.0001f);
++    assert(fabsf(s_mix_buffer[1] + 1.1f) < 0.0001f);
++    free(test_port->buffer);
+     memset(s_ports, 0, sizeof(s_ports));
+     s_audio_initialized = 1;
+     vm_write64(0x100, 8);
 diff --git a/libs/codec/cellVdec.c b/libs/codec/cellVdec.c
 index a411dbd..401fe46 100644
 --- a/libs/codec/cellVdec.c
@@ -675,12 +863,24 @@ index 85b05f8..896ce24 100644
          unsigned int ea = (unsigned int)(uintptr_t)data_guest;
          vm_write32((unsigned long long)ea + 0, (unsigned int)data->len);   /* len (s32) */
 diff --git a/libs/misc/cellAvconfExt.c b/libs/misc/cellAvconfExt.c
-index 2ab88b8..62f891d 100644
+index 2ab88b8..abbef68 100644
 --- a/libs/misc/cellAvconfExt.c
 +++ b/libs/misc/cellAvconfExt.c
-@@ -10,13 +10,8 @@
+@@ -1,32 +1,34 @@
+ /*
+  * ps3recomp - cellAvconfExt HLE implementation
+  *
+- * Reports standard LPCM stereo 48kHz as available audio output.
++ * Reports host-supported LPCM audio output modes.
+  * Games query this to decide audio format before opening cellAudio ports.
+  */
+ 
+ #include "cellAvconfExt.h"
+ #include "../../runtime/ppu/ppu_memory.h"   /* vm_write32: translate + byte-swap */
  #include "../../runtime/ppu/ppu_context.h"  /* the float argument of SetGamma is in f1 */
++#include <stdio.h>
  #include <stdlib.h>
++#include <string.h>
  
 -/* The HLE ABI adapter passes pointer parameters as raw guest addresses, so a
 - * bare deref here writes to whatever host address shares that number. These
@@ -693,8 +893,11 @@ index 2ab88b8..62f891d 100644
 + * fields big-endian. ABI reference: RPCS3 Emu/Cell/Modules/cellAudioOut.h. */
  extern u8* vm_base;
  #define GUEST_PTR(p, T) ((T)((p) ? (void*)(vm_base + (uint32_t)(uintptr_t)(p)) : (void*)0))
- #include <stdio.h>
-@@ -27,6 +22,13 @@ extern u8* vm_base;
+-#include <stdio.h>
+-#include <string.h>
+ 
+ /* ---------------------------------------------------------------------------
+  * Internal state
   * -----------------------------------------------------------------------*/
  
  static float s_gamma = 1.0f;
@@ -1576,7 +1779,7 @@ index b58a830..ed5aeca 100644
      u32 depth_format;
      u32 raster_type;     /* 1 = pitch (linear), 2 = swizzle                */
 diff --git a/libs/video/rsx_draw_engine.c b/libs/video/rsx_draw_engine.c
-index bb7675c..b5cb7e7 100644
+index bb7675c..ec453a6 100644
 --- a/libs/video/rsx_draw_engine.c
 +++ b/libs/video/rsx_draw_engine.c
 @@ -1,3 +1,5 @@
@@ -1682,7 +1885,7 @@ index bb7675c..b5cb7e7 100644
 +    struct { u64 cpu_ns, bytes; u32 calls; } fp_hash_totals[4];
 +    struct { u64 cpu_ns, bytes; u32 calls; } fp_metadata_probe[4];
 +    int detail_trace;
-+    int surface_seed_trace, surface_typed_seed;
++    int surface_seed_trace, surface_typed_seed, surface_gpu_seed;
 +    int b8_feedback;
 +    u64 b8_copies, b8_reuses;
 +    int vp_meta_enabled;
@@ -1812,23 +2015,42 @@ index bb7675c..b5cb7e7 100644
                  return i;
              slot = i;
              break;
-@@ -580,19 +690,33 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
+@@ -579,27 +689,56 @@ static u32 eng_surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
+         slot = g.n_surfaces;
      }
  
-     u32 seed_row = 0;
-+    eng_phase_clock surface_clock = eng_surface_begin();
-     const void* seed = eng_surface_seed(location, offset, want_w, want_h,
+-    u32 seed_row = 0;
+-    const void* seed = eng_surface_seed(location, offset, want_w, want_h,
 -                                        want_fmt, &seed_row);
+-    const u32 handle = g.be->color_target_create(g.be->user, want_fmt,
++    u32 seed_row = 0, handle = 0;
++    eng_phase_clock surface_clock = eng_surface_begin();
++    /* Keep the same guest bounds and typed B8 layout as the CPU decoder.
++     * The backend copies compact rows now; it must never retain guest bytes. */
++    if (g.surface_gpu_seed && g.surface_typed_seed && g.be->color_target_create_b8 &&
++        location == RSX_LOCATION_MAIN && want_fmt == RSX_BE_FMT_R8G8B8A8 &&
++        color_format == 9 && raster_type == 1 && want_w && want_h &&
++        (s_guest_reader || cellGcmResolveIO(offset))) {
++        const u64 stride = pitch ? pitch : want_w;
++        const u64 span = (u64)(want_h-1)*stride + want_w;
++        if (stride >= want_w && span <= UINT32_MAX && (u64)offset+span <= (1ull<<32)) {
++            const void* source = eng_guest_ptr(NULL, location, offset, (u32)span);
++            if (source) handle = g.be->color_target_create_b8(g.be->user,
++                want_w, want_h, source, (u32)stride);
++        }
++    }
++    const int gpu_seeded = handle != 0;
++    const void* seed = handle ? NULL : eng_surface_seed(location, offset, want_w, want_h,
 +                                        want_fmt, pitch, color_format, raster_type,
 +                                        &seed_row);
 +    eng_phase_end(surface_clock, 17);
 +    if (surface_clock.wall)
 +        fprintf(stderr, "[rsx surface seed] frame=%u location=%u offset=%08X "
-+                "size=%ux%u color=%u raster=%u pitch=%u typed=%d seeded=%d\n",
++                "size=%ux%u color=%u raster=%u pitch=%u typed=%d seeded=%d gpu=%d\n",
 +                g.frames, location, offset, want_w, want_h, color_format,
-+                raster_type, pitch, g.surface_typed_seed, seed != NULL);
++                raster_type, pitch, g.surface_typed_seed, seed != NULL || gpu_seeded, gpu_seeded);
 +    surface_clock = eng_surface_begin();
-     const u32 handle = g.be->color_target_create(g.be->user, want_fmt,
++    if (!handle) handle = g.be->color_target_create(g.be->user, want_fmt,
                                                   want_w, want_h, seed, seed_row);
 +    eng_phase_end(surface_clock, 18);
      if (!handle)
@@ -1847,7 +2069,15 @@ index bb7675c..b5cb7e7 100644
      s->color_serial = 0;
      s->guest_dirty = 0;
      if (slot == g.n_surfaces) g.n_surfaces++;
-@@ -618,9 +742,14 @@ static u32 eng_current_target_set(u32 slots[RSX_BE_MAX_COLOR_TARGETS])
+     { static u32 logs = 0; if (logs++ < 16)
+         fprintf(stderr, "[rsx engine] surface %u:0x%08X %ux%u fmt %d%s\n",
+                 location, offset, want_w, want_h, (int)want_fmt,
+-                seed ? " (seeded from guest memory)" : ""); }
++                (seed || gpu_seeded) ? " (seeded from guest memory)" : ""); }
+     return slot;
+ }
+ 
+@@ -618,9 +757,14 @@ static u32 eng_current_target_set(u32 slots[RSX_BE_MAX_COLOR_TARGETS])
      const u32 sel = (sf.color_target == CELL_GCM_SURFACE_TARGET_1) ? 1u : 0u;
      const rsx_be_format fmt = eng_surface_format(sf.color_format);
      const u32 first = eng_surface_get(sf.color_location[sel], sf.color_offset[sel],
@@ -1863,7 +2093,7 @@ index bb7675c..b5cb7e7 100644
      slots[0] = first;
      u32 n = 1;
  
-@@ -630,11 +759,19 @@ static u32 eng_current_target_set(u32 slots[RSX_BE_MAX_COLOR_TARGETS])
+@@ -630,11 +774,19 @@ static u32 eng_current_target_set(u32 slots[RSX_BE_MAX_COLOR_TARGETS])
      };
      for (u32 i = 0; i < 3; i++) {
          if (sf.color_target < mrt_from[i]) break;
@@ -1884,7 +2114,7 @@ index bb7675c..b5cb7e7 100644
          /* A set naming one buffer twice would attach the same target twice,
           * which no host API allows. */
          int seen = 0;
-@@ -659,6 +796,13 @@ static u32 eng_transfer_bpp(rsx_be_format fmt)
+@@ -659,6 +811,13 @@ static u32 eng_transfer_bpp(rsx_be_format fmt)
      }
  }
  
@@ -1898,7 +2128,7 @@ index bb7675c..b5cb7e7 100644
  /* The surface holding guest bytes [offset, offset + pitch * h), with the byte
   * position of `offset` inside its row (*xb) and its row (*y). Only a surface
   * laid out with the transfer's own pitch qualifies: another pitch puts the
-@@ -673,7 +817,7 @@ static u32 eng_surface_at(u32 location, u32 offset, u32 pitch, u32* xb, u32* y)
+@@ -673,7 +832,7 @@ static u32 eng_surface_at(u32 location, u32 offset, u32 pitch, u32* xb, u32* y)
      for (u32 i = 0; i < g.n_surfaces; i++) {
          const eng_surface* s = &g.surfaces[i];
          if (!s->handle || s->location != location || offset < s->offset) continue;
@@ -1907,7 +2137,7 @@ index bb7675c..b5cb7e7 100644
          if (!bpp || s->pitch != pitch) continue;
          const u32 d = offset - s->offset;
          if (d / pitch >= s->h || d % pitch >= s->w * bpp) continue;
-@@ -741,41 +885,38 @@ static void eng_row_convert(u8* dst, const u8* src, u32 w, int rgba, int to_gues
+@@ -741,41 +900,38 @@ static void eng_row_convert(u8* dst, const u8* src, u32 w, int rgba, int to_gues
      }
  }
  
@@ -1972,7 +2202,7 @@ index bb7675c..b5cb7e7 100644
              /* R,G,B,A halves, each stored big-endian: the layout
               * rsx_texture_decode reads W16_Z16_Y16_X16_FLOAT from. */
              for (u32 c = 0; c < n * 4u; c++) {
-@@ -786,6 +927,27 @@ void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32
+@@ -786,6 +942,27 @@ void rsx_draw_engine_guest_read(u32 location, u32 offset, u32 pitch, u32 w, u32
          }
          memcpy(dst, src + skip, bytes);
      }
@@ -2000,7 +2230,7 @@ index bb7675c..b5cb7e7 100644
  }
  
  void rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32 h)
-@@ -794,7 +956,8 @@ void rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32
+@@ -794,7 +971,8 @@ void rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32
      u32 x = 0, y = 0;
      const u32 slot = eng_surface_at(location, offset, pitch, &x, &y);
      /* color_target_write takes R,G,B,A bytes: an A8R8G8B8 surface only. */
@@ -2010,7 +2240,7 @@ index bb7675c..b5cb7e7 100644
          if (eng_coherence_log())
              fprintf(stderr, "[rsx engine] guest_wrote %u:0x%08X %ux%u: no A8R8G8B8 surface\n",
                      location, offset, w, h);
-@@ -817,6 +980,11 @@ void rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32
+@@ -817,6 +995,11 @@ void rsx_draw_engine_guest_wrote(u32 location, u32 offset, u32 pitch, u32 w, u32
                          " %u non-zero pixels\n", location, offset, w, h, s->offset, x, y,
                  eng_nonzero_pixels(rows, w * h, 4u));
      g.be->color_target_write(g.be->user, s->handle, x, y, w, h, rows, w * 4u);
@@ -2022,7 +2252,7 @@ index bb7675c..b5cb7e7 100644
  }
  
  static u32 eng_current_surface(void)
-@@ -861,6 +1029,7 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
+@@ -861,6 +1044,7 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
          return (slot < g.n_zdepths && g.zdepths[slot].handle) ? slot : ENG_INVALID;
  
      eng_zdepth* z = &g.zdepths[slot];
@@ -2030,7 +2260,7 @@ index bb7675c..b5cb7e7 100644
      if (z->handle) g.be->depth_target_release(g.be->user, z->handle);
      z->location = location; z->offset = offset;
      z->w = want_w; z->h = want_h;
-@@ -879,14 +1048,17 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
+@@ -879,14 +1063,17 @@ static u32 eng_zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
   * a depth-WRITING draw: a write-enable bit alone does not prove the pass
   * produced a usable depth map, and a clear-only zeta falls through to guest
   * memory instead (rsx_live_draw.c:6016-6018, 6265-6269). */
@@ -2053,7 +2283,7 @@ index bb7675c..b5cb7e7 100644
      z->snapshot = tex;
      z->snapshot_valid = 1;
      return tex;
-@@ -952,14 +1124,16 @@ static void eng_deswizzle_3d_slice(u8* dst, const u8* src, u32 w, u32 h, u32 d,
+@@ -952,14 +1139,16 @@ static void eng_deswizzle_3d_slice(u8* dst, const u8* src, u32 w, u32 h, u32 d,
                     src + (size_t)rsx_swizzle_offset_3d(x, y, z, lw, lh, ld) * bpp, bpp);
  }
  
@@ -2073,7 +2303,7 @@ index bb7675c..b5cb7e7 100644
      u64 hash = 1469598103934665603ull;
      u32 i = 0;
      for (; i + 8 <= span; i += 8) {
-@@ -1034,11 +1208,12 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
+@@ -1034,11 +1223,12 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
       * inFAMOUS 2's occlusion volumes read an 8x8x8 cone LUT; uploaded as its
       * first slice and sampled in 2D it darkened whole boxes round every prop. */
      if (depth > 1 && !cube && g.be->texture_create_3d && g.be->texture_upload_3d &&
@@ -2088,7 +2318,7 @@ index bb7675c..b5cb7e7 100644
                                                     w, h, depth, nlv, remap, fmt);
          if (!handle) return 0;
          const u8* level_src = src;
-@@ -1046,12 +1221,20 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
+@@ -1046,12 +1236,20 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
          for (u32 m = 0; m < nlv; m++) {
              const rsx_tex_layout* tl = &lv[m].tl;
              const u32 lin_bytes = tl->swizzled ? tl->row_bytes * tl->rows : 0u;
@@ -2111,7 +2341,7 @@ index bb7675c..b5cb7e7 100644
                      u8* lin = g.tex_staging + tl->dst_row_bytes * tl->rows;
                      eng_deswizzle_3d_slice(lin, level_src, lv[m].w, lv[m].h, d, z, tl->bytes_per_texel);
                      rsx_tex_layout ltl = *tl; ltl.swizzled = 0;
-@@ -1063,7 +1246,7 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
+@@ -1063,7 +1261,7 @@ static u32 eng_texture_upload(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
                                         tl, rsx_texture_argb_is_rgba());
                  }
                  g.be->texture_upload_3d(g.be->user, handle, z, m, lv[m].w, lv[m].h,
@@ -2120,7 +2350,7 @@ index bb7675c..b5cb7e7 100644
              }
              level_src += (size_t)tl->face_bytes * d;
              if (d > 1) d >>= 1;
-@@ -1120,7 +1303,7 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
+@@ -1120,7 +1318,7 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
          if (e->location != location || e->offset != offset ||
              e->format != fmt || e->width != w || e->height != h ||
              e->pitch != pitch || e->remap != remap ||
@@ -2129,7 +2359,7 @@ index bb7675c..b5cb7e7 100644
              continue;
          if (e->handle && e->last_hash_frame != g.frames) {
              /* Every cached texture used to be hashed in full every frame;
-@@ -1170,6 +1353,7 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
+@@ -1170,6 +1368,7 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
      e.location = location; e.offset = offset; e.format = fmt;
      e.width = w; e.height = h; e.pitch = pitch;
      e.remap = remap; e.cubemap = (u32)(cube != 0); e.depth = depth;
@@ -2137,7 +2367,7 @@ index bb7675c..b5cb7e7 100644
      e.last_hash_frame = g.frames;
      e.last_full_frame = g.frames - (index & (ENG_TEXHASH_FULL_EVERY - 1u));
      e.last_use_serial = ++g.texture_use_serial;
-@@ -1194,13 +1378,14 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
+@@ -1194,13 +1393,14 @@ static u32 eng_texture_slot(u32 location, u32 offset, u32 fmt, u32 w, u32 h,
   * guest memory like any other, so every format the decoder knows reads them
   * the way RSX would. A surface is stored at most once per write to it. */
  
@@ -2155,7 +2385,7 @@ index bb7675c..b5cb7e7 100644
              e->last_hash_frame = g.frames - 1u;
              e->last_full_frame = g.frames - ENG_TEXHASH_FULL_EVERY;   /* hash it all */
          }
-@@ -1225,15 +1410,17 @@ static int eng_format_reinterprets_rgba8(u32 base_fmt)
+@@ -1225,15 +1425,17 @@ static int eng_format_reinterprets_rgba8(u32 base_fmt)
      }
  }
  
@@ -2177,7 +2407,7 @@ index bb7675c..b5cb7e7 100644
      s->guest_dirty = 0;
      eng_textures_touch(s->location, s->offset, s->pitch * s->h);
      return 1;
-@@ -1298,6 +1485,7 @@ static int eng_zdepth_to_guest(u32 slot)
+@@ -1298,6 +1500,7 @@ static int eng_zdepth_to_guest(u32 slot)
  static void eng_zdepth_wrote(u32 slot, const rsx_dsp_surface* sf)
  {
      eng_zdepth* z = &g.zdepths[slot];
@@ -2185,7 +2415,7 @@ index bb7675c..b5cb7e7 100644
      z->depth_serial = ++g.write_serial;
      z->guest_dirty = 1;
      z->zfmt = sf->depth_format;
-@@ -1306,12 +1494,103 @@ static void eng_zdepth_wrote(u32 slot, const rsx_dsp_surface* sf)
+@@ -1306,12 +1509,103 @@ static void eng_zdepth_wrote(u32 slot, const rsx_dsp_surface* sf)
      z->used_h = sf->clip_h ? sf->clip_h : g.height;
  }
  
@@ -2289,7 +2519,7 @@ index bb7675c..b5cb7e7 100644
      }
  }
  
-@@ -1319,8 +1598,8 @@ static void eng_surfaces_wrote(const u32* targets, u32 n_targets)
+@@ -1319,8 +1613,8 @@ static void eng_surfaces_wrote(const u32* targets, u32 n_targets)
   * the four combinations of a nearest/linear minification with a
   * nearest/linear mip filter) and mag [26:24]; SET_TEXTURE_CONTROL0 carries
   * max LOD at [18:7] and min LOD at [30:19], both 4.8 fixed point. RSX's LOD
@@ -2300,7 +2530,7 @@ index bb7675c..b5cb7e7 100644
  static void eng_decode_sampler(u32 filter, u32 wrap, u32 control0,
                                 rsx_be_sampler_desc* out)
  {
-@@ -1333,6 +1612,10 @@ static void eng_decode_sampler(u32 filter, u32 wrap, u32 control0,
+@@ -1333,6 +1627,10 @@ static void eng_decode_sampler(u32 filter, u32 wrap, u32 control0,
      out->wrap_s = (u8)(wrap & 0xFu);
      out->wrap_t = (u8)((wrap >> 8) & 0xFu);
      out->wrap_r = (u8)((wrap >> 16) & 0xFu);
@@ -2311,7 +2541,7 @@ index bb7675c..b5cb7e7 100644
      out->min_lod = (float)((control0 >> 19) & 0xFFFu) / 256.0f;
      out->max_lod = out->mip_present ? (float)((control0 >> 7) & 0xFFFu) / 256.0f
                                      : 0.0f;
-@@ -1409,6 +1692,30 @@ static u32 eng_cube_mask(void)
+@@ -1409,6 +1707,30 @@ static u32 eng_cube_mask(void)
   * layout and by the pipeline, because they must not disagree: the built-in
   * program declares all sixteen inputs, so narrowing the layout for it would
   * leave the pipeline's vertex descriptor short of what the shader reads. */
@@ -2342,7 +2572,7 @@ index bb7675c..b5cb7e7 100644
  static int eng_guest_programs(const u8** out_vp, u32* out_vp_instrs,
                                const u8** out_fp, u32* out_fp_size)
  {
-@@ -1430,8 +1737,12 @@ static int eng_guest_programs(const u8** out_vp, u32* out_vp_instrs,
+@@ -1430,8 +1752,12 @@ static int eng_guest_programs(const u8** out_vp, u32* out_vp_instrs,
          u32 fp_loc = 0;
          const u32 fp_off = rsx_dsp_fragment_program(&g.rsx, &fp_loc);
          fp_uc = eng_guest_ptr(NULL, fp_loc, fp_off, 16);
@@ -2357,7 +2587,7 @@ index bb7675c..b5cb7e7 100644
          if (!fp_uc) fp_size = 0;
      }
  
-@@ -1442,6 +1753,39 @@ static int eng_guest_programs(const u8** out_vp, u32* out_vp_instrs,
+@@ -1442,6 +1768,39 @@ static int eng_guest_programs(const u8** out_vp, u32* out_vp_instrs,
      return vp_instrs && fp_size;
  }
  
@@ -2397,7 +2627,7 @@ index bb7675c..b5cb7e7 100644
  /* The layout the active vertex program actually reads. An uncertain analysis
   * falls back to all sixteen registers (rsx_live_draw.c:3625-3643). */
  static void eng_vertex_layout(rsx_vertex_layout_plan* layout)
-@@ -1450,10 +1794,14 @@ static void eng_vertex_layout(rsx_vertex_layout_plan* layout)
+@@ -1450,10 +1809,14 @@ static void eng_vertex_layout(rsx_vertex_layout_plan* layout)
      const u8* uc = NULL;
      u32 instrs = 0;
      if (eng_guest_programs(&uc, &instrs, NULL, NULL)) {
@@ -2416,7 +2646,7 @@ index bb7675c..b5cb7e7 100644
      }
      rsx_vertex_layout_plan_init(layout, mask);
  }
-@@ -1597,6 +1945,82 @@ static u64 eng_fp_debug_hash(const u8* fp_uc, u32 fp_size)
+@@ -1597,6 +1960,82 @@ static u64 eng_fp_debug_hash(const u8* fp_uc, u32 fp_size)
          ? rsx_fp_structural_hash(fp_uc, fp_size, 1469598103934665603ull) : 0;
  }
  
@@ -2499,7 +2729,7 @@ index bb7675c..b5cb7e7 100644
  static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
                              const rsx_be_render_state* rs,
                              rsx_be_format rt_fmt, u32 rt_count, int* out_fixed,
-@@ -1610,17 +2034,24 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
+@@ -1610,17 +2049,24 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
      u32 vp_instrs = 0, fp_size = 0;
      /* No resident program pair means the built-in one; see kEngFixedVS. */
      const int fixed = !eng_guest_programs(&vp_uc, &vp_instrs, &fp_uc, &fp_size);
@@ -2527,7 +2757,7 @@ index bb7675c..b5cb7e7 100644
      for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++) {
          if (!(sampled_units & (1u << u))) continue;
          rsx_dsp_texture t;
-@@ -1634,7 +2065,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
+@@ -1634,7 +2080,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
          rsx_dsp_texture t; rsx_dsp_get_texture(&g.rsx, u, &t);
          if (t.enabled) gamma_masks[u] = rsx_texture_gamma_mask(t.format, t.remap, t.filter, t.wrap);
      }
@@ -2536,7 +2766,7 @@ index bb7675c..b5cb7e7 100644
      for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; ++u)
          if (!(gamma_units & (1u << u))) gamma_masks[u] = 0;
      /* Texture sign expansion: SET_TEXTURE_ADDRESS's UNSIGNED_REMAP_BIASED
-@@ -1645,7 +2076,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
+@@ -1645,7 +2091,7 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
          rsx_dsp_texture t; rsx_dsp_get_texture(&g.rsx, u, &t);
          if (t.enabled) expand_masks[u] = rsx_texture_expand_mask(t.format, t.remap, t.filter, t.wrap);
      }
@@ -2545,7 +2775,7 @@ index bb7675c..b5cb7e7 100644
      for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; ++u)
          if (!(expand_units & (1u << u))) expand_masks[u] = 0;
  
-@@ -1658,8 +2089,9 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
+@@ -1658,8 +2104,9 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
          if (!(unnorm_mask & (1u << u)))
              unnorm_dim[u][0] = unnorm_dim[u][1] = 0;
  
@@ -2557,7 +2787,7 @@ index bb7675c..b5cb7e7 100644
          return 0;
  
      /* Identity: the vertex program's own bytes, the fragment program's
-@@ -1667,13 +2099,17 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
+@@ -1667,13 +2114,17 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
       * a constant change must not be a new pipeline), the export-width bit of
       * SHADER_CONTROL, the cube and vertex-texture masks, the input layout,
       * and the structural render state. */
@@ -2578,7 +2808,7 @@ index bb7675c..b5cb7e7 100644
          if (!key) return 0;
          const u32 fp_ctrl_key = fp_ctrl & 0x4Eu; /* colour width and fragment depth export */
          key = eng_fnv1a(&fp_ctrl_key, sizeof fp_ctrl_key, key);
-@@ -1794,6 +2230,7 @@ static void dc_reset(void)
+@@ -1794,6 +2245,7 @@ static void dc_reset(void)
      dc.n_arr = dc.n_idx = dc.n_packets = 0;
      dc.n_refs = dc.n_source_refs = dc.n_verts = dc.n_cuts = 0;
      dc.refs_remapped = 0;
@@ -2586,7 +2816,7 @@ index bb7675c..b5cb7e7 100644
      dc.fetch_ok = 1;
      dc.inl = NULL;
      dc.inl_bytes = 0;
-@@ -1844,8 +2281,24 @@ static int dc_reserve_indices(u32 count)
+@@ -1844,8 +2296,24 @@ static int dc_reserve_indices(u32 count)
   * than fetching a phantom vertex wherever the restart sentinel appears, then
   * collapse repeated references and fetch each unique vertex once.
   * rsx_live_draw.c's fetch_batches_hoisted (4165-4292). */
@@ -2611,7 +2841,7 @@ index bb7675c..b5cb7e7 100644
      if (dc.n_immediate) {
          dc.n_source_refs = dc.n_immediate;
          if (!dc_reserve_verts((u64)dc.n_immediate * layout->stride)) {
-@@ -1857,6 +2310,7 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
+@@ -1857,6 +2325,7 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
                  memcpy(dc.verts + (u64)v * layout->stride + slot * 16u,
                         dc.immediate[v][layout->attrs[slot]], 16u);
          dc.n_verts = dc.n_immediate;
@@ -2619,7 +2849,7 @@ index bb7675c..b5cb7e7 100644
          return;
      }
      for (u32 b = 0; b < dc.n_arr && dc.fetch_ok; b++)
-@@ -1900,23 +2354,50 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
+@@ -1900,23 +2369,50 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
          }
      }
      if (!dc.fetch_ok) return;
@@ -2671,7 +2901,7 @@ index bb7675c..b5cb7e7 100644
      if (!dc_reserve_verts((u64)dc.n_refs * layout->stride)) {
          dc.fetch_ok = 0;
          return;
-@@ -1929,6 +2410,8 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
+@@ -1929,6 +2425,8 @@ static void dc_fetch(const rsx_vertex_layout_plan* layout, int allow_remap)
          }
      }
      dc.n_verts = dc.n_refs;
@@ -2680,7 +2910,7 @@ index bb7675c..b5cb7e7 100644
  }
  
  /* ---- sink ---------------------------------------------------------------- */
-@@ -2020,10 +2503,140 @@ static void sink_draw_index(void* user, const rsx_dispatch* r, u32 first, u32 co
+@@ -2020,10 +2518,140 @@ static void sink_draw_index(void* user, const rsx_dispatch* r, u32 first, u32 co
  /* A direct copy is valid only for the entire matching physical sample
   * layout. Reinterpreted, swizzled, mipmapped and subrectangle aliases need a
   * different conversion and must not silently sample stale guest bytes. */
@@ -2748,7 +2978,7 @@ index bb7675c..b5cb7e7 100644
 +            first->crop=copy;first->crop_serial=first->color_serial;first->crop_format=0x81u;
 +            first->crop_w=t->width;first->crop_h=t->height;++g.b8_copies;
 +        } else ++g.b8_reuses;
-+        return g.be->surface_view(g.be->user,first->crop,t->remap & 0xffffu,t->format);
++        return g.be->surface_view(g.be->user,first->crop,t->remap,t->format);
 +    }
 +    const u32 filter=(t->filter>>16)&7u;
 +    if (!g.be->color_b8_mip_snapshot || filter<3 || filter>6 || t->mipmaps<=1)
@@ -2808,7 +3038,7 @@ index bb7675c..b5cb7e7 100644
 +        memcpy(first->b8_mip_hashes,hashes,sizeof hashes);
 +        ++g.b8_copies;
 +    } else ++g.b8_reuses;
-+    return g.be->surface_view(g.be->user,first->b8_mips,t->remap & 0xffffu,t->format);
++    return g.be->surface_view(g.be->user,first->b8_mips,t->remap,t->format);
 +}
 +
  static int eng_color_feedback_compatible(const eng_surface* s,
@@ -2821,7 +3051,7 @@ index bb7675c..b5cb7e7 100644
      const u32 base = t->format & 0x9fu;
      u32 bpp = 0, color = 0;
      switch (s->fmt) {
-@@ -2052,12 +2665,177 @@ static u32 eng_color_feedback_failure(u32 unit, const eng_surface* s,
+@@ -2052,12 +2680,177 @@ static u32 eng_color_feedback_failure(u32 unit, const eng_surface* s,
      if (logs++ < 8)
          fprintf(stderr, "[rsx engine] rejected colour feedback unit %u: "
                  "target %ux%u fmt%u pitch%u, texture %ux%u fmt%02X pitch%u "
@@ -2906,7 +3136,7 @@ index bb7675c..b5cb7e7 100644
 +    if ((s_color_crop_copies+s_color_crop_reuses)%512u == 0)
 +        fprintf(stderr,"[rsx engine] GPU colour crop totals frame=%u copies=%llu reuses=%llu\n",
 +                g.frames,(unsigned long long)s_color_crop_copies,(unsigned long long)s_color_crop_reuses);
-+    return g.be->surface_view(g.be->user,s->crop,t->remap & 0xffffu,t->format);
++    return g.be->surface_view(g.be->user,s->crop,t->remap,t->format);
 +}
 +
 +static u32 eng_cube_alias_failure(const rsx_dsp_texture* t)
@@ -2940,7 +3170,7 @@ index bb7675c..b5cb7e7 100644
 +    }
 +    if (!has_writer)
 +        return eng_texture_slot(t->location,t->offset,t->format,t->width,t->height,
-+                                t->mipmaps,t->pitch,1,t->remap & 0xffffu,1);
++                                t->mipmaps,t->pitch,1,t->remap,1);
 +    const u32 fmt=t->format & 0x9fu;
 +    const u32 bpp=fmt==0x85 ? 4 : fmt==0x9a ? 8 : fmt==0x9b ? 16 : 0;
 +    const rsx_be_format host=fmt==0x85 ? RSX_BE_FMT_R8G8B8A8 :
@@ -2978,13 +3208,13 @@ index bb7675c..b5cb7e7 100644
 +    }
 +    if (count==6 && g.be->cube_snapshot) {
 +        eng_surface* first=&g.surfaces[slots[0]];
-+        if (first->cube && first->cube_remap==(t->remap & 0xffffu) && first->cube_format==t->format &&
++        if (first->cube && first->cube_remap==(t->remap) && first->cube_format==t->format &&
 +            !memcmp(first->cube_faces,handles,sizeof handles) &&
 +            !memcmp(first->cube_serials,serials,sizeof serials)) return first->cube;
-+        const u32 cube=g.be->cube_snapshot(g.be->user,handles,t->remap & 0xffffu,t->format);
++        const u32 cube=g.be->cube_snapshot(g.be->user,handles,t->remap,t->format);
 +        if (cube) {
 +            if (first->cube) g.be->texture_release(g.be->user,first->cube);
-+            first->cube=cube; first->cube_remap=t->remap & 0xffffu; first->cube_format=t->format;
++            first->cube=cube; first->cube_remap=t->remap; first->cube_format=t->format;
 +            memcpy(first->cube_faces,handles,sizeof handles);
 +            memcpy(first->cube_serials,serials,sizeof serials);
 +            return cube;
@@ -2995,13 +3225,13 @@ index bb7675c..b5cb7e7 100644
 +    for (u32 f=0;f<6;++f) if (slots[f]!=ENG_INVALID && !eng_surface_to_guest(slots[f]))
 +        return eng_cube_alias_failure(t);
 +    return eng_texture_slot(t->location,t->offset,t->format,t->width,t->height,
-+                            t->mipmaps,t->pitch,1,t->remap & 0xffffu,1);
++                            t->mipmaps,t->pitch,1,t->remap,1);
 +}
 +
  static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
                                u32 current_zslot, u32 tex_used,
                                u32 textures[RSX_BE_MAX_TEXTURES],
-@@ -2065,6 +2843,8 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
+@@ -2065,6 +2858,8 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
  {
      u32 mask = 0;
      u32 feedback[RSX_BE_MAX_COLOR_TARGETS] = {0};
@@ -3010,7 +3240,7 @@ index bb7675c..b5cb7e7 100644
      for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) {
          rsx_dsp_texture t;
          rsx_dsp_get_texture(&g.rsx, u, &t);
-@@ -2074,6 +2854,20 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
+@@ -2074,6 +2869,20 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
          if (!t.enabled || !((tex_used >> u) & 1u)) continue;
          mask |= 1u << u;
          eng_decode_sampler(t.filter, t.wrap, t.control0, &samplers[u]);
@@ -3031,7 +3261,7 @@ index bb7675c..b5cb7e7 100644
  
          int sampled = -1, own = 0, surface_at = -1;
          for (u32 i = 0; i < g.n_surfaces; i++) {
-@@ -2103,10 +2897,29 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
+@@ -2103,18 +2912,44 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
          if (zsrc >= 0) {
              /* DEPTH24_D8 keeps the backend's own snapshot when it has one;
               * anything else goes through guest memory. */
@@ -3055,7 +3285,7 @@ index bb7675c..b5cb7e7 100644
 +                if (snap) {
 +                    static int reported;
 +                    if (!reported) { reported=1; fprintf(stderr, "[rsx engine] GPU packed depth active (%ux%u)\n", t.width, t.height); }
-+                    const u32 view=g.be->surface_view ? g.be->surface_view(g.be->user,snap,t.remap & 0xFFFFu,t.format) : 0;
++                    const u32 view=g.be->surface_view ? g.be->surface_view(g.be->user,snap,t.remap,t.format) : 0;
 +                    textures[u]=view ? view : snap;
 +                    continue;
 +                }
@@ -3063,7 +3293,9 @@ index bb7675c..b5cb7e7 100644
              if (eng_zdepth_to_guest((u32)zsrc)) {
                  textures[u] = eng_texture_slot(t.location, t.offset, t.format,
                                                 t.width, t.height, t.mipmaps, t.pitch,
-@@ -2115,6 +2928,13 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
+-                                               (int)t.cubemap, t.remap & 0xFFFFu,
++                                               (int)t.cubemap, t.remap,
+                                        (t.dimension == 3 && !t.cubemap) ? t.depth : 1u);
                  continue;
              }
          }
@@ -3077,7 +3309,7 @@ index bb7675c..b5cb7e7 100644
          if (own && zsrc < 0 && g.be->color_snapshot) {
              eng_surface* s = &g.surfaces[surface_at];
              rsx_dsp_surface sf;
-@@ -2125,8 +2945,12 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
+@@ -2125,36 +2960,64 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
              while (k < n_targets && target_slots[k] != (u32)surface_at) k++;
              if (k == n_targets) return eng_color_feedback_failure(u, s, &t);
              if (!feedback[k]) {
@@ -3091,7 +3323,16 @@ index bb7675c..b5cb7e7 100644
                  if (s->feedback) g.be->texture_release(g.be->user, s->feedback);
                  s->feedback = feedback[k] = copy;
              }
-@@ -2141,6 +2965,30 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
+             if (g.be->surface_view) {
+                 textures[u] = g.be->surface_view(g.be->user, feedback[k],
+-                                               t.remap & 0xffffu, t.format);
++                                               t.remap, t.format);
+                 if (!textures[u]) return eng_color_feedback_failure(u, s, &t);
+-            } else if ((t.remap & 0xffffu) == 0xaae4u) {
++            } else if ((t.remap) == 0xaae4u) {
+                 textures[u] = feedback[k];
+             } else {
+                 return eng_color_feedback_failure(u, s, &t);
              }
              continue;
          }
@@ -3115,14 +3356,30 @@ index bb7675c..b5cb7e7 100644
 +                        t.width, t.height, t.offset);
 +            textures[u] = eng_texture_slot(t.location, t.offset, t.format,
 +                                           t.width, t.height, t.mipmaps, t.pitch,
-+                                           (int)t.cubemap, t.remap & 0xFFFFu,
++                                           (int)t.cubemap, t.remap,
 +                                           (t.dimension == 3 && !t.cubemap) ? t.depth : 1u);
 +            continue;
 +        }
          if (sampled >= 0 && zsrc < 0 &&
              g.surfaces[sampled].fmt == RSX_BE_FMT_R8G8B8A8 &&
              eng_format_reinterprets_rgba8(base_fmt) &&
-@@ -2163,7 +3011,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
+             eng_surface_to_guest((u32)sampled)) {
+             textures[u] = eng_texture_slot(t.location, t.offset, t.format,
+                                            t.width, t.height, t.mipmaps, t.pitch,
+-                                           (int)t.cubemap, t.remap & 0xFFFFu,
++                                           (int)t.cubemap, t.remap,
+                                        (t.dimension == 3 && !t.cubemap) ? t.depth : 1u);
+             continue;
+         }
+         if (sampled >= 0) {
+             const u32 view = g.be->surface_view
+                 ? g.be->surface_view(g.be->user, g.surfaces[sampled].handle,
+-                                     t.remap & 0xFFFFu, t.format)
++                                     t.remap, t.format)
+                 : 0;
+             textures[u] = view ? view : g.surfaces[sampled].handle;
+             continue;
+@@ -2163,7 +3026,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
              for (u32 i = 0; i < g.n_zdepths; i++)
                  if (g.zdepths[i].location == t.location &&
                      g.zdepths[i].offset == t.offset && current_zslot != i) {
@@ -3131,7 +3388,16 @@ index bb7675c..b5cb7e7 100644
                      if (snap) textures[u] = snap;
                      break;
                  }
-@@ -2447,6 +3295,18 @@ static void pd_note(const u32* targets, u32 n_targets, u32 zslot,
+@@ -2171,7 +3034,7 @@ static u32 sink_bind_textures(const u32* target_slots, u32 n_targets,
+         }
+         textures[u] = eng_texture_slot(t.location, t.offset, t.format,
+                                        t.width, t.height, t.mipmaps, t.pitch,
+-                                       (int)t.cubemap, t.remap & 0xFFFFu,
++                                       (int)t.cubemap, t.remap,
+                                        (t.dimension == 3 && !t.cubemap) ? t.depth : 1u);
+     }
+     return mask;
+@@ -2447,6 +3310,18 @@ static void pd_note(const u32* targets, u32 n_targets, u32 zslot,
                      t.format & 0xFFu, t.width, t.height);
          }
          fprintf(s_pd.draws_log, "\n");
@@ -3150,7 +3416,16 @@ index bb7675c..b5cb7e7 100644
      }
      if (s_pd.draws++) return;
  
-@@ -2514,6 +3374,41 @@ static void pd_present(u32 presented)
+@@ -2486,7 +3361,7 @@ static void pd_note(const u32* targets, u32 n_targets, u32 zslot,
+         at += (size_t)snprintf(s_pd.first + at, sizeof s_pd.first - at,
+             " t%u %u:0x%08X f%02X %ux%u p%u%s r%04X zf%u %s", u, t.location, t.offset,
+             t.format & 0xFFu, t.width, t.height, t.pitch, t.cubemap ? " cube" : "",
+-            t.remap & 0xFFFFu, t.wrap >> 28, src);
++            t.remap, t.wrap >> 28, src);
+     }
+ }
+ 
+@@ -2514,6 +3389,41 @@ static void pd_present(u32 presented)
      }
  }
  
@@ -3192,7 +3467,7 @@ index bb7675c..b5cb7e7 100644
  static void sink_end(void* user, const rsx_dispatch* r)
  {
      (void)user; (void)r;
-@@ -2541,9 +3436,13 @@ static void sink_end(void* user, const rsx_dispatch* r)
+@@ -2541,9 +3451,13 @@ static void sink_end(void* user, const rsx_dispatch* r)
          if (topology == RSX_TOPOLOGY_UNSUPPORTED) return;
      }
  
@@ -3206,7 +3481,7 @@ index bb7675c..b5cb7e7 100644
      if (!dc.n_verts || !dc.fetch_ok) return;
  
      int indexed = 0;
-@@ -2557,6 +3456,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
+@@ -2557,6 +3471,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
      }
      if (!n_draw) return;
  
@@ -3214,7 +3489,7 @@ index bb7675c..b5cb7e7 100644
      rsx_be_render_state rs;
      rsx_draw_engine_decode_render_state(&g.rsx, &rs);
  
-@@ -2571,6 +3471,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
+@@ -2571,6 +3486,7 @@ static void sink_end(void* user, const rsx_dispatch* r)
      rsx_dsp_get_viewport(&g.rsx, &vp);
      const u32 zslot = eng_zdepth_get(sf.zeta_location, sf.zeta_offset,
                                       sf.clip_w, sf.clip_h);
@@ -3222,7 +3497,7 @@ index bb7675c..b5cb7e7 100644
  
      /* A guest program pair that will not translate has no fallback: the draw
       * is dropped, as the reference engine drops it. Substituting the built-in
-@@ -2579,10 +3480,12 @@ static void sink_end(void* user, const rsx_dispatch* r)
+@@ -2579,10 +3495,12 @@ static void sink_end(void* user, const rsx_dispatch* r)
      int pipeline_is_fixed = 1;
      u32 tex_used = 0;
      u64 fp_hash = 0;
@@ -3235,7 +3510,7 @@ index bb7675c..b5cb7e7 100644
      if (!pipeline) return;
      if (fp_hash && eng_debug_fp(fp_hash, pipeline)) return;
  
-@@ -2596,9 +3499,13 @@ static void sink_end(void* user, const rsx_dispatch* r)
+@@ -2596,9 +3514,13 @@ static void sink_end(void* user, const rsx_dispatch* r)
      memset(samplers, 0, sizeof samplers);
      memset(vtextures, 0, sizeof vtextures);
      memset(vsamplers, 0, sizeof vsamplers);
@@ -3249,7 +3524,7 @@ index bb7675c..b5cb7e7 100644
      const u32 vtex_mask = sink_bind_vertex_textures(eng_vtex_mask(), vtextures,
                                                      vsamplers);
  
-@@ -2661,10 +3568,23 @@ static void sink_end(void* user, const rsx_dispatch* r)
+@@ -2661,10 +3583,23 @@ static void sink_end(void* user, const rsx_dispatch* r)
          g.zdepths[zslot].had_write = 0;
      }
  
@@ -3273,7 +3548,7 @@ index bb7675c..b5cb7e7 100644
      g.be->bind_vs_constants(g.be->user, g.vp_cb, ENG_VP_CB_BYTES);
      g.be->bind_ps_constants(g.be->user, g.fp_cb, fp_bytes);
      g.be->bind_textures(g.be->user, textures, samplers, tex_mask);
-@@ -2708,9 +3628,27 @@ static void sink_end(void* user, const rsx_dispatch* r)
+@@ -2708,9 +3643,27 @@ static void sink_end(void* user, const rsx_dispatch* r)
          g.be->set_depth_bounds(g.be->user, fmin, fmax);
      }
  
@@ -3304,7 +3579,7 @@ index bb7675c..b5cb7e7 100644
      /* Counted only when the draw ran the guest's OWN programs, which is what
       * the test hook means: a draw through the built-in pair is a draw, not
       * evidence that the decompile-translate-compile path worked. */
-@@ -2771,8 +3709,7 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
+@@ -2771,8 +3724,7 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
           * 0xFFFFFF00 seeded by rsx_dispatch_init clears to 1.0 / 0. */
          const u32 zs = rsx_dsp_reg(&g.rsx, M_ZSTENCIL_CLEAR);
          const int z16 = sf.depth_format == 1u;
@@ -3314,7 +3589,7 @@ index bb7675c..b5cb7e7 100644
                                  : (float)(zs >> 8) / 16777215.0f;
          g.be->clear_depth_stencil(g.be->user, g.zdepths[zslot].handle, flags,
                                    depth, z16 ? 0 : (u8)(zs & 0xFFu));
-@@ -2806,6 +3743,28 @@ static u32 eng_present_surface(u32 buffer_id)
+@@ -2806,6 +3758,28 @@ static u32 eng_present_surface(u32 buffer_id)
  static void eng_present(u32 buffer_id)
  {
      if (!g.ready) return;
@@ -3343,7 +3618,7 @@ index bb7675c..b5cb7e7 100644
      const u32 target = eng_present_surface(buffer_id);
      if (target == ENG_INVALID) return;
      if (getenv("PS3RECOMP_METAL_FRAME_DUMP") && g.frames % 120 == 0) {
-@@ -2820,7 +3779,63 @@ static void eng_present(u32 buffer_id)
+@@ -2820,7 +3794,63 @@ static void eng_present(u32 buffer_id)
      pd_present(target);
      g.last_present_surface = target;
      g.be->present(g.be->user, g.surfaces[target].handle);
@@ -3407,7 +3682,7 @@ index bb7675c..b5cb7e7 100644
      g.last_guest_draws = g.guest_draws;
      g.guest_draws = 0;
  }
-@@ -2865,7 +3880,31 @@ int rsx_draw_engine_enabled(void)
+@@ -2865,7 +3895,33 @@ int rsx_draw_engine_enabled(void)
  
  int rsx_draw_engine_init(u32 width, u32 height)
  {
@@ -3423,6 +3698,8 @@ index bb7675c..b5cb7e7 100644
 +    g.surface_seed_trace = surface_trace && surface_trace[0] == '1';
 +    const char* typed_seed = getenv("RSX_SURFACE_TYPED_SEED");
 +    g.surface_typed_seed = typed_seed && typed_seed[0] == '1';
++    const char* gpu_seed = getenv("RSX_SURFACE_GPU_SEED");
++    g.surface_gpu_seed = gpu_seed && gpu_seed[0] == '1';
 +    const char* b8_feedback = getenv("RSX_B8_SURFACE_FEEDBACK");
 +    g.b8_feedback = b8_feedback && b8_feedback[0] == '1';
 +    const char* vp_metadata = getenv("RSX_VP_METADATA_CACHE");
@@ -3439,7 +3716,7 @@ index bb7675c..b5cb7e7 100644
      g.width  = width  ? width  : 1280;
      g.height = height ? height : 720;
      { const char* e = getenv("PS3RECOMP_ENG_TEXHASH_FULL");
-@@ -2906,17 +3945,25 @@ void rsx_draw_engine_shutdown(void)
+@@ -2906,17 +3962,25 @@ void rsx_draw_engine_shutdown(void)
          if (g.pipelines[i].handle) g.be->pipeline_release(g.be->user, g.pipelines[i].handle);
      for (u32 i = 0; i < g.n_surfaces; i++) {
          if (g.surfaces[i].feedback) g.be->texture_release(g.be->user, g.surfaces[i].feedback);
@@ -3467,7 +3744,7 @@ index bb7675c..b5cb7e7 100644
      memset(&g, 0, sizeof g);
      g.be = be;
 diff --git a/libs/video/rsx_draw_engine.h b/libs/video/rsx_draw_engine.h
-index 4dec1d6..7f447e4 100644
+index 4dec1d6..f84cca5 100644
 --- a/libs/video/rsx_draw_engine.h
 +++ b/libs/video/rsx_draw_engine.h
 @@ -27,6 +27,7 @@
@@ -3541,7 +3818,7 @@ index 4dec1d6..7f447e4 100644
  
      /* Optional. 3D textures (SET_TEXTURE_FORMAT dimension 3, CONTROL3 depth):
       * a volume of `depth` slices per level, each slice one upload of decoded
-@@ -244,6 +276,20 @@ typedef struct rsx_draw_backend {
+@@ -244,6 +276,25 @@ typedef struct rsx_draw_backend {
                                u32 depth, u32 mips, u32 remap, u32 rsx_fmt);
      void (*texture_upload_3d)(void* user, u32 texture, u32 z, u32 mip,
                                u32 w, u32 h, const void* src, u32 row_bytes);
@@ -3559,10 +3836,15 @@ index 4dec1d6..7f447e4 100644
 +    /* Ordered immutable cube from six equal square colour surfaces. Face
 +     * order is +X,-X,+Y,-Y,+Z,-Z; one mip level, with the guest crossbar. */
 +    u32 (*cube_snapshot)(void* user, const u32 faces[6], u32 remap, u32 rsx_format);
++    /* Optional exact B8 seed: snapshot w bytes from each pitched guest row
++     * before returning. Produce RGBA8 {b,b,b,255} in command order before
++     * any subsequent clear/draw/sample. Return 0 for the CPU fallback. */
++    u32 (*color_target_create_b8)(void* user, u32 w, u32 h,
++                                  const void* source, u32 pitch);
  } rsx_draw_backend;
  
  /* ---- the engine --------------------------------------------------------- */
-@@ -304,6 +350,7 @@ void rsx_draw_engine_note_flip(u32 buffer_id);
+@@ -304,6 +355,7 @@ void rsx_draw_engine_note_flip(u32 buffer_id);
   * falls in. `offset` is the rectangle's first byte, `pitch` the guest row
   * pitch, `w` and `h` in 32-bit pixels. Only 8-bit-per-channel surfaces laid
   * out with the same pitch take part; anything else is left alone. */
@@ -3767,7 +4049,7 @@ index 670e886..d63dc7c 100644
   * retaining structural identity. This is intended for aggregate diagnostics;
   * PSO identity should use rsx_fp_structural_hash in buffered mode. */
 diff --git a/libs/video/rsx_metal_backend.m b/libs/video/rsx_metal_backend.m
-index 32f0b95..56fb8a7 100644
+index 32f0b95..142aac7 100644
 --- a/libs/video/rsx_metal_backend.m
 +++ b/libs/video/rsx_metal_backend.m
 @@ -51,11 +51,13 @@
@@ -3887,7 +4169,7 @@ index 32f0b95..56fb8a7 100644
      ENG_REC_DRAW, ENG_REC_CLEAR_COLOR, ENG_REC_CLEAR_DS, ENG_REC_DEPTH_RESOLVE,
 -    ENG_REC_COLOR_SNAPSHOT
 +    ENG_REC_COLOR_SNAPSHOT, ENG_REC_COLOR_RG16, ENG_REC_CUBE_SNAPSHOT,
-+    ENG_REC_COLOR_B8
++    ENG_REC_COLOR_B8, ENG_REC_B8_SEED
  } EngRecKind;
  
  typedef struct {
@@ -3930,7 +4212,7 @@ index 32f0b95..56fb8a7 100644
  
  /* What the bind_* calls have accumulated for the next draw. */
  static EngRecord s_eng_pending;
-@@ -2286,7 +2327,9 @@ static void release_surfaces(void)
+@@ -2286,7 +2327,10 @@ static void release_surfaces(void)
  static id<MTLLibrary>             s_eng_helper_lib;
  static id<MTLRenderPipelineState> s_eng_blit_pso;
  static MTLPixelFormat             s_eng_blit_pso_fmt;
@@ -3938,10 +4220,11 @@ index 32f0b95..56fb8a7 100644
 +static id<MTLRenderPipelineState> s_eng_depth_pso, s_eng_depth_packed_pso;
 +static id<MTLComputePipelineState> s_eng_color_rg16_pso;
 +static id<MTLComputePipelineState> s_eng_color_b8_pso;
++static id<MTLComputePipelineState> s_eng_b8_seed_pso;
  static id<MTLSamplerState>        s_eng_point_sampler;
  static id<MTLSamplerState>        s_eng_linear_sampler;   /* FXAA's taps */
  
-@@ -2338,7 +2381,7 @@ static void eng_post_options(void)
+@@ -2338,7 +2382,7 @@ static void eng_post_options(void)
  "fragment float4 eng_blit_fs(BOut i [[stage_in]],\n"
  "                            texture2d<float> src [[texture(0)]],\n"
  "                            sampler s [[sampler(0)]]) {\n"
@@ -3950,7 +4233,7 @@ index 32f0b95..56fb8a7 100644
  "}\n"
  /* The present: optional contrast-adaptive sharpening (AMD FidelityFX CAS,
   * the non-scaling form: a cross whose negative weight grows where the 3x3
-@@ -2460,10 +2503,37 @@ static void eng_post_options(void)
+@@ -2460,10 +2504,43 @@ static void eng_post_options(void)
  "    else           posM.y += pixelOffsetSubpix * lengthSign;\n"
  "    return float4(t.sample(s, posM).rgb, rgbyM.a);\n"
  "}\n"
@@ -3981,6 +4264,12 @@ index 32f0b95..56fb8a7 100644
 +"    if(p.x>=dst.get_width() || p.y>=dst.get_height()) return;\n"
 +"    dst.write(float4(src.read(p).b,0,0,1),p);\n"
 +"}\n"
++"kernel void eng_seed_b8(const device uchar* src [[buffer(0)]],\n"
++"    texture2d<float,access::write> dst [[texture(0)]], uint2 p [[thread_position_in_grid]]) {\n"
++"    if(p.x>=dst.get_width() || p.y>=dst.get_height()) return;\n"
++"    float b=float(src[p.y*dst.get_width()+p.x])/255.0f;\n"
++"    dst.write(float4(b,b,b,1.0f),p);\n"
++"}\n"
  "fragment float eng_depth_fs(BOut i [[stage_in]],\n"
  "                            depth2d<float> src [[texture(0)]],\n"
  "                            sampler s [[sampler(0)]]) {\n"
@@ -3989,7 +4278,7 @@ index 32f0b95..56fb8a7 100644
  "}\n";
  
  static u32 eng_obj_add(id<MTLTexture> t)
-@@ -2477,6 +2547,7 @@ static u32 eng_obj_add(id<MTLTexture> t)
+@@ -2477,6 +2554,7 @@ static u32 eng_obj_add(id<MTLTexture> t)
          slot = s_eng_obj_count++;
      }
      s_eng_obj[slot] = t;
@@ -3997,7 +4286,7 @@ index 32f0b95..56fb8a7 100644
      return slot + 1;
  }
  
-@@ -2495,6 +2566,7 @@ static void eng_collect_retired_objects(void)
+@@ -2495,6 +2573,7 @@ static void eng_collect_retired_objects(void)
          if (!s_eng_obj_retired[i]) continue;
          s_eng_obj_retired[i] = 0;
          s_eng_obj[i] = nil;
@@ -4005,7 +4294,7 @@ index 32f0b95..56fb8a7 100644
          s_eng_obj_free[s_eng_obj_free_count++] = i;
      }
  }
-@@ -2537,9 +2609,72 @@ static MTLPixelFormat eng_pixel_format(rsx_be_format f)
+@@ -2537,9 +2616,72 @@ static MTLPixelFormat eng_pixel_format(rsx_be_format f)
  /* ---- staging ------------------------------------------------------------- */
  
  static void eng_encode_and_commit(id<MTLTexture> present_dst);
@@ -4078,7 +4367,7 @@ index 32f0b95..56fb8a7 100644
      const u32 start = (s_eng_stage_used + ENG_ALIGN - 1u) & ~(ENG_ALIGN - 1u);
      if ((u64)start + bytes > ENG_STAGE_MAX) {
          /* Submit and wait rather than drop the rest of the frame; everything
-@@ -2547,7 +2682,9 @@ static int eng_stage_reserve(u32 bytes, u32* out_off)
+@@ -2547,7 +2689,9 @@ static int eng_stage_reserve(u32 bytes, u32* out_off)
          eng_encode_and_commit(nil);
          return eng_stage_reserve(bytes, out_off);
      }
@@ -4089,7 +4378,7 @@ index 32f0b95..56fb8a7 100644
          u32 cap = s_eng_stage_cap ? s_eng_stage_cap : (4u << 20);
          while (start + bytes > cap) cap *= 2u;
          u8* n = (u8*)realloc(s_eng_stage, cap);
-@@ -2568,14 +2705,56 @@ static int eng_stage_copy(const void* src, u32 bytes, u32* out_off)
+@@ -2568,20 +2712,68 @@ static int eng_stage_copy(const void* src, u32 bytes, u32* out_off)
      return 1;
  }
  
@@ -4146,7 +4435,19 @@ index 32f0b95..56fb8a7 100644
      s_eng_helper_lib = [s_dev newLibraryWithSource:kEngHelperMSL options:nil error:&err];
      if (!s_eng_helper_lib) {
          fprintf(stderr, "[rsx engine/metal] helper shader compile failed: %s\n",
-@@ -2597,9 +2776,18 @@ static int eng_init(void* user, u32 width, u32 height)
+                 [[err localizedDescription] UTF8String]);
+         return -1;
+     }
++    const char* gpu_seed = getenv("RSX_SURFACE_GPU_SEED");
++    if (gpu_seed && gpu_seed[0] == '1')
++        s_eng_b8_seed_pso = [s_dev newComputePipelineStateWithFunction:
++            [s_eng_helper_lib newFunctionWithName:@"eng_seed_b8"] error:&err];
++    /* An unavailable optional pipeline retains the CPU seed path. Compile
++     * at renderer startup, never on the first large gameplay surface. */
+     MTLSamplerDescriptor* sd = [MTLSamplerDescriptor new];
+     sd.minFilter = MTLSamplerMinMagFilterNearest;
+     sd.magFilter = MTLSamplerMinMagFilterNearest;
+@@ -2597,9 +2789,18 @@ static int eng_init(void* user, u32 width, u32 height)
  static void eng_shutdown(void* user)
  {
      (void)user;
@@ -4166,7 +4467,7 @@ index 32f0b95..56fb8a7 100644
          s_eng_pipe[i].ds = nil;
      }
      for (u32 i = 0; i < s_eng_func_count; i++) s_eng_func[i].fn = nil;
-@@ -2608,11 +2796,20 @@ static void eng_shutdown(void* user)
+@@ -2608,11 +2809,21 @@ static void eng_shutdown(void* user)
      memset(s_eng_obj_retired, 0, sizeof s_eng_obj_retired);
      s_eng_pipe_count = s_eng_func_count = s_eng_samp_count = s_eng_view_count = 0;
      s_eng_rec_count = 0;
@@ -4186,10 +4487,11 @@ index 32f0b95..56fb8a7 100644
 +    s_eng_depth_pso = nil; s_eng_depth_packed_pso = nil;
 +    s_eng_color_rg16_pso = nil;
 +    s_eng_color_b8_pso = nil;
++    s_eng_b8_seed_pso = nil;
      s_eng_point_sampler = nil;
      s_eng_linear_sampler = nil;
      s_eng_fxaa_pso = nil;
-@@ -2661,6 +2858,9 @@ static void eng_texture_upload(void* user, u32 handle, u32 face, u32 mip,
+@@ -2661,6 +2872,9 @@ static void eng_texture_upload(void* user, u32 handle, u32 face, u32 mip,
      (void)user; (void)rows;
      id<MTLTexture> t = eng_obj(handle);
      if (!t || !src || !row_bytes) return;
@@ -4199,7 +4501,7 @@ index 32f0b95..56fb8a7 100644
      [t replaceRegion:MTLRegionMake2D(0, 0, w, h)
           mipmapLevel:mip
                 slice:face
-@@ -2698,6 +2898,7 @@ static void eng_texture_upload_3d(void* user, u32 handle, u32 z, u32 mip,
+@@ -2698,6 +2912,7 @@ static void eng_texture_upload_3d(void* user, u32 handle, u32 z, u32 mip,
      (void)user;
      id<MTLTexture> t = eng_obj(handle);
      if (!t || !src || !row_bytes) return;
@@ -4207,7 +4509,43 @@ index 32f0b95..56fb8a7 100644
      [t replaceRegion:MTLRegionMake3D(0, 0, z, w, h, 1)
           mipmapLevel:mip
                 slice:0
-@@ -2742,7 +2943,7 @@ static u32 eng_surface_view(void* user, u32 surface, u32 remap, u32 rsx_format)
+@@ -2727,6 +2942,35 @@ static u32 eng_color_target_create(void* user, rsx_be_format fmt, u32 w, u32 h,
+     return eng_obj_add(t);
+ }
+ 
++static u32 eng_color_target_create_b8(void* user, u32 w, u32 h,
++                                      const void* source, u32 pitch)
++{
++    (void)user;
++    const u64 bytes = (u64)w*h;
++    if (!s_dev || !s_eng_b8_seed_pso || !source || !w || !h || pitch < w ||
++        bytes > ENG_STAGE_MAX || s_eng_rec_count >= ENG_MAX_RECORDS) return 0;
++    MTLTextureDescriptor* td = [MTLTextureDescriptor
++        texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
++        width:w height:h mipmapped:NO];
++    td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead |
++               MTLTextureUsageShaderWrite | MTLTextureUsagePixelFormatView;
++    id<MTLTexture> texture = [s_dev newTextureWithDescriptor:td];
++    if (!texture) return 0;
++    u32 offset;
++    if (!eng_stage_reserve((u32)bytes, &offset)) return 0;
++    const u32 handle = eng_obj_add(texture);
++    if (!handle) return 0;
++    /* Immutable compact snapshot; the normal staging fences protect it
++     * until GPU completion. Do not keep or re-read a mutable guest pointer. */
++    for (u32 y=0; y<h; ++y)
++        memcpy(s_eng_stage+offset+(size_t)y*w, (const u8*)source+(size_t)y*pitch, w);
++    EngRecord* r = &s_eng_rec[s_eng_rec_count++];
++    memset(r,0,sizeof *r); r->kind=ENG_REC_B8_SEED;
++    r->resolve_dst=handle; r->packed_off=offset; r->packed_bytes=(u32)bytes;
++    s_eng_obj_upload_sealed[handle-1]=1;
++    return handle;
++}
++
+ static u32 eng_surface_view(void* user, u32 surface, u32 remap, u32 rsx_format)
+ {
+     (void)user;
+@@ -2742,7 +2986,7 @@ static u32 eng_surface_view(void* user, u32 surface, u32 remap, u32 rsx_format)
      id<MTLTexture> v =
          [t newTextureViewWithPixelFormat:[t pixelFormat]
                               textureType:MTLTextureType2D
@@ -4216,7 +4554,7 @@ index 32f0b95..56fb8a7 100644
                                    slices:NSMakeRange(0, 1)
                                   swizzle:MTLTextureSwizzleChannelsMake(
                                               swizzle_sel(sel[1]), swizzle_sel(sel[2]),
-@@ -2759,24 +2960,168 @@ static u32 eng_surface_view(void* user, u32 surface, u32 remap, u32 rsx_format)
+@@ -2759,24 +3003,168 @@ static u32 eng_surface_view(void* user, u32 surface, u32 remap, u32 rsx_format)
  
  /* Allocate now, copy in command order. The returned object is unique to
   * this draw; later snapshots never overwrite a queued draw's sampled image. */
@@ -4390,7 +4728,7 @@ index 32f0b95..56fb8a7 100644
      return copy;
  }
  
-@@ -2790,7 +3135,8 @@ static u32 eng_depth_target_create(void* user, u32 w, u32 h)
+@@ -2790,7 +3178,8 @@ static u32 eng_depth_target_create(void* user, u32 w, u32 h)
                                                         mipmapped:NO];
      /* ShaderRead as well as RenderTarget: depth-as-texture resolves through a
       * pass that samples this as a depth2d, so it cannot be write-only. */
@@ -4400,7 +4738,7 @@ index 32f0b95..56fb8a7 100644
      td.storageMode = MTLStorageModePrivate;
      return eng_obj_add([s_dev newTextureWithDescriptor:td]);
  }
-@@ -2798,40 +3144,50 @@ static u32 eng_depth_target_create(void* user, u32 w, u32 h)
+@@ -2798,40 +3187,50 @@ static u32 eng_depth_target_create(void* user, u32 w, u32 h)
  /* The sampleable copy of a depth target. The copy is a record in the stream,
   * not an immediate blit, because it has to observe the depth the passes
   * recorded so far actually wrote. */
@@ -4460,7 +4798,7 @@ index 32f0b95..56fb8a7 100644
  /* ---- pipelines ----------------------------------------------------------- */
  
  static id<MTLFunction> eng_function(const char* hlsl, int stage,
-@@ -2842,22 +3198,41 @@ static u32 eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
+@@ -2842,22 +3241,41 @@ static u32 eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
          if (s_eng_func[i].hash == hash) return s_eng_func[i].fn;
      if (s_eng_func_count >= ENG_MAX_FUNCS) return nil;
  
@@ -4503,7 +4841,7 @@ index 32f0b95..56fb8a7 100644
      return fn;
  }
  
-@@ -2949,13 +3324,31 @@ static u32 eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_h
+@@ -2949,13 +3367,31 @@ static u32 eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_h
      }
  
      NSError* err = nil;
@@ -4536,7 +4874,7 @@ index 32f0b95..56fb8a7 100644
  
      /* Depth and stencil are pipeline state in D3D12 and an encoder object in
       * Metal, so the engine's render state splits here rather than upstream. */
-@@ -2991,7 +3384,13 @@ static u32 eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_h
+@@ -2991,7 +3427,13 @@ static u32 eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_h
  
      const u32 slot = s_eng_pipe_count++;
      s_eng_pipe[slot].pso = pso;
@@ -4550,7 +4888,7 @@ index 32f0b95..56fb8a7 100644
      /* CULL_FACE FRONT=0x0404 BACK=0x0405 FRONT_AND_BACK=0x0408 (front here,
       * as in the D3D12 engine); FRONT_FACE CW=0x0900 CCW=0x0901. */
      s_eng_pipe[slot].cull = MTLCullModeNone;
-@@ -3011,6 +3410,7 @@ static void eng_pipeline_release(void* user, u32 pipeline)
+@@ -3011,6 +3453,7 @@ static void eng_pipeline_release(void* user, u32 pipeline)
      (void)user;
      if (pipeline && pipeline <= s_eng_pipe_count) {
          s_eng_pipe[pipeline - 1].pso = nil;
@@ -4558,7 +4896,7 @@ index 32f0b95..56fb8a7 100644
          s_eng_pipe[pipeline - 1].ds  = nil;
      }
  }
-@@ -3021,8 +3421,8 @@ static void eng_pipeline_release(void* user, u32 pipeline)
+@@ -3021,8 +3464,8 @@ static void eng_pipeline_release(void* user, u32 pipeline)
   * linearly through a mip chain, which is where a surface seen at a grazing
   * angle (a road, a wall along the view) blurs. Point-filtered and unmipped
   * samplers -- lookup tables, render targets, UI -- keep their filtering, so
@@ -4569,7 +4907,7 @@ index 32f0b95..56fb8a7 100644
  static int eng_aniso_from(const char* e)
  {
      if (!e || !*e) return 0;
-@@ -3042,12 +3442,37 @@ static int eng_aniso(void)
+@@ -3042,12 +3485,37 @@ static int eng_aniso(void)
  
  static int eng_sampler_slot(const rsx_be_sampler_desc* d)
  {
@@ -4609,7 +4947,7 @@ index 32f0b95..56fb8a7 100644
      for (u32 i = 0; i < s_eng_samp_count; i++)
          if (s_eng_samp[i].key == key) return (int)i;
      if (s_eng_samp_count >= ENG_MAX_SAMPLERS) return -1;
-@@ -3065,8 +3490,12 @@ static int eng_sampler_slot(const rsx_be_sampler_desc* d)
+@@ -3065,8 +3533,12 @@ static int eng_sampler_slot(const rsx_be_sampler_desc* d)
      sd.tAddressMode = gcm_wrap_to_metal(d->wrap_t);
      sd.rAddressMode = gcm_wrap_to_metal(d->wrap_r);
      sd.borderColor  = MTLSamplerBorderColorTransparentBlack;
@@ -4624,7 +4962,7 @@ index 32f0b95..56fb8a7 100644
      id<MTLSamplerState> s = [s_dev newSamplerStateWithDescriptor:sd];
      if (!s) return -1;
      const int slot = (int)s_eng_samp_count++;
-@@ -3109,6 +3538,7 @@ static void eng_bind_textures(void* user, const u32* textures,
+@@ -3109,6 +3581,7 @@ static void eng_bind_textures(void* user, const u32* textures,
      (void)user;
      for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) {
          s_eng_pending.tex[u]  = ((mask >> u) & 1u) ? textures[u] : 0;
@@ -4632,7 +4970,7 @@ index 32f0b95..56fb8a7 100644
          s_eng_pending.samp[u] = ((mask >> u) & 1u) ? eng_sampler_slot(&samplers[u]) : -1;
      }
  }
-@@ -3119,6 +3549,7 @@ static void eng_bind_vertex_textures(void* user, const u32* textures,
+@@ -3119,6 +3592,7 @@ static void eng_bind_vertex_textures(void* user, const u32* textures,
      (void)user;
      for (u32 u = 0; u < RSX_BE_MAX_VERTEX_TEXTURES; u++) {
          s_eng_pending.vtex[u]  = ((mask >> u) & 1u) ? textures[u] : 0;
@@ -4640,7 +4978,7 @@ index 32f0b95..56fb8a7 100644
          s_eng_pending.vsamp[u] = ((mask >> u) & 1u) ? eng_sampler_slot(&samplers[u]) : -1;
      }
  }
-@@ -3140,6 +3571,29 @@ static void eng_set_scissor(void* user, u32 x, u32 y, u32 w, u32 h)
+@@ -3140,6 +3614,29 @@ static void eng_set_scissor(void* user, u32 x, u32 y, u32 w, u32 h)
  static void eng_set_stencil_ref(void* user, u32 ref)
  { (void)user; s_eng_pending.stencil_ref = ref; }
  
@@ -4670,7 +5008,7 @@ index 32f0b95..56fb8a7 100644
  static void eng_draw(void* user, rsx_topology topology, const void* vertices,
                       u32 vertex_count, u32 stride, const u32* indices,
                       u32 index_count)
-@@ -3162,6 +3616,72 @@ static void eng_draw(void* user, rsx_topology topology, const void* vertices,
+@@ -3162,6 +3659,72 @@ static void eng_draw(void* user, rsx_topology topology, const void* vertices,
      r->vertex_count = vertex_count;
      r->ib_off       = ib_off;
      r->index_count  = indices ? index_count : 0;
@@ -4743,7 +5081,7 @@ index 32f0b95..56fb8a7 100644
  }
  
  static void eng_clear_color(void* user, u32 surface, const float rgba[4])
-@@ -3203,21 +3723,29 @@ static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
+@@ -3203,21 +3766,29 @@ static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
  {
      if (!r->pipeline || r->pipeline > s_eng_pipe_count) { s_eng_encoding_failed = 1; return; }
      const EngPipeline* p = &s_eng_pipe[r->pipeline - 1];
@@ -4776,7 +5114,7 @@ index 32f0b95..56fb8a7 100644
          [enc setFragmentTexture:(t ? t : s_null_tex) atIndex:(NSUInteger)u];
          [enc setFragmentSamplerState:(r->samp[u] >= 0 ? s_eng_samp[r->samp[u]].samp
                                                        : s_default_sampler)
-@@ -3253,6 +3781,26 @@ static int eng_record_targets_are(const EngRecord* r, const u32* rt, u32 nrt)
+@@ -3253,6 +3824,26 @@ static int eng_record_targets_are(const EngRecord* r, const u32* rt, u32 nrt)
      return 1;
  }
  
@@ -4803,10 +5141,28 @@ index 32f0b95..56fb8a7 100644
  /* A clear names a surface independently of any later draw's attachment set.
   * Replay it alone when it cannot be folded into that draw's load actions. */
  static int eng_encode_clear(id<MTLCommandBuffer> cb, const EngRecord* r)
-@@ -3300,20 +3848,56 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
+@@ -3300,20 +3891,74 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
      u32 i = 0;
      s_ft_passes = s_ft_resolves = s_ft_copies = 0;
      while (i < s_eng_rec_count) {
++        if (s_eng_rec[i].kind == ENG_REC_B8_SEED) {
++            const EngRecord* r=&s_eng_rec[i++];
++            id<MTLTexture> dst=eng_obj(r->resolve_dst);
++            if (!dst || !stage || !s_eng_b8_seed_pso ||
++                (u64)r->packed_off+r->packed_bytes > stage.length ||
++                (u64)dst.width*dst.height != r->packed_bytes) {
++                s_eng_encoding_failed=1; continue;
++            }
++            id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder];
++            if (!e) { s_eng_encoding_failed=1;continue; }
++            [e setComputePipelineState:s_eng_b8_seed_pso];
++            [e setBuffer:stage offset:r->packed_off atIndex:0];
++            [e setTexture:dst atIndex:0];
++            [e dispatchThreads:MTLSizeMake(dst.width,dst.height,1)
++                threadsPerThreadgroup:MTLSizeMake(16,8,1)];
++            [e endEncoding]; s_ft_copies++;
++            continue;
++        }
 +        if (s_eng_rec[i].kind == ENG_REC_CUBE_SNAPSHOT) {
 +            const EngRecord* r=&s_eng_rec[i++];
 +            id<MTLTexture> dst=eng_obj(r->resolve_dst);
@@ -4865,7 +5221,7 @@ index 32f0b95..56fb8a7 100644
                        toTexture:dst destinationSlice:0 destinationLevel:0
                destinationOrigin:MTLOriginMake(0, 0, 0)];
              [copy endEncoding];
-@@ -3323,7 +3907,8 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
+@@ -3323,7 +3968,8 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
              const EngRecord* r = &s_eng_rec[i++];
              id<MTLTexture> src = eng_obj(r->depth);
              id<MTLTexture> dst = eng_obj(r->resolve_dst);
@@ -4875,7 +5231,7 @@ index 32f0b95..56fb8a7 100644
              MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
              rp.colorAttachments[0].texture     = dst;
              rp.colorAttachments[0].loadAction  = MTLLoadActionDontCare;
-@@ -3331,7 +3916,7 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
+@@ -3331,7 +3977,7 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
              id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
              if (!e) { s_eng_encoding_failed = 1; continue; }
              s_ft_resolves++;
@@ -4884,7 +5240,7 @@ index 32f0b95..56fb8a7 100644
              [e setFragmentTexture:src atIndex:0];
              [e setFragmentSamplerState:s_eng_point_sampler atIndex:0];
              [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
-@@ -3351,9 +3936,9 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
+@@ -3351,9 +3997,9 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
          u32 cd = 0, ds_flags = 0;
          float cdepth = 1.0f;
          u8 cstencil = 0;
@@ -4897,7 +5253,7 @@ index 32f0b95..56fb8a7 100644
              const EngRecord* r = &s_eng_rec[i];
              if (r->kind == ENG_REC_CLEAR_COLOR) {
                  u32 k = 0;
-@@ -3466,6 +4051,29 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
+@@ -3466,6 +4112,29 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
              rp.renderTargetHeight = [zbuf height];
          }
  
@@ -4927,7 +5283,7 @@ index 32f0b95..56fb8a7 100644
          id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
          /* A draw's pipeline declares as many colour attachments as its record
           * named, so a pass that could not bind them all takes its clears and
-@@ -3480,12 +4088,24 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
+@@ -3480,12 +4149,24 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
          s_ft_passes++;
          while (i < s_eng_rec_count && s_eng_rec[i].kind == ENG_REC_DRAW &&
                 eng_record_targets_are(&s_eng_rec[i], rt, nrt) &&
@@ -4952,7 +5308,7 @@ index 32f0b95..56fb8a7 100644
      }
  }
  
-@@ -3585,17 +4205,64 @@ static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
+@@ -3585,17 +4266,64 @@ static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
  
  /* Encode everything recorded so far and commit it.
   *
@@ -5020,7 +5376,7 @@ index 32f0b95..56fb8a7 100644
      @autoreleasepool {
          id<CAMetalDrawable> drawable = nil;
          id<MTLTexture> dst = nil;
-@@ -3608,7 +4275,9 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
+@@ -3608,7 +4336,9 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
              if (s_headless) {
                  dst = s_offscreen;
              } else {
@@ -5030,7 +5386,7 @@ index 32f0b95..56fb8a7 100644
                  if (!drawable) {           /* compositor is busy; skip */
                      dispatch_semaphore_signal(s_inflight);
                      return;
-@@ -3618,9 +4287,11 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
+@@ -3618,9 +4348,11 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
          }
  
          id<MTLBuffer> stage = nil;
@@ -5045,7 +5401,7 @@ index 32f0b95..56fb8a7 100644
          id<MTLCommandBuffer> cb = [s_queue commandBuffer];
          if (!cb || (s_eng_stage_used && !stage)) {
              s_eng_encoding_failed = 1;
-@@ -3628,30 +4299,38 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
+@@ -3628,30 +4360,38 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
              return;
          }
          const uint64_t ft_e0 = PS3_FT_ON() ? ps3_ft_now() : 0;
@@ -5093,7 +5449,7 @@ index 32f0b95..56fb8a7 100644
              }
              s_eng_checked_completed = [cb status] == MTLCommandBufferStatusCompleted &&
                                        ![cb error] && !s_eng_dropped && !s_eng_encoding_failed;
-@@ -3672,10 +4351,14 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
+@@ -3672,10 +4412,14 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
                      s_eng_dropped, ENG_MAX_RECORDS);
              s_eng_dropped = 0;
          }
@@ -5109,7 +5465,7 @@ index 32f0b95..56fb8a7 100644
  }
  
  /* Opt-in readback of the game surface, useful on a locked Mac or in CI.
-@@ -3684,8 +4367,29 @@ static void eng_dump_frame(id<MTLTexture> src)
+@@ -3684,8 +4428,29 @@ static void eng_dump_frame(id<MTLTexture> src)
  {
      const char* path = getenv("PS3RECOMP_METAL_FRAME_DUMP");
      if (!path || !*path) return;
@@ -5140,7 +5496,7 @@ index 32f0b95..56fb8a7 100644
      if ([src pixelFormat] != MTLPixelFormatRGBA8Unorm &&
          [src pixelFormat] != MTLPixelFormatBGRA8Unorm) return;
      size_t w = [src width], h = [src height];
-@@ -3714,13 +4418,72 @@ static void eng_dump_frame(id<MTLTexture> src)
+@@ -3714,13 +4479,72 @@ static void eng_dump_frame(id<MTLTexture> src)
      free(rgba);
  }
  
@@ -5213,7 +5569,7 @@ index 32f0b95..56fb8a7 100644
  }
  
  static void eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
-@@ -3737,8 +4500,8 @@ static void eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
+@@ -3737,8 +4561,8 @@ static void eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
  }
  
  /* Read depth through the existing full-size R32Float resolve, then copy the
@@ -5224,7 +5580,7 @@ index 32f0b95..56fb8a7 100644
   * until both the resolve and the copy have completed successfully. */
  static int eng_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32 h,
                                float* out, u32 out_pitch)
-@@ -3778,6 +4541,7 @@ static int eng_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32 h,
+@@ -3778,6 +4602,7 @@ static int eng_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32 h,
                      toBuffer:staging destinationOffset:0
           destinationBytesPerRow:copy_pitch destinationBytesPerImage:copy_pitch * h];
          [blit endEncoding];
@@ -5232,7 +5588,13 @@ index 32f0b95..56fb8a7 100644
          [cb commit]; [cb waitUntilCompleted];
          const int ok = [cb status] == MTLCommandBufferStatusCompleted && ![cb error];
          if (ok) {
-@@ -3807,8 +4571,13 @@ static int eng_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32 h,
+@@ -3802,13 +4627,19 @@ static int eng_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32 h,
+     .texture_create_3d    = eng_texture_create_3d,
+     .texture_upload_3d    = eng_texture_upload_3d,
+     .color_target_create  = eng_color_target_create,
++    .color_target_create_b8 = eng_color_target_create_b8,
+     .color_target_release = eng_obj_release,
+     .surface_view         = eng_surface_view,
      .depth_target_create  = eng_depth_target_create,
      .depth_target_release = eng_obj_release,
      .depth_snapshot       = eng_depth_snapshot,
@@ -5246,7 +5608,7 @@ index 32f0b95..56fb8a7 100644
      .pipeline_create      = eng_pipeline_create,
      .pipeline_release     = eng_pipeline_release,
      .bind_targets         = eng_bind_targets,
-@@ -3820,7 +4589,13 @@ static int eng_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32 h,
+@@ -3820,7 +4651,13 @@ static int eng_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32 h,
      .set_viewport         = eng_set_viewport,
      .set_scissor          = eng_set_scissor,
      .set_stencil_ref      = eng_set_stencil_ref,
@@ -5260,7 +5622,7 @@ index 32f0b95..56fb8a7 100644
      .clear_color          = eng_clear_color,
      .clear_depth_stencil  = eng_clear_depth_stencil,
      .present              = eng_present,
-@@ -3971,6 +4746,30 @@ void rsx_metal_backend_shutdown(void)
+@@ -3971,6 +4808,30 @@ void rsx_metal_backend_shutdown(void)
      }
  }
  
@@ -5291,7 +5653,7 @@ index 32f0b95..56fb8a7 100644
  static int pump_messages_impl(void)
  {
  #if !TARGET_OS_IPHONE
-@@ -3982,8 +4781,21 @@ static int pump_messages_impl(void)
+@@ -3982,8 +4843,21 @@ static int pump_messages_impl(void)
                                                  inMode:NSDefaultRunLoopMode
                                                 dequeue:YES];
              if (!ev) break;
@@ -5434,7 +5796,7 @@ index 50450b1..4e71483 100644
  }
  #endif
 diff --git a/libs/video/rsx_texture_layout.c b/libs/video/rsx_texture_layout.c
-index 5053174..2fad910 100644
+index 5053174..441bce0 100644
 --- a/libs/video/rsx_texture_layout.c
 +++ b/libs/video/rsx_texture_layout.c
 @@ -5,6 +5,33 @@
@@ -5485,6 +5847,31 @@ index 5053174..2fad910 100644
          off += lv->tl.face_bytes;
          n++;
          if (mw == 1 && mh == 1) break;   /* no level below 1x1 */
+@@ -328,12 +356,23 @@ void rsx_texture_component_remap(u32 control1, u32 rsx_fmt, u8 out[4])
+     static const u8 lanes_argb[4] = {3, 0, 1, 2};
+     static const u8 lanes_g8b8[4] = {1, 0, 1, 0};
+     static const u8 lanes_b8[4]   = {RSX_REMAP_ONE, 0, 0, 0};
++    static const u8 lanes_y16x16f[4] = {0, 1, 0, 1};
+     const u32 base = rsx_fmt & 0x9Fu;
+     const u8* src2res = (base == 0x8Bu) ? lanes_g8b8
+-                      : (base == 0x81u) ? lanes_b8 : lanes_argb;
++                      : (base == 0x81u) ? lanes_b8
++                      : (base == 0x9Fu) ? lanes_y16x16f : lanes_argb;
+ 
+     if (!(control1 & 0xFFFFu)) control1 = 0xAAE4u;   /* unset -> identity */
+ 
++    /* Y16_X16_FLOAT has fixed selectors, unlike an RGBA colour texture.
++     * The two big-endian halves are uploaded in memory order; the sampler
++     * presents half 1, half 0, half 1, half 0 as RGBA (or 1,1,1,0 with
++     * the high-word override). Keep the zero/one controls. This matches
++     * RPCS3's decoded_remap + Vulkan component mapping, including the
++     * velocity target used by MotorStorm. Do not swap the stored bytes. */
++    if (base == 0x9Fu)
++        control1 = (control1 & ~0xFFu) | ((control1 >> 16) ? 0x56u : 0x66u);
++
+     /* Y16_X16 (and HILO8): two 16-bit channels whose crossbar is encoded in
+      * 16-bit blocks -- 0xE4 or 0x4E only -- and presented interleaved
+      * R-G-R-G, or R-R-R-G when CONTROL1's high word (the remap override,
 diff --git a/libs/video/rsx_texture_layout.h b/libs/video/rsx_texture_layout.h
 index 1ac2845..15ed69a 100644
 --- a/libs/video/rsx_texture_layout.h
@@ -6144,7 +6531,7 @@ index 455e2c6..8e713c8 100644
      free(vm_base);
      return fails ? 1 : 0;
 diff --git a/libs/video/tests/test_rsx_draw_engine.c b/libs/video/tests/test_rsx_draw_engine.c
-index aee6109..34e8332 100644
+index aee6109..c29217f 100644
 --- a/libs/video/tests/test_rsx_draw_engine.c
 +++ b/libs/video/tests/test_rsx_draw_engine.c
 @@ -14,6 +14,7 @@
@@ -6155,7 +6542,7 @@ index aee6109..34e8332 100644
  
  #include <stdio.h>
  #include <stdlib.h>
-@@ -70,7 +71,14 @@ typedef struct {
+@@ -70,7 +71,15 @@ typedef struct {
  
      int n_texture_create, n_texture_release, n_texture_upload;
      int n_color_create, n_color_release, n_color_seeded;
@@ -6165,12 +6552,13 @@ index aee6109..34e8332 100644
 +    int n_volume_create, n_volume_upload, check_bc_volume;
 +    u32 volume_format;
 +    u32 crop_source, crop_w, crop_h;
++    u32 view_remap, created_remap;
      int n_depth_create, n_depth_snapshot;
 +    u32 snapshot_w, snapshot_h;
      int n_pipeline_create;
      rsx_be_render_state pipeline_rs;   /* the last pipeline's render state */
      int n_draw, n_clear_color, n_clear_ds, n_present;
-@@ -78,6 +86,7 @@ typedef struct {
+@@ -78,6 +87,7 @@ typedef struct {
  
      /* the last draw's bindings */
      u32 bound_tex[RSX_BE_MAX_TEXTURES];
@@ -6178,7 +6566,7 @@ index aee6109..34e8332 100644
      u32 bound_mask;
      u32 bound_rt[RSX_BE_MAX_COLOR_TARGETS];
      u32 bound_rt_count;
-@@ -95,8 +104,13 @@ typedef struct {
+@@ -95,8 +105,13 @@ typedef struct {
      u32 last_created_texture, last_created_color;
      u32 last_released;
      float last_clear_depth;
@@ -6192,16 +6580,19 @@ index aee6109..34e8332 100644
      float vp_xf[8];               /* viewport epilogue after the VS constants */
  } StubState;
  
-@@ -120,6 +134,8 @@ static u32 stub_texture_create(void* u, rsx_be_format f, u32 w, u32 h, u32 mips,
+@@ -118,8 +133,10 @@ static u32 stub_texture_create(void* u, rsx_be_format f, u32 w, u32 h, u32 mips,
+                                u32 faces, u32 remap, u32 rsx_fmt)
+ {
      (void)u; (void)f; (void)w; (void)h; (void)mips; (void)faces;
-     (void)remap; (void)rsx_fmt;
+-    (void)remap; (void)rsx_fmt;
++    (void)rsx_fmt; stub.created_remap=remap;
      stub.n_texture_create++;
 +    stub.texture_w = w; stub.texture_h = h;
 +    stub.texture_faces = faces; stub.texture_levels = mips;
      stub.last_created_texture = stub_handle();
      return stub.last_created_texture;
  }
-@@ -130,6 +146,33 @@ static void stub_texture_upload(void* u, u32 t, u32 face, u32 mip, u32 w, u32 h,
+@@ -130,6 +147,33 @@ static void stub_texture_upload(void* u, u32 t, u32 face, u32 mip, u32 w, u32 h,
      (void)u; (void)t; (void)face; (void)mip; (void)w; (void)h;
      (void)src; (void)row; (void)rows;
      stub.n_texture_upload++;
@@ -6235,10 +6626,13 @@ index aee6109..34e8332 100644
  }
  
  static void stub_release(void* u, u32 handle)
-@@ -159,11 +202,31 @@ static void stub_color_release(void* u, u32 handle)
- static u32 stub_surface_view(void* u, u32 surface, u32 remap, u32 fmt)
- { (void)u; (void)remap; (void)fmt; return surface; }
+@@ -157,13 +201,33 @@ static void stub_color_release(void* u, u32 handle)
+ { stub.n_color_release++; stub_release(u, handle); }
  
+ static u32 stub_surface_view(void* u, u32 surface, u32 remap, u32 fmt)
+-{ (void)u; (void)remap; (void)fmt; return surface; }
++{ (void)u; (void)fmt; stub.view_remap=remap; return surface; }
++
 +static u32 stub_color_crop(void* u,u32 surface,u32 x,u32 y,u32 w,u32 h)
 +{
 +    (void)u; CHECK(x==0 && y==0,"engine crop uses the matching alias origin");
@@ -6258,7 +6652,7 @@ index aee6109..34e8332 100644
 +    stub.n_cube++; memcpy(stub.cube_faces,faces,sizeof stub.cube_faces);
 +    return stub.cube_fail ? 0 : stub_handle();
 +}
-+
+ 
  static u32 stub_depth_create(void* u, u32 w, u32 h)
  { (void)u; (void)w; (void)h; stub.n_depth_create++; return stub_handle(); }
  
@@ -6268,7 +6662,7 @@ index aee6109..34e8332 100644
  
  static u32 stub_pipeline_create(void* u, const char* vs, const char* ps,
                                  const rsx_be_render_state* rs,
-@@ -201,8 +264,9 @@ static void stub_bind_ps(void* u, const void* d, u32 n) { (void)u; (void)d; (voi
+@@ -201,8 +265,9 @@ static void stub_bind_ps(void* u, const void* d, u32 n) { (void)u; (void)d; (voi
  static void stub_bind_textures(void* u, const u32* tex,
                                 const rsx_be_sampler_desc* smp, u32 mask)
  {
@@ -6279,7 +6673,7 @@ index aee6109..34e8332 100644
      stub.bound_mask = mask;
  }
  
-@@ -221,6 +285,10 @@ static void stub_scissor(void* u, u32 x, u32 y, u32 w, u32 h)
+@@ -221,6 +286,10 @@ static void stub_scissor(void* u, u32 x, u32 y, u32 w, u32 h)
  }
  
  static void stub_stencil_ref(void* u, u32 r) { (void)u; stub.stencil_ref = r; }
@@ -6290,7 +6684,7 @@ index aee6109..34e8332 100644
  static void stub_depth_bounds(void* u, float lo, float hi)
  {
      (void)u;
-@@ -275,6 +343,7 @@ static const u8 g_stub_pixel16[8] = { 0x00, 0x3C, 0x00, 0x40, 0x00, 0x42, 0x00,
+@@ -275,6 +344,7 @@ static const u8 g_stub_pixel16[8] = { 0x00, 0x3C, 0x00, 0x40, 0x00, 0x42, 0x00,
  /* With g_stub_ramp set, pixel (c, r) reads back as R,G,B,A = 4c+1, 4c+2,
   * 4c+3, 0x80+r instead, so every byte of a row is distinct. */
  static int g_stub_ramp;
@@ -6298,7 +6692,7 @@ index aee6109..34e8332 100644
  
  /* The engine asks for rows packed at the surface's own pixel size, so the
   * pitch tells the two formats apart. */
-@@ -282,6 +351,7 @@ static void stub_readback(void* u, u32 s, u32 x, u32 y, u32 w, u32 h,
+@@ -282,6 +352,7 @@ static void stub_readback(void* u, u32 s, u32 x, u32 y, u32 w, u32 h,
                            void* out, u32 pitch)
  {
      (void)u; (void)s; (void)x; (void)y;
@@ -6306,7 +6700,7 @@ index aee6109..34e8332 100644
      const u32 bpp = pitch >= w * 8u ? 8u : 4u;
      for (u32 r = 0; r < h; r++)
          for (u32 c = 0; c < w; c++) {
-@@ -332,9 +402,15 @@ static const rsx_draw_backend g_stub_backend = {
+@@ -332,9 +403,15 @@ static const rsx_draw_backend g_stub_backend = {
      .color_target_release = stub_color_release,
      .color_target_write = stub_color_write,
      .surface_view = stub_surface_view,
@@ -6322,7 +6716,7 @@ index aee6109..34e8332 100644
      .pipeline_create = stub_pipeline_create,
      .pipeline_release = stub_pipeline_release,
      .bind_targets = stub_bind_targets,
-@@ -347,6 +423,8 @@ static const rsx_draw_backend g_stub_backend = {
+@@ -347,6 +424,8 @@ static const rsx_draw_backend g_stub_backend = {
      .set_scissor = stub_scissor,
      .set_stencil_ref = stub_stencil_ref,
      .set_depth_bounds = stub_depth_bounds,
@@ -6331,7 +6725,7 @@ index aee6109..34e8332 100644
      .draw = stub_draw,
      .clear_color = stub_clear_color,
      .clear_depth_stencil = stub_clear_ds,
-@@ -450,6 +528,7 @@ static void test_surface_set(void)
+@@ -450,6 +529,7 @@ static void test_surface_set(void)
  {
      printf("-- surface set\n");
      engine_up();
@@ -6339,7 +6733,7 @@ index aee6109..34e8332 100644
  
      m(M_CLEAR_BUFFERS, 0xF0u);
      CHECK(stub.n_color_create == 1 && stub.n_clear_color == 1,
-@@ -816,6 +895,14 @@ static void test_pipeline_key(void)
+@@ -816,6 +896,14 @@ static void test_pipeline_key(void)
            "changing transform constants does not (%d pipelines)",
            stub.n_pipeline_create);
  
@@ -6354,7 +6748,7 @@ index aee6109..34e8332 100644
      /* The stencil reference is encoder state, not pipeline state. */
      m(M_STENCIL_FUNC_REF, 0x7Fu);
      draw_triangle();
-@@ -1234,6 +1321,20 @@ static void test_transfer_reads_fp16(void)
+@@ -1234,6 +1322,20 @@ static void test_transfer_reads_fp16(void)
      rsx_draw_engine_guest_read(RSX_LOCATION_LOCAL, row + 255u * 8u, 2048u, 8u, 1u);
      CHECK(memcmp(rd + 2040, px, 8) == 0, "a transfer past the width stops at the surface's edge");
  
@@ -6375,7 +6769,7 @@ index aee6109..34e8332 100644
      /* Bytes copied INTO an FP16 target are not pushed as A8R8G8B8 rows. */
      memset(&g_written, 0, sizeof g_written);
      rsx_draw_engine_guest_wrote(RSX_LOCATION_LOCAL, row, 2048u, 4u, 1u);
-@@ -1241,6 +1342,91 @@ static void test_transfer_reads_fp16(void)
+@@ -1241,6 +1343,91 @@ static void test_transfer_reads_fp16(void)
      engine_down();
  }
  
@@ -6467,7 +6861,7 @@ index aee6109..34e8332 100644
  static unsigned custom_reads;
  static const u8* custom_guest_read(void* user, u32 location, u32 offset, u32 bytes)
  {
-@@ -1326,12 +1512,19 @@ static void test_depth_clear_value(void)
+@@ -1326,12 +1513,19 @@ static void test_depth_clear_value(void)
      CHECK(stub.n_clear_ds == 1 && stub.last_clear_depth == 1.0f,
            "a Z16 zeta cleared with 0xFFFF clears to 1.0 (%g)", stub.last_clear_depth);
  
@@ -6487,7 +6881,7 @@ index aee6109..34e8332 100644
      engine_down();
  }
  
-@@ -1366,7 +1559,11 @@ static void test_antialiased_surface(void)
+@@ -1366,7 +1560,11 @@ static void test_antialiased_surface(void)
          /* The whole 128x64-pixel viewport. */
          mf(M_VIEWPORT_TRANSLATE + 0, 64.0f); mf(M_VIEWPORT_TRANSLATE + 4, 32.0f);
          mf(M_VIEWPORT_SCALE + 0, 64.0f);     mf(M_VIEWPORT_SCALE + 4, -32.0f);
@@ -6499,7 +6893,7 @@ index aee6109..34e8332 100644
          CHECK(stub.color_w == cases[i].w && stub.color_h == cases[i].h,
                "antialias %u: a 128x64 surface is created at %ux%u (got %ux%u)",
                cases[i].aa, cases[i].w, cases[i].h, stub.color_w, stub.color_h);
-@@ -1381,12 +1578,47 @@ static void test_antialiased_surface(void)
+@@ -1381,12 +1579,47 @@ static void test_antialiased_surface(void)
                "antialias %u: the full-pixel viewport still maps to the whole surface "
                "(scale %g,%g offset %g,%g)", cases[i].aa, stub.vp_xf[0], stub.vp_xf[1],
                stub.vp_xf[4], stub.vp_xf[5]);
@@ -6547,7 +6941,7 @@ index aee6109..34e8332 100644
  static void test_depth_read_as_color(void)
  {
      printf("-- zeta read as A8R8G8B8\n");
-@@ -1412,8 +1644,17 @@ static void test_depth_read_as_color(void)
+@@ -1412,8 +1645,17 @@ static void test_depth_read_as_color(void)
      m(M_DEPTH_WRITE, 0u);
      m(M_COLOR_A_OFFSET, 0x90000u);
      bind_texture_unit(RSX_LOCATION_LOCAL, ZETA_OFFSET);
@@ -6565,7 +6959,7 @@ index aee6109..34e8332 100644
      const u8* z = vm_base + GUEST_LOCAL_EA + ZETA_OFFSET;
      CHECK(stub.n_depth_readback == 1, "the depth target was read back (%d)",
            stub.n_depth_readback);
-@@ -1431,6 +1672,111 @@ static void test_depth_read_as_color(void)
+@@ -1431,6 +1673,114 @@ static void test_depth_read_as_color(void)
      engine_down();
  }
  
@@ -6659,16 +7053,19 @@ index aee6109..34e8332 100644
 +    m(M_SURFACE_FORMAT,8u|(1u<<8));m(M_COLOR_A_PITCH,256u*4u);m(M_CLEAR_BUFFERS,0xF0u);
 +    m(M_COLOR_A_OFFSET,0x90000u);bind_texture_unit(RSX_LOCATION_LOCAL,0x40000u);
 +    m(0x1840,256u*4u);draw_triangle();const u32 rgba=stub.bound_tex[0];
++    m(M_TEX_UNIT+0x10,0x1AAE4u);
 +    m(M_TEX_UNIT+0x04,1u|(2u<<4)|(0xBFu<<8)|(1u<<16));draw_triangle();
 +    const u32 half=stub.bound_tex[0];
 +    CHECK(stub.n_color_rg16==1 && half!=rgba && !stub.alive[rgba],
 +          "format change invalidates RGBA crop and creates a distinct RG16 bit snapshot");
 +    CHECK(g_readback_surface==0 && stub.n_texture_upload==0,"RG16 GPU conversion skips guest round trip");
++    CHECK(stub.view_remap==0x1AAE4u,"RG16 GPU view preserves CONTROL1 override");
 +    draw_triangle();CHECK(stub.n_color_rg16==1 && stub.bound_tex[0]==half,"unchanged RG16 alias reuses snapshot");
 +    m(M_TEX_UNIT+0x18,(256u<<16)|256u);draw_triangle();
 +    CHECK(stub.n_color_rg16==2 && stub.crop_w==256,"full-size RG16 alias also uses conversion");
 +    m(0x1840,512u*4u);draw_triangle();
 +    CHECK(stub.n_color_rg16==2 && stub.n_texture_upload==1,"RG16 pitch mismatch retains CPU fallback");
++    CHECK(stub.created_remap==0x1AAE4u,"RG16 CPU fallback preserves CONTROL1 override");
 +    m(0x1840,256u*4u);m(M_TEX_UNIT+0x18,(4u<<16)|4u);stub.crop_fail=1;
 +    draw_triangle();CHECK(stub.n_color_rg16==3 && stub.n_texture_upload==2,"RG16 allocation failure retains CPU fallback");
 +    engine_down();unsetenv("RSX_GPU_COLOR_REINTERPRET");unsetenv("RSX_GPU_COLOR_CROP");
@@ -6677,7 +7074,7 @@ index aee6109..34e8332 100644
  static void test_color_read_as_float(void)
  {
      printf("-- colour target read as X32_FLOAT\n");
-@@ -1593,6 +1939,210 @@ static void test_immediate_packed_zero_and_inline(void)
+@@ -1593,6 +1943,210 @@ static void test_immediate_packed_zero_and_inline(void)
      engine_down();
  }
  
@@ -6888,7 +7285,7 @@ index aee6109..34e8332 100644
  int main(void)
  {
      vm_base = (u8*)calloc(1, GUEST_BYTES);
-@@ -1606,9 +2156,15 @@ int main(void)
+@@ -1606,9 +2160,15 @@ int main(void)
      }
  
      test_surface_set();
@@ -6904,7 +7301,7 @@ index aee6109..34e8332 100644
      test_texture_sparse_rehash();
      test_pipeline_key();
      test_restart_expansion();
-@@ -1620,11 +2176,17 @@ int main(void)
+@@ -1620,11 +2180,17 @@ int main(void)
      test_transfer_coherence();
      test_transfer_rows();
      test_transfer_reads_fp16();
@@ -6923,7 +7320,7 @@ index aee6109..34e8332 100644
      test_immediate_packed_zero_and_inline();
  
 diff --git a/libs/video/tests/test_texture_layout.c b/libs/video/tests/test_texture_layout.c
-index b930534..4fb2337 100644
+index b930534..744ac0b 100644
 --- a/libs/video/tests/test_texture_layout.c
 +++ b/libs/video/tests/test_texture_layout.c
 @@ -392,6 +392,43 @@ static void test_control3_pitch(void)
@@ -6970,7 +7367,34 @@ index b930534..4fb2337 100644
  static void test_swizzle_offset(void)
  {
      /* 4x4 Morton order: x and y bits interleave, x first. */
-@@ -760,6 +797,7 @@ int main(void)
+@@ -746,6 +783,26 @@ static void test_remap_rejects_null(void)
+     rsx_texture_component_remap(0xAAE4u, FMT_A8R8G8B8, NULL);   /* must not crash */
+ }
+ 
++/* Y16_X16_FLOAT is not a four-channel colour texture. RPCS3's
++ * RSXTexture::decoded_remap and VKFormats::get_component_mapping together
++ * present the second stored half first, then the first half. The low-byte
++ * selectors are fixed for this float format; zero/one controls still apply. */
++static void test_remap_y16x16_float_lanes(void)
++{
++    u8 m[4];
++    for (u32 selector = 0; selector < 256; ++selector) {
++        rsx_texture_component_remap(0xAA00u | selector, FMT_Y16X16F | FMT_LN, m);
++        CHECK_EQ(m[R_], 1); CHECK_EQ(m[G_], 0);
++        CHECK_EQ(m[B_], 1); CHECK_EQ(m[A_], 0);
++        rsx_texture_component_remap(0x1AA00u | selector, FMT_Y16X16F, m);
++        CHECK_EQ(m[R_], 1); CHECK_EQ(m[G_], 1);
++        CHECK_EQ(m[B_], 1); CHECK_EQ(m[A_], 0);
++    }
++    rsx_texture_component_remap(0xA1E4u, FMT_Y16X16F, m);
++    CHECK_EQ(m[A_], RSX_REMAP_ONE); CHECK_EQ(m[R_], RSX_REMAP_ZERO);
++    CHECK_EQ(m[G_], 0); CHECK_EQ(m[B_], 1);
++}
++
+ int main(void)
+ {
+     test_argb();
+@@ -760,6 +817,7 @@ int main(void)
      test_float_formats();
      test_hilo();
      test_control3_pitch();
@@ -6978,6 +7402,14 @@ index b930534..4fb2337 100644
      test_swizzle_offset();
      test_log2_ceil();
      test_decode_argb_linear();
+@@ -771,6 +829,7 @@ int main(void)
+     test_remap_identity_packs_to_d3d_default();
+     test_remap_b8_lanes();
+     test_remap_y16x16_lanes();
++    test_remap_y16x16_float_lanes();
+     test_remap_field_order_is_not_reversed();
+     test_remap_force_zero_and_one();
+     test_remap_g8b8_lanes();
 diff --git a/runtime/ppu/ppu_fs.cpp b/runtime/ppu/ppu_fs.cpp
 index 44cd4ee..75b6a9c 100644
 --- a/runtime/ppu/ppu_fs.cpp
@@ -7136,7 +7568,7 @@ index 148be1f..ffa2a87 100644
      ctx.gpr[3]  = a0; ctx.gpr[4] = a1; ctx.gpr[5] = a2; ctx.gpr[6] = a3;
      ctx.gpr[7]  = a4; ctx.gpr[8] = a5; ctx.gpr[9] = a6; ctx.gpr[10] = a7;
 diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
-index dbea35b..c94f9c5 100644
+index dbea35b..278d153 100644
 --- a/runtime/spu/spu_channels.c
 +++ b/runtime/spu/spu_channels.c
 @@ -22,9 +22,9 @@
@@ -7152,7 +7584,19 @@ index dbea35b..c94f9c5 100644
  #include <time.h>
  #include "../platform/win32_compat.h"
  
-@@ -66,48 +66,51 @@ static uint64_t spu_host_ns(void)
+@@ -32,6 +32,11 @@
+ extern "C" {
+ #endif
+ 
++/* Optional AOT overlays supplied by the port. The callback must validate the
++ * live local-store code before returning a body; unknown code stays on the
++ * ordinary fallback path. Install once, before starting guest workers. */
++spu_lifted_fn (*g_spu_port_overlay_lookup)(const spu_context*, uint32_t);
++
+ /* The SPU decrementer ticks at the PS3 timebase, 79.8 MHz -- the same clock
+  * sys_time_get_timebase_frequency reports to the PPU. Titles calibrate real
+  * delays against it, so the rate has to be right, not merely non-zero. */
+@@ -66,48 +71,51 @@ static uint64_t spu_host_ns(void)
  #else
  #  define SPU_TLS __thread
  #endif
@@ -7246,7 +7690,7 @@ index dbea35b..c94f9c5 100644
  static SPU_TLS jmp_buf s_spu_halt_env;
  static SPU_TLS int     s_spu_halt_armed = 0;
  
-@@ -225,7 +228,7 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
+@@ -225,7 +233,7 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
       * recursion guard halted the SPU at 2000 after a few minutes of idling. */
      ctx->host_depth = 0;
      ctx->irq_frame = 0;
@@ -7255,7 +7699,7 @@ index dbea35b..c94f9c5 100644
      /* Nest-safe: a job run synchronously from inside another SPU's execution
       * re-enters here on the same host thread. The halt target is per-thread,
       * so save the outer one and put it back on the way out -- otherwise the
-@@ -293,13 +296,56 @@ typedef struct spu_mfc_slot {
+@@ -293,13 +301,56 @@ typedef struct spu_mfc_slot {
  static spu_mfc_slot* s_mfc_slots;
  static SRWLOCK s_mfc_claim_lock = SRWLOCK_INIT;
  
@@ -7313,7 +7757,7 @@ index dbea35b..c94f9c5 100644
          }
      }
      ReleaseSRWLockShared(&s_mfc_claim_lock);
-@@ -309,8 +355,9 @@ static mfc_engine* mfc_for(spu_context* ctx)
+@@ -309,8 +360,9 @@ static mfc_engine* mfc_for(spu_context* ctx)
      AcquireSRWLockExclusive(&s_mfc_claim_lock);
      for (spu_mfc_slot* slot = s_mfc_slots; slot; slot = slot->next) {
          if (slot->ctx == ctx) {
@@ -7324,7 +7768,7 @@ index dbea35b..c94f9c5 100644
          }
      }
      spu_mfc_slot* slot = (spu_mfc_slot*)malloc(sizeof(*slot));
-@@ -323,8 +370,9 @@ static mfc_engine* mfc_for(spu_context* ctx)
+@@ -323,8 +375,9 @@ static mfc_engine* mfc_for(spu_context* ctx)
      mfc_engine_init(&slot->mfc);
      slot->next = s_mfc_slots;
      s_mfc_slots = slot;
@@ -7335,7 +7779,7 @@ index dbea35b..c94f9c5 100644
  }
  
  void spu_mfc_release(spu_context* ctx)
-@@ -335,6 +383,7 @@ void spu_mfc_release(spu_context* ctx)
+@@ -335,6 +388,7 @@ void spu_mfc_release(spu_context* ctx)
          if ((*link)->ctx != ctx) continue;
          spu_mfc_slot* slot = *link;
          *link = slot->next;
@@ -7343,7 +7787,7 @@ index dbea35b..c94f9c5 100644
          free(slot);
          break;
      }
-@@ -351,6 +400,7 @@ void spu_mfc_forget_range(uintptr_t lo, uintptr_t hi)
+@@ -351,6 +405,7 @@ void spu_mfc_forget_range(uintptr_t lo, uintptr_t hi)
          uintptr_t owner = (uintptr_t)slot->ctx;
          if (owner >= lo && owner < hi) {
              *link = slot->next;
@@ -7351,7 +7795,28 @@ index dbea35b..c94f9c5 100644
              free(slot);
          } else {
              link = &slot->next;
-@@ -740,10 +790,11 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
+@@ -390,6 +445,20 @@ volatile unsigned g_spu_putllc_sync_hit = 0;
+  * lifted code is a runaway, not a service call. */
+ #define SPU_JM2_KERNEL_BASE 0x15000u
+ 
++/* Shared by indirect dispatch and drain resumption: an interpreted high-LS
++ * overlay must stay in the same live call frame across native helper calls. */
++int spu_high_ls_fallback_enabled(const spu_context* ctx)
++{
++    static int enabled = -1;
++    if (enabled < 0) {
++        const char* value = getenv("SPU_INTERP_UNLIFTED");
++        enabled = value && *value && strcmp(value, "0");
++    }
++    return enabled && !ctx->policy_mode &&
++           (ctx->pc & SPU_LS_MASK) >= SPU_JM2_KERNEL_BASE;
++}
++
++
+ /* Link-register value handed to a SPURS job so its final `bi $r0` lands
+  * somewhere we recognise. The real job manager passes a return address into
+  * itself; we have no manager, so we pass this and treat arriving here as job
+@@ -740,10 +809,11 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
                        ctx->gpr[0]._u32[0] & SPU_LS_MASK, ea); }
          ctx->resv_valid = 0;                           /* reservation consumed */
          spu_lockline_unlock();
@@ -7367,7 +7832,7 @@ index dbea35b..c94f9c5 100644
          return 1;
  
      case MFC_PUTLLUC_CMD:
-@@ -760,8 +811,9 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
+@@ -760,8 +830,9 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
          spu_coh_notify_write(ea);
          ctx->resv_valid = 0; ctx->atomic_stat = 2;   /* PUTLLUC complete */
          spu_lockline_unlock();
@@ -7378,7 +7843,7 @@ index dbea35b..c94f9c5 100644
          return 1;
  
      default:
-@@ -815,7 +867,9 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
+@@ -815,7 +886,9 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
           * long-missing producer for event_status (previously only ever cleared
           * via WrEventAck -> RdEventStat waits could never complete). */
          if (channel == MFC_WrTagUpdate && v != 0 && (ctx->event_mask & 0x1u)) {
@@ -7388,7 +7853,7 @@ index dbea35b..c94f9c5 100644
              spu_ch_wake(ctx);
          }
          return;
-@@ -929,12 +983,17 @@ static int yz_ch_block(void)
+@@ -929,12 +1002,17 @@ static int yz_ch_block(void)
   */
  static void spu_resv_lost_poll(spu_context* ctx)
  {
@@ -7409,7 +7874,16 @@ index dbea35b..c94f9c5 100644
  }
  
  static int spu_ch_ready(spu_context* ctx, uint32_t channel)
-@@ -2065,9 +2124,9 @@ static int spu_smc_microstep(spu_context* ctx)
+@@ -1538,7 +1616,7 @@ void spu_register_stack_reset_entry(uint32_t entry, int image_id)
+  * a stack-switching routine without going through spu_indirect_branch. */
+ void spu_check_stack_reset(spu_context* ctx, void (*fn)(spu_context*))
+ {
+-    if (!ctx->host_depth || !s_spu_halt_armed || ctx->policy_mode) return;
++    if (ctx->policy_mode || !ctx->host_depth || !s_spu_halt_armed) return;
+     for (unsigned i = 0; i < s_stack_reset_count; ++i)
+         if (ctx->pc == s_stack_reset[i].entry &&
+             fn == spu_lookup(ctx->pc, s_stack_reset[i].image_id)) {
+@@ -2065,9 +2143,9 @@ static int spu_smc_microstep(spu_context* ctx)
                        " microstep set -- handing to the interpreter (steps=%d)\n",
                        ctx->image_id, pc, w, steps); }
          ctx->pc = pc;
@@ -7422,7 +7896,7 @@ index dbea35b..c94f9c5 100644
          const uint32_t return_pc = ctx->drain_ret_pc;
          uint32_t result = spu_interp_run_until(ctx, pc, return_pc);
          /* A live interpreter rejoin is a transfer, not a host return. Nested
-@@ -2130,7 +2189,11 @@ void spu_indirect_branch(spu_context* ctx)
+@@ -2130,7 +2208,11 @@ void spu_indirect_branch(spu_context* ctx)
              /* cellSpursModulePoll: report "no contention — keep running".
               * (The host scheduler admits bounded workers; this service does not preempt.) */
              unsigned n = ++g_spurs_pm_polls;
@@ -7435,7 +7909,7 @@ index dbea35b..c94f9c5 100644
                  fprintf(stderr, "[spurs-pm] poll #%u (r3=0x%08X) -> continue\n",
                          n, ctx->gpr[3]._u32[0]);
              ctx->gpr[3] = spu_make_preferred_u32(0);
-@@ -2246,6 +2309,27 @@ void spu_indirect_branch(spu_context* ctx)
+@@ -2246,6 +2328,27 @@ void spu_indirect_branch(spu_context* ctx)
          if (!ti && !ctx->resident_task) ti = spu_taskset_task_image(ctx->pc);
          if (ti) ctx->resident_task = ti;
      }
@@ -7463,7 +7937,16 @@ index dbea35b..c94f9c5 100644
      /* The launched task owns the shared task-code region: resolve it there FIRST
       * so a co-resident task at the same LS base cannot shadow it. (resident_task
       * is 0 outside the region, so this only ever fires for genuine task code.) */
-@@ -2329,7 +2413,7 @@ void spu_indirect_branch(spu_context* ctx)
+@@ -2266,6 +2369,8 @@ void spu_indirect_branch(spu_context* ctx)
+      * may also be registered (historical junk lifts) and must lose. */
+     if (!code_owner && !fn && ctx->resident_ovl) fn = spu_lookup(ctx->pc, ctx->resident_ovl);
+     if (!code_owner && !fn) fn = spu_lookup(ctx->pc, ctx->image_id);
++    if (!code_owner && !fn && g_spu_port_overlay_lookup)
++        fn = g_spu_port_overlay_lookup(ctx, ctx->pc);
+     /* The job returned through the link register we planted: it is finished.
+      * Its outermost frame ends in `bi $r0`, and r0 was 0 -- so without this the
+      * return landed on LS 0, which is the job's OWN entry, and it ran a second
+@@ -2329,7 +2434,7 @@ void spu_indirect_branch(spu_context* ctx)
          if (!known && n_seen < 16) {
              seen[n_seen++] = ctx->pc;
              fprintf(stderr, "[spu] img=%d branched into unlifted LS 0x%05X "
@@ -7472,17 +7955,42 @@ index dbea35b..c94f9c5 100644
                      ctx->image_id, ctx->pc, ctx->gpr[0]._u32[0] & SPU_LS_MASK);
              { fprintf(stderr, "      last dispatched PCs (oldest first):");
                for (unsigned q = 0; q < 8; q++) {
-@@ -2363,7 +2447,8 @@ void spu_indirect_branch(spu_context* ctx)
+@@ -2362,41 +2467,37 @@ void spu_indirect_branch(spu_context* ctx)
+         { uint32_t p = ctx->pc & SPU_LS_MASK;
            uint32_t w0 = ((uint32_t)ctx->ls[p] << 24) | ((uint32_t)ctx->ls[p+1] << 16) |
                          ((uint32_t)ctx->ls[p+2] << 8) | ctx->ls[p+3];
-           static int s_iu = -1;
+-          static int s_iu = -1;
 -          if (s_iu < 0) { const char* e = getenv("SPU_INTERP_UNLIFTED"); s_iu = e ? 1 : 0; }
-+          if (s_iu < 0) { const char* e = getenv("SPU_INTERP_UNLIFTED");
-+              s_iu = e && *e && strcmp(e, "0") != 0; }
-           if (s_iu && w0) {
+-          if (s_iu && w0) {
++          if (spu_high_ls_fallback_enabled(ctx) && w0) {
                static int _n = 0;
                if (_n++ < 8)
-@@ -2375,28 +2460,6 @@ void spu_indirect_branch(spu_context* ctx)
+                   fprintf(stderr, "[spu] img=%d interpreting unlifted LS 0x%05X "
+                           "(runtime-loaded code)\n", ctx->image_id, p);
+-              spu_interp_run(ctx, p);
++              /* A lifted bisl owns the instructions after its link address.
++               * The address need not be a registered function entry. Running
++               * past it interprets the caller's continuation, then the live
++               * host frame executes that continuation a second time. This
++               * duplicated MotorStorm's Multistream DSP work and nested its
++               * channel loop inside itself (return LS 0x4140).
++               *
++               * On re-entry after an interpreted call into a lifted helper,
++               * pc == lr: that is the overlay's continuation, not a new call.
++               * Keep the enclosing drain's return boundary in that case.
++               * With no live host caller, a rejoin must be scheduled explicitly.
++               */
++              uint32_t return_pc = ctx->drain_ret_pc;
++              const uint32_t lr = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
++              if (ctx->host_depth && lr != p) return_pc = lr;
++              if (!ctx->host_depth) return_pc = 0;
++              spu_interp_run_until(ctx, p, return_pc);
++              if (ctx->image_id >= 0 && (ctx->status & SPU_STATUS_RUNNING) &&
++                  (!return_pc || (ctx->pc & SPU_LS_MASK) != return_pc) &&
++                  spu_lifted_lookup(ctx, ctx->pc))
++                  g_spu_trampoline_fn = spu_indirect_branch;
+               return;
+           } }
          spu_halt(ctx);
          return;
      }
@@ -7511,7 +8019,7 @@ index dbea35b..c94f9c5 100644
      /* WWS job-code fallback: the jobmanager PM (image 2) stages each job's
       * code into an LS buffer and branches into it. The staged blobs are
       * lifted as their own images at their LS residence addresses (image 1 =
-@@ -2814,4 +2877,4 @@ void spu_trace_rt(spu_context* ctx, uint32_t rt)
+@@ -2814,4 +2915,4 @@ void spu_trace_rt(spu_context* ctx, uint32_t rt)
  
  #ifdef __cplusplus
  }
@@ -7727,12 +8235,40 @@ index 9820cc2..fca2ba4 100644
               * AFTER the arming code finishes. We run it inline here, so hold the
               * resulting interrupt off for a few drain ticks -- otherwise the WWS
 diff --git a/runtime/spu/spu_drain.c b/runtime/spu/spu_drain.c
-index 931d3b3..1a50d87 100644
+index 931d3b3..9a56486 100644
 --- a/runtime/spu/spu_drain.c
 +++ b/runtime/spu/spu_drain.c
-@@ -59,6 +59,26 @@ unsigned spu_recent_pcs(uint32_t* out, unsigned max)
+@@ -48,17 +48,53 @@ void* volatile    g_pm_flow_ctx = 0;
+ extern void spu_halt(spu_context*);
+ /* Last 32 drain steps on this host thread (pc), for post-mortems of a run that
+  * ended where it should not have (spurs_policy.c, [pm-end]). */
++/* The release fast path omits the diagnostic flight recorder. Explicit
++ * tracing or SPU_FAST_DISPATCH=0 retains the original hook in full. */
++static int s_fast_dispatch = -1;
++static int spu_fast_dispatch_init(void)
++{
++    const char* e = getenv("SPU_FAST_DISPATCH");
++    int fast = e && e[0] == '1';
++    const char* probes[] = {"MOTORSTORM_WWS_WAIT_TRACE", "SPU_NO_LS0_END",
++        "SPU_EXITTRACE", "SPU_STEPTRACE", "SPU_STEPTRACE_FROM", "SPU_JOBDRAIN"};
++    for (unsigned i=0; i<sizeof probes/sizeof probes[0]; ++i)
++        if (getenv(probes[i])) fast = 0;
++    __atomic_store_n(&s_fast_dispatch, fast, __ATOMIC_RELAXED);
++    return fast;
++}
+ static _Thread_local uint32_t t_recent[32];
+ static _Thread_local uint32_t t_recent_n;
+ unsigned spu_recent_pcs(uint32_t* out, unsigned max)
+ {
++    /* A fast run has no complete history; do not report a partial one. */
++    if (__atomic_load_n(&s_fast_dispatch, __ATOMIC_RELAXED) == 1) return 0;
+     unsigned n = t_recent_n < 32 ? t_recent_n : 32, k = n < max ? n : max;
+     for (unsigned i = 0; i < k; i++) out[i] = t_recent[(t_recent_n - k + i) & 31];
+     return k;
+ }
  
- void spu_task_launch_check(spu_context* ctx, void* fn)
+-void spu_task_launch_check(spu_context* ctx, void* fn)
++static void spu_task_launch_slow(spu_context* ctx, void* fn)
  {
 +    /* Opt-in observation of the recurrent MotorStorm WWS load-wait stall.
 +     * It never advances a job or alters an event, tag, or guest register. */
@@ -7757,6 +8293,49 @@ index 931d3b3..1a50d87 100644
      t_recent[t_recent_n++ & 31] = (uint32_t)ctx->pc & SPU_LS_MASK;
      extern void spu_check_stack_reset(spu_context*, void (*)(spu_context*));
      spu_check_stack_reset(ctx, (void (*)(spu_context*))fn);
+@@ -149,6 +185,25 @@ void spu_task_launch_check(spu_context* ctx, void* fn)
+         fprintf(stderr, "[pm-jobdrain] ring-full spin: marked %d pending records done\n", marked);
+ }
+ 
++/* The common nonzero-PC transfer needs only the job step counter and a
++ * possible stack switch. Interrupts remain in the drain loop; LS-zero job
++ * exits, policy-flow capture and every explicitly requested probe use the
++ * original hook. No instructions, waits or job completion events are skipped. */
++void spu_task_launch_check(spu_context* ctx, void* fn)
++{
++    int fast = __atomic_load_n(&s_fast_dispatch, __ATOMIC_RELAXED);
++    if (fast < 0) fast = spu_fast_dispatch_init();
++    if (fast && (ctx->pc & SPU_LS_MASK) && g_pm_flow_ctx != (void*)ctx) {
++        if (!ctx->policy_mode && ctx->host_depth) {
++            extern void spu_check_stack_reset(spu_context*, void (*)(spu_context*));
++            spu_check_stack_reset(ctx, (void (*)(spu_context*))fn);
++        }
++        ++ctx->steps;
++        return;
++    }
++    spu_task_launch_slow(ctx, fn);
++}
++
+ /* Restore the active image after a lifted call bracket. The brsl/bisl emission
+  * saves image_id in a call-site local and hands it back here so an image
+  * adopted inside the callee cannot leak into the caller's continuation. A
+@@ -460,6 +515,16 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
+                 continue;
+             }
+         }
++        /* A lifted helper can return into an interpreted DSP overlay. Keep
++         * this caller's host continuation alive while the overlay resumes;
++         * restarting the top-level dispatcher loses the return boundary. */
++        {
++            extern int spu_high_ls_fallback_enabled(const spu_context*);
++            if ((ctx->status & SPU_STATUS_RUNNING) && spu_high_ls_fallback_enabled(ctx)) {
++                g_spu_trampoline_fn = spu_indirect_branch;
++                continue;
++            }
++        }
+         {
+             extern void spu_restart_dispatch(spu_context*);
+             SPU_DRAIN_POP_IRQ();
 diff --git a/runtime/spu/spu_interp.c b/runtime/spu/spu_interp.c
 index 9a3bfc0..fc1378a 100644
 --- a/runtime/spu/spu_interp.c
@@ -7827,6 +8406,75 @@ index 5d1c63d..6348292 100644
  {
      if (!entry || !pm_host || !pm_size || pm_size > SPU_LS_SIZE - 0xA00)
          return -1;
+diff --git a/runtime/spu/tests/test_spu_interpreter_handoff.c b/runtime/spu/tests/test_spu_interpreter_handoff.c
+index aa13676..022f4b4 100644
+--- a/runtime/spu/tests/test_spu_interpreter_handoff.c
++++ b/runtime/spu/tests/test_spu_interpreter_handoff.c
+@@ -35,14 +35,15 @@ static void wrong_continuation(spu_context* c) {
+     c->gpr[21]._u32[0]++;
+     finish(c);
+ }
++static uint32_t call_target = 0x4000;
+ static void tail_entry(spu_context* c) {
+-    c->pc = 0x4000; g_spu_trampoline_fn = spu_indirect_branch;
++    c->pc = call_target; g_spu_trampoline_fn = spu_indirect_branch;
+ }
+ static int queued_call;
+ static void nested_entry(spu_context* c) {
+     c->gpr[0] = spu_link(0x204);
+     c->host_depth++;
+-    c->pc = 0x4000;
++    c->pc = call_target;
+     if (queued_call) g_spu_trampoline_fn = spu_indirect_branch;
+     else spu_indirect_branch(c);
+     spu_drain_call(c, 0x204);
+@@ -59,7 +60,7 @@ int main(int argc, char** argv) {
+     ctx.status = SPU_STATUS_RUNNING;
+     spu_begin_image(77);
+     spu_register_function(0x200, helper);
+-    if (strcmp(mode, "nested-return-unlifted"))
++    if (strcmp(mode, "nested-return-unlifted") && strcmp(mode, "high-return-unlifted"))
+         spu_register_function(0x204, wrong_continuation);
+     spu_register_function(0x240, finish);
+     if (!strcmp(mode, "top-zero")) spu_register_function(0, finish);
+@@ -70,7 +71,25 @@ int main(int argc, char** argv) {
+     }
+     word(0x4000, 0x04000082); /* ori $2,$1,0: force full interpreter */
+     void (*entry)(spu_context*) = tail_entry;
+-    if (!strcmp(mode, "top-zero")) {
++    if (!strncmp(mode, "high-", 5)) {
++        ctx.policy_mode = 0;
++        call_target = 0x30000;
++        setenv("SPU_INTERP_UNLIFTED", "1", 1);
++        word(0x30000, 0x04000082); /* ori $2,$1,0 */
++        word(0x204, 0x1C004A95); /* host-owned continuation: must not run here */
++        word(0x208, 0x30004800); /* bra 0x240 */
++        if (!strcmp(mode, "high-top")) {
++            word(0x30004, 0x30004800); /* tail transfer to a lifted function */
++        } else {
++            entry = nested_entry;
++            if (!strcmp(mode, "high-rejoin")) {
++                word(0x30004, 0x04000050); /* ori $80,$0,0: save caller LR */
++                word(0x30008, 0x31004000); /* brasl $0,0x200: native helper */
++                word(0x3000C, 0x04002800); /* ori $0,$80,0: restore LR */
++                word(0x30010, 0x35000000); /* bi $0 */
++            } else word(0x30004, 0x35000000); /* bi $0 -> 0x204 */
++        }
++    } else if (!strcmp(mode, "top-zero")) {
+         word(0x4004, 0x30000000); /* bra 0: registered, valid lifted entry */
+     } else if (!strcmp(mode, "top")) {
+         word(0x4004, 0x30004800); /* bra 0x240 */
+@@ -132,8 +151,8 @@ int main(int argc, char** argv) {
+     }
+     assert(halted == 1 && ctx.status == SPU_STATUS_STOPPED_BY_STOP);
+     assert(ctx.gpr[11]._u32[0] == 1);
+-    assert(ctx.gpr[20]._u32[0] == (!strncmp(mode, "nested-return", 13) ? 1u : 0u));
+-    assert(ctx.gpr[10]._u32[0] == (!strcmp(mode, "nested-calls") ? 2u : 0u));
++    assert(ctx.gpr[20]._u32[0] == ((!strncmp(mode, "nested-return", 13) || (!strncmp(mode, "high-", 5) && strcmp(mode, "high-top"))) ? 1u : 0u));
++    assert(ctx.gpr[10]._u32[0] == (!strcmp(mode, "nested-calls") ? 2u : !strcmp(mode, "high-rejoin") ? 1u : 0u));
+     puts("PASS"); return 0;
+ }
+ 
 diff --git a/runtime/spu/tests/test_spu_lifted_start.c b/runtime/spu/tests/test_spu_lifted_start.c
 index 7f5ef56..4a4af8c 100644
 --- a/runtime/spu/tests/test_spu_lifted_start.c
@@ -8524,6 +9172,18 @@ index 2f27270..e4c39d3 100644
          binary = Path(tmp) / name
          command = [os.environ.get('CC', 'cc'), '-std=gnu17', '-O1', '-UNDEBUG',
                     '-I' + str(root / 'include'), '-I' + str(spu),
+diff --git a/tools/test_spu_interpreter_handoff.py b/tools/test_spu_interpreter_handoff.py
+index f7699b0..1e81270 100644
+--- a/tools/test_spu_interpreter_handoff.py
++++ b/tools/test_spu_interpreter_handoff.py
+@@ -24,6 +24,7 @@ with tempfile.TemporaryDirectory(prefix='spu-interp-handoff-') as tmp:
+                     '-o', str(binary)], check=True)
+     failed = []
+     for mode in ['top', 'top-zero', 'nested-return', 'nested-return-unlifted', 'nested-calls', 'stop-zero',
++                 'high-return-lifted', 'high-return-unlifted', 'high-rejoin', 'high-top',
+                  'nested-stop', 'stop-code', 'halt', 'smc', 'pure-interpreter', 'stepcap', 'negative-stepcap']:
+         env = {k: v for k, v in os.environ.items()
+                if not k.startswith(('SPU_', 'SPURS_', 'YDKJ_', 'LBP_', 'GH3_'))}
 diff --git a/include/ps3emu/guest_read_sync.h b/include/ps3emu/guest_read_sync.h
 new file mode 100644
 index 0000000..bf047b0
@@ -8554,6 +9214,136 @@ index 0000000..bf047b0
 +#ifdef __cplusplus
 +}
 +#endif
++#endif
+diff --git a/libs/input/macos_keyboard_map.h b/libs/input/macos_keyboard_map.h
+new file mode 100644
+index 0000000..191c6b1
+--- /dev/null
++++ b/libs/input/macos_keyboard_map.h
+@@ -0,0 +1,124 @@
++/* Pure mapping helpers shared by the Metal keyboard bridge and its tests. */
++#ifndef PS3RECOMP_MACOS_KEYBOARD_MAP_H
++#define PS3RECOMP_MACOS_KEYBOARD_MAP_H
++
++#include <stdint.h>
++
++typedef struct MacKeyboardPadState {
++    uint16_t buttons;
++    uint8_t left_x, left_y, right_x, right_y;
++    uint8_t enter_down, escape_down;
++} MacKeyboardPadState;
++
++typedef enum MacKeyboardContext {
++    MAC_KEYBOARD_CONTEXT_UNKNOWN = 0,
++    MAC_KEYBOARD_CONTEXT_BOOT,
++    MAC_KEYBOARD_CONTEXT_FRONTEND,
++    MAC_KEYBOARD_CONTEXT_GAMEPLAY,
++    MAC_KEYBOARD_CONTEXT_PAUSE
++} MacKeyboardContext;
++
++typedef enum MacKeyboardKeyEvent {
++    MAC_KEY_EVENT_DOWN,
++    MAC_KEY_EVENT_UP
++} MacKeyboardKeyEvent;
++
++/* Repeated key-down and release events are idempotent. */
++static inline void mac_keyboard_apply_event(uint64_t keys[2], unsigned key,
++                                            MacKeyboardKeyEvent event)
++{
++    if (key >= 128) return;
++    const unsigned word = key / 64;
++    const uint64_t bit = UINT64_C(1) << (key % 64);
++    if (event == MAC_KEY_EVENT_DOWN) {
++        keys[word] |= bit;
++    } else if (event == MAC_KEY_EVENT_UP) {
++        keys[word] &= ~bit;
++    }
++}
++
++/* Read the actual left-device modifier state; toggling on flagsChanged
++ * would turn a release after focus loss into a stuck handbrake. */
++static inline void mac_keyboard_apply_modifiers(uint64_t keys[2], int left_shift)
++{
++    mac_keyboard_apply_event(keys, 56, left_shift ? MAC_KEY_EVENT_DOWN : MAC_KEY_EVENT_UP);
++}
++
++static inline void mac_keyboard_clear(uint64_t keys[2])
++{
++    keys[0] = keys[1] = 0;
++}
++
++/* Consume keys held through a menu/race transition until each is released.
++ * This prevents an arrow used to select a menu item from becoming throttle. */
++static inline void mac_keyboard_context_transition(MacKeyboardContext context,
++    MacKeyboardContext *previous, uint64_t keys[2], uint64_t blocked[2])
++{
++    if (*previous != context) {
++        blocked[0] |= keys[0];
++        blocked[1] |= keys[1];
++        *previous = context;
++    }
++    blocked[0] &= keys[0];
++    blocked[1] &= keys[1];
++}
++
++static inline int mac_keyboard_held(uint64_t lo, uint64_t hi, unsigned key)
++{
++    if (key < 64) return (int)((lo >> key) & 1u);
++    if (key < 128) return (int)((hi >> (key - 64)) & 1u);
++    return 0;
++}
++
++static inline uint8_t mac_keyboard_axis(uint64_t lo, uint64_t hi,
++                                        unsigned negative_key, unsigned positive_key)
++{
++    const int negative = mac_keyboard_held(lo, hi, negative_key);
++    const int positive = mac_keyboard_held(lo, hi, positive_key);
++    return negative == positive ? 128 : negative ? 0 : 255;
++}
++
++static inline MacKeyboardPadState mac_keyboard_pad_state(uint64_t lo, uint64_t hi,
++                                                         MacKeyboardContext context)
++{
++    MacKeyboardPadState s = {0, 128, 128, 128, 128,
++                             (uint8_t)mac_keyboard_held(lo, hi, 36),
++                             (uint8_t)mac_keyboard_held(lo, hi, 53)};
++    const int menu = context == MAC_KEYBOARD_CONTEXT_BOOT ||
++                     context == MAC_KEYBOARD_CONTEXT_FRONTEND ||
++                     context == MAC_KEYBOARD_CONTEXT_PAUSE;
++    /* Arrow keys navigate menus; in a race, Up/Down only control triggers. */
++    if (menu && mac_keyboard_held(lo, hi, 126)) s.buttons |= 0x0010;
++    if (menu && mac_keyboard_held(lo, hi, 125)) s.buttons |= 0x0040;
++    if (mac_keyboard_held(lo, hi, 123)) s.buttons |= 0x0080;
++    if (mac_keyboard_held(lo, hi, 124)) s.buttons |= 0x0020;
++    s.left_x = mac_keyboard_axis(lo, hi, 123, 124);
++    if (context == MAC_KEYBOARD_CONTEXT_GAMEPLAY) {
++        if (mac_keyboard_held(lo, hi, 126)) s.buttons |= 0x0200; /* R2 throttle */
++        if (mac_keyboard_held(lo, hi, 125)) s.buttons |= 0x0100; /* L2 brake */
++    }
++    s.left_y = mac_keyboard_axis(lo, hi, 13, 1); /* W/S lean */
++    s.right_y = mac_keyboard_axis(lo, hi, 34, 40); /* I/K */
++    s.right_x = mac_keyboard_axis(lo, hi, 38, 37); /* J/L */
++
++    if (mac_keyboard_held(lo, hi, 49)) s.buttons |= 0x4000; /* Space: Cross */
++    if (mac_keyboard_held(lo, hi, 56)) s.buttons |= 0x2000; /* left Shift: Circle */
++    if (mac_keyboard_held(lo, hi, 8)) s.buttons |= 0x1000; /* C: Triangle */
++    if (mac_keyboard_held(lo, hi, 48)) s.buttons |= 0x0004; /* Tab: R3 */
++    if (mac_keyboard_held(lo, hi, 15)) s.buttons |= 0x0001; /* R: Select */
++    if (mac_keyboard_held(lo, hi, 3)) s.buttons |= 0x8000; /* F: Square */
++    if (s.enter_down) {
++        if (context == MAC_KEYBOARD_CONTEXT_BOOT) s.buttons |= 0x0008; /* Start */
++        else if (context == MAC_KEYBOARD_CONTEXT_FRONTEND ||
++                 context == MAC_KEYBOARD_CONTEXT_PAUSE) s.buttons |= 0x4000;
++    }
++    if (s.escape_down) {
++        if (context == MAC_KEYBOARD_CONTEXT_GAMEPLAY ||
++            context == MAC_KEYBOARD_CONTEXT_PAUSE) s.buttons |= 0x0008; /* Start */
++        else if (context == MAC_KEYBOARD_CONTEXT_BOOT ||
++                 context == MAC_KEYBOARD_CONTEXT_FRONTEND) s.buttons |= 0x2000;
++    }
++    return s;
++}
++
 +#endif
 diff --git a/libs/video/rsx_metal_msaa.h b/libs/video/rsx_metal_msaa.h
 new file mode 100644
@@ -9569,6 +10359,91 @@ index 0000000..e59b8c1
 +    printf("B8/legacy feedback checks=%u failures=%u\n",checks,failures);
 +    return failures?1:0;
 +} }
+diff --git a/libs/video/tests/test_metal_b8_seed.m b/libs/video/tests/test_metal_b8_seed.m
+new file mode 100644
+index 0000000..ab75ed6
+--- /dev/null
++++ b/libs/video/tests/test_metal_b8_seed.m
+@@ -0,0 +1,79 @@
++/* Exercise the actual Metal initializer and queued seed/snapshot/clear path. */
++#define ENG_STAGE_MAX (32u << 20)
++#include "../rsx_metal_backend.m"
++#include <assert.h>
++u8* vm_base;
++float cellAvconfExt_display_gamma(void) { return 1; }
++int cellGcmOffsetIsDisplay(u32 off) { (void)off; assert(0); return 0; }
++u32 cellGcmResolveOffset(u32 off) { (void)off; assert(0); return 0; }
++u32 cellGcmResolveLocated(int loc,u32 off) { (void)loc;(void)off;assert(0);return 0; }
++void rsx_fetch_attrib(const rsx_state* st,int idx,u32 vi,float out[4]) { (void)st;(void)idx;(void)vi;(void)out;assert(0); }
++
++static void check_texture(u32 handle,u32 w,u32 h,int cleared)
++{
++    id<MTLTexture> texture=eng_obj(handle); assert(texture);
++    const u32 pitch=(w*4+255)&~255u;
++    id<MTLBuffer> read=[s_dev newBufferWithLength:(size_t)pitch*h options:MTLResourceStorageModeShared];
++    id<MTLCommandBuffer> cb=[s_queue commandBuffer];
++    id<MTLBlitCommandEncoder> copy=[cb blitCommandEncoder];
++    [copy copyFromTexture:texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0)
++        sourceSize:MTLSizeMake(w,h,1) toBuffer:read destinationOffset:0
++        destinationBytesPerRow:pitch destinationBytesPerImage:(size_t)pitch*h];
++    [copy endEncoding];[cb commit];[cb waitUntilCompleted];
++    assert(cb.status==MTLCommandBufferStatusCompleted && !cb.error);
++    for(u32 y=0;y<h;++y)for(u32 x=0;x<w;++x) {
++        const u8* p=(const u8*)read.contents+(size_t)y*pitch+x*4;
++        u8 b=(u8)(x+y*37);
++        assert(p[0]==(cleared?255:b) && p[1]==(cleared?0:b) &&
++               p[2]==(cleared?0:b) && p[3]==255);
++    }
++}
++static void layout(u32 w,u32 h,u32 pad,int rollover)
++{
++    u32 pitch=w+pad,span=(h-1)*pitch+w;
++    u8* source=malloc(span);assert(source);memset(source,0xe7,span);
++    for(u32 y=0;y<h;++y)for(u32 x=0;x<w;++x)source[(size_t)y*pitch+x]=(u8)(x+y*37);
++    u32 seed=eng_color_target_create_b8(NULL,w,h,source,pitch);assert(seed);
++    memset(source,0xab,span);free(source); /* No deferred guest reads. */
++    u32 before=eng_color_snapshot(NULL,seed);assert(before);
++    const float red[4]={1,0,0,1};eng_clear_color(NULL,seed,red);
++    u32 after=eng_color_snapshot(NULL,seed);assert(after);
++    eng_obj_release(NULL,seed); /* Queued commands still own the old handle. */
++    if(rollover) {
++        u32 padding;
++        const u32 aligned=(s_eng_stage_used+255)&~255u;
++        assert(eng_stage_reserve(ENG_STAGE_MAX-256-aligned,&padding));
++        const u8 next[17]={0};
++        u32 following=eng_color_target_create_b8(NULL,17,1,next,17);assert(following);
++        /* 256-byte aligned 17-byte reservation still fits; force next seed
++         * across the arena boundary with a 257-byte row. */
++        u8 next_row[257]={0};
++        u32 crossed=eng_color_target_create_b8(NULL,257,1,next_row,257);assert(crossed);
++        assert(s_eng_rec_count==1 && s_eng_rec[0].packed_off==0);
++        eng_obj_release(NULL,following);eng_obj_release(NULL,crossed);
++    }
++    eng_submit_and_wait(NULL,0);assert(s_eng_checked_completed && !s_eng_encoding_failed);
++    check_texture(before,w,h,0);check_texture(after,w,h,1);
++    eng_obj_release(NULL,before);eng_obj_release(NULL,after);
++    eng_submit_and_wait(NULL,0);
++}
++int main(void) { @autoreleasepool {
++    s_dev=MTLCreateSystemDefaultDevice();assert(s_dev);s_queue=[s_dev newCommandQueue];
++    setenv("RSX_SURFACE_GPU_SEED","1",1);
++    for(int direct=0;direct<2;++direct) {
++        setenv("RSX_METAL_DIRECT_STAGE",direct?"1":"0",1);
++        assert(!eng_init(NULL,1280,720) && s_eng_b8_seed_pso);
++        layout(256,3,19,0);layout(17,13,7,1);layout(1,1,0,0);
++        layout(4096,4096,0,0);
++        const u8 byte=0;
++        assert(!eng_color_target_create_b8(NULL,0,1,&byte,1));
++        assert(!eng_color_target_create_b8(NULL,2,1,&byte,1));
++        assert(!eng_color_target_create_b8(NULL,1,1,NULL,1));
++        assert(!eng_color_target_create_b8(NULL,8192,8192,&byte,8192));
++        s_eng_b8_seed_pso=nil;
++        assert(!eng_color_target_create_b8(NULL,1,1,&byte,1));
++        eng_shutdown(NULL);
++    }
++    puts("PASS: all 256 B8 values, padded and tight final rows, 4096-square image, immutable source, seed/snapshot/clear order, retired handles, arena rollover, copied/shared staging and fallback guards");
++    return 0;
++}}
 diff --git a/libs/video/tests/test_metal_bc_volume.m b/libs/video/tests/test_metal_bc_volume.m
 new file mode 100644
 index 0000000..fd801e6
@@ -9936,14 +10811,52 @@ index 0000000..9b7373f
 +} }
 diff --git a/libs/video/tests/test_metal_depth_bias.m b/libs/video/tests/test_metal_depth_bias.m
 new file mode 100644
-index 0000000..bdb1265
+index 0000000..01a3e55
 --- /dev/null
 +++ b/libs/video/tests/test_metal_depth_bias.m
-@@ -0,0 +1,174 @@
+@@ -0,0 +1,213 @@
 +/* Exercise the recorded backend draw on a real device, including reset. */
 +#include "../rsx_metal_backend.m"
 +#include <assert.h>
++float cellAvconfExt_display_gamma(void) { return 1; }
 +static id<MTLTexture> test_depth;
++static void test_rg16_sample_order(void) {
++    /* Stored halves +0.25, -0.5 must sample as (-0.5,+0.25,-0.5,+0.25).
++     * Exercise both guest uploads and the production colour-alias view. */
++    const u8 rgba[4]={0x00,0xb8,0x00,0x34};
++    const u16 halves[2]={0x3400,0xb800};
++    u32 source=eng_color_target_create(NULL,RSX_BE_FMT_R8G8B8A8,1,1,rgba,4);
++    u32 snapshot=eng_color_rg16_snapshot(NULL,source,1,1);assert(snapshot);
++    NSError* error=nil;
++    NSString* code=@"#include <metal_stdlib>\nusing namespace metal;\n"
++        "kernel void probe(texture2d<float> t [[texture(0)]], device float4* out [[buffer(0)]]) {"
++        "constexpr sampler s(coord::normalized,filter::nearest);out[0]=t.sample(s,float2(0.5));}";
++    id<MTLLibrary> lib=[s_dev newLibraryWithSource:code options:nil error:&error];assert(lib);
++    id<MTLComputePipelineState> pso=[s_dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"probe"] error:&error];assert(pso);
++    id<MTLCommandBuffer> cb=[s_queue commandBuffer];eng_encode_records(cb,nil);
++    [cb commit];[cb waitUntilCompleted];assert(!cb.error);s_eng_rec_count=0;
++    u32 views[2]={0};
++    for(unsigned override=0;override<2;++override) {
++        u32 remap=0xAAE4u|(override<<16);
++        views[override]=eng_surface_view(NULL,snapshot,remap,0xBFu);assert(views[override]);
++        u32 uploaded=eng_texture_create(NULL,RSX_BE_FMT_R16G16F,1,1,1,1,remap,0xBFu);assert(uploaded);
++        eng_texture_upload(NULL,uploaded,0,0,1,1,halves,4,1);
++        for(unsigned route=0;route<2;++route) {
++            id<MTLBuffer> rb=[s_dev newBufferWithLength:16 options:MTLResourceStorageModeShared];
++            cb=[s_queue commandBuffer];id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder];
++            [e setComputePipelineState:pso];[e setTexture:eng_obj(route?uploaded:views[override]) atIndex:0];
++            [e setBuffer:rb offset:0 atIndex:0];[e dispatchThreads:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(1,1,1)];
++            [e endEncoding];[cb commit];[cb waitUntilCompleted];assert(!cb.error);
++            const float* got=rb.contents;
++            assert(got[0]==-0.5f && got[1]==(override?-0.5f:0.25f) && got[2]==-0.5f && got[3]==0.25f);
++        }
++        eng_obj_release(NULL,uploaded);
++    }
++    assert(views[0]!=views[1]);
++    eng_obj_release(NULL,views[0]);eng_obj_release(NULL,views[1]);
++    eng_obj_release(NULL,snapshot);eng_obj_release(NULL,source);
++    puts("Metal RG16F sampling: PASS (RPCS3 channel order, override, GPU alias and CPU upload)");
++}
 +static void test_color_rg16(void) {
 +    /* Exercise production queue ordering and compare raw output bits against
 +     * the CPU upload path, including all half bit patterns, odd crop widths,
@@ -10112,6 +11025,7 @@ index 0000000..bdb1265
 +    test_crop();
 +    test_packed_range();
 +    test_color_rg16();
++    test_rg16_sample_order();
 +    printf("Metal depth slope and reset: PASS (%g -> %g -> %g)\n",before,biased,reset);
 +} }
 diff --git a/libs/video/tests/test_metal_fp_alias.m b/libs/video/tests/test_metal_fp_alias.m
@@ -11035,10 +11949,10 @@ index 0000000..06f0ec5
 +}
 diff --git a/libs/video/tests/test_surface_seed.c b/libs/video/tests/test_surface_seed.c
 new file mode 100644
-index 0000000..07e2fa0
+index 0000000..d475eaf
 --- /dev/null
 +++ b/libs/video/tests/test_surface_seed.c
-@@ -0,0 +1,113 @@
+@@ -0,0 +1,145 @@
 +/* Exercise the production seed converter and its actual dispatcher callsite. */
 +#define main original_engine_tests_main
 +#include "test_rsx_draw_engine.c"
@@ -11125,6 +12039,7 @@ index 0000000..07e2fa0
 +}
 +static void dispatcher_case(u32 color)
 +{
++    setenv("RSX_SURFACE_GPU_SEED","0",1);
 +    setenv("RSX_SURFACE_TYPED_SEED","1",1);
 +    rsx_draw_backend backend=g_stub_backend;
 +    backend.color_target_create=capture_seed;
@@ -11144,10 +12059,41 @@ index 0000000..07e2fa0
 +    engine_down();
 +    assert(!g.surface_typed_seed);
 +}
++static int gpu_calls,gpu_fail;
++static u32 capture_gpu_seed(void* u,u32 w,u32 h,const void* source,u32 pitch)
++{
++    assert(source==seed_source && w==7 && h==3 && pitch==11);
++    assert(seed_request==29);gpu_calls++;
++    return gpu_fail?0:stub_color_create(u,RSX_BE_FMT_R8G8B8A8,w,h,NULL,0);
++}
++static void gpu_dispatcher_case(int enabled,int available,int fail,u32 color)
++{
++    setenv("RSX_SURFACE_GPU_SEED",enabled?"1":"0",1);
++    rsx_draw_backend backend=g_stub_backend;
++    backend.color_target_create=capture_seed;
++    backend.color_target_create_b8=available?capture_gpu_seed:NULL;
++    rsx_draw_engine_set_backend(&backend);
++    assert(!rsx_draw_engine_init(1280,720));
++    rsx_draw_engine_set_guest_memory(bounded_seed_reader,NULL);
++    expected_color=color;expected_pitch=color==9?11:32;
++    seed_fixture(7,3,color==9?1:4,expected_pitch);
++    gpu_calls=captured=0;gpu_fail=fail;
++    u32 slot=eng_surface_get(1,seed_offset,7,3,RSX_BE_FMT_R8G8B8A8,expected_pitch,color,1);
++    assert(slot!=ENG_INVALID);
++    const int attempted=enabled && available && color==9;
++    assert(gpu_calls==attempted && captured==!(attempted && !fail));
++    assert(seed_request==seed_span);
++    assert(eng_surface_get(1,seed_offset,7,3,RSX_BE_FMT_R8G8B8A8,expected_pitch,color,1)==slot);
++    assert(gpu_calls==attempted && captured==!(attempted && !fail));
++    engine_down();assert(!g.surface_gpu_seed);
++}
 +int main(void)
 +{
 +    differential();
 +    dispatcher_case(8);dispatcher_case(9);
++    gpu_dispatcher_case(1,1,0,9);gpu_dispatcher_case(1,1,1,9);
++    gpu_dispatcher_case(0,1,0,9);gpu_dispatcher_case(1,0,0,9);
++    gpu_dispatcher_case(1,1,0,8);
 +    free(seed_source);
 +    puts("PASS: real dispatcher supplies guest color format, raster type and pitch; existing target reused; shutdown reset");
 +    return g_failures?1:0;
@@ -11670,6 +12616,84 @@ index 0000000..6506bc4
 +{ (void)role; (void)frame_critical; }
 +#endif
 +#endif
+diff --git a/runtime/spu/tests/test_dispatch_checks.c b/runtime/spu/tests/test_dispatch_checks.c
+new file mode 100644
+index 0000000..72a82c2
+--- /dev/null
++++ b/runtime/spu/tests/test_dispatch_checks.c
+@@ -0,0 +1,72 @@
++/* Differentially compare release transfers with the complete diagnostic hook. */
++#include "../spu_drain.c"
++#include <assert.h>
++#include <time.h>
++static jmp_buf stop;
++static unsigned stack_switches;
++static void switches_stack(spu_context* ctx) { (void)ctx; }
++void spu_check_stack_reset(spu_context* ctx,void (*fn)(spu_context*))
++{
++    if(ctx->host_depth && !ctx->policy_mode && fn==switches_stack) {
++        ++stack_switches;longjmp(stop,2);
++    }
++}
++void spu_halt(spu_context* ctx) { ctx->status=0x1234;longjmp(stop,1); }
++static int invoke(spu_context* ctx,int fast,void* fn)
++{
++    int result=setjmp(stop);
++    if(!result) {
++        if(fast)spu_task_launch_check(ctx,fn);
++        else spu_task_launch_slow(ctx,fn);
++    }
++    return result;
++}
++static double clock_s(void)
++{
++    struct timespec t;clock_gettime(CLOCK_THREAD_CPUTIME_ID,&t);
++    return t.tv_sec+t.tv_nsec*1e-9;
++}
++__attribute__((noinline)) static double bench(spu_context* ctx,int fast)
++{
++    double start=clock_s();
++    for(unsigned i=0;i<5000000;++i) {
++        ctx->pc=0x4000+(i&255)*4;
++        if(fast)spu_task_launch_check(ctx,NULL);else spu_task_launch_slow(ctx,NULL);
++    }
++    return clock_s()-start;
++}
++int main(void)
++{
++    setenv("SPU_FAST_DISPATCH","1",1);
++    assert(spu_fast_dispatch_init()==1);
++    spu_context* a=calloc(1,sizeof *a);spu_context* b=calloc(1,sizeof *b);assert(a&&b);
++    for(unsigned i=0;i<2048;++i) {
++        memset(a,0,sizeof *a);
++        a->pc=(i%5==0)?0:((i%7==0)?SPU_LS_SIZE:0x4000+i*4);
++        a->steps=i%3==0?0:i;
++        a->image_id=(i%3==0)?0:900;a->policy_mode=i&1;
++        a->host_depth=(i%4);a->gpr[3]._u32[0]=0x12345678;
++        memcpy(b,a,sizeof *b);
++        void* fn=i%11==0?(void*)switches_stack:NULL;
++        int reference=invoke(a,0,fn),candidate=invoke(b,1,fn);
++        assert(reference==candidate && !memcmp(a,b,sizeof *a));
++    }
++    assert(stack_switches);
++    memset(a,0,sizeof *a);a->pc=0x1234;a->policy_mode=1;
++    g_pm_flow_ctx=a;g_pm_flow_n=0;
++    assert(!invoke(a,1,NULL) && g_pm_flow_n==1 && g_pm_flow_buf[0]==0x1234);
++    g_pm_flow_ctx=NULL;
++    uint32_t recent[32];assert(!spu_recent_pcs(recent,32));
++    /* Every existing observation/compatibility option forces the full path,
++     * even a value of zero: some legacy switches use presence semantics. */
++    const char* probes[]={"MOTORSTORM_WWS_WAIT_TRACE","SPU_NO_LS0_END",
++        "SPU_EXITTRACE","SPU_STEPTRACE","SPU_STEPTRACE_FROM","SPU_JOBDRAIN"};
++    for(unsigned i=0;i<sizeof probes/sizeof probes[0];++i) {
++        setenv(probes[i],"0",1);assert(!spu_fast_dispatch_init());unsetenv(probes[i]);
++    }
++    assert(spu_fast_dispatch_init()==1);
++    memset(a,0,sizeof *a);a->image_id=900;a->host_depth=4;a->policy_mode=1;
++    double slow=bench(a,0),fast=bench(a,1);
++    printf("PASS: 2048 identical contexts/exits, stack switches, flow capture and probe fallback; 5M policy transfers %.3f -> %.3f s (%.2fx)\n",slow,fast,slow/fast);
++    free(a);free(b);return 0;
++}
 diff --git a/runtime/spu/tests/test_spu_lockline_host.c b/runtime/spu/tests/test_spu_lockline_host.c
 new file mode 100644
 index 0000000..104f4d8
@@ -20960,133 +21984,3 @@ index 0000000..6062b26
 +    a.out.parent.mkdir(parents=True, exist_ok=True)
 +    a.out.write_text(json.dumps(result, indent=2) + "\n")
 +print(json.dumps(result, indent=2))
-diff --git a/libs/input/macos_keyboard_map.h b/libs/input/macos_keyboard_map.h
-new file mode 100644
-index 0000000..191c6b1
---- /dev/null
-+++ b/libs/input/macos_keyboard_map.h
-@@ -0,0 +1,124 @@
-+/* Pure mapping helpers shared by the Metal keyboard bridge and its tests. */
-+#ifndef PS3RECOMP_MACOS_KEYBOARD_MAP_H
-+#define PS3RECOMP_MACOS_KEYBOARD_MAP_H
-+
-+#include <stdint.h>
-+
-+typedef struct MacKeyboardPadState {
-+    uint16_t buttons;
-+    uint8_t left_x, left_y, right_x, right_y;
-+    uint8_t enter_down, escape_down;
-+} MacKeyboardPadState;
-+
-+typedef enum MacKeyboardContext {
-+    MAC_KEYBOARD_CONTEXT_UNKNOWN = 0,
-+    MAC_KEYBOARD_CONTEXT_BOOT,
-+    MAC_KEYBOARD_CONTEXT_FRONTEND,
-+    MAC_KEYBOARD_CONTEXT_GAMEPLAY,
-+    MAC_KEYBOARD_CONTEXT_PAUSE
-+} MacKeyboardContext;
-+
-+typedef enum MacKeyboardKeyEvent {
-+    MAC_KEY_EVENT_DOWN,
-+    MAC_KEY_EVENT_UP
-+} MacKeyboardKeyEvent;
-+
-+/* Repeated key-down and release events are idempotent. */
-+static inline void mac_keyboard_apply_event(uint64_t keys[2], unsigned key,
-+                                            MacKeyboardKeyEvent event)
-+{
-+    if (key >= 128) return;
-+    const unsigned word = key / 64;
-+    const uint64_t bit = UINT64_C(1) << (key % 64);
-+    if (event == MAC_KEY_EVENT_DOWN) {
-+        keys[word] |= bit;
-+    } else if (event == MAC_KEY_EVENT_UP) {
-+        keys[word] &= ~bit;
-+    }
-+}
-+
-+/* Read the actual left-device modifier state; toggling on flagsChanged
-+ * would turn a release after focus loss into a stuck handbrake. */
-+static inline void mac_keyboard_apply_modifiers(uint64_t keys[2], int left_shift)
-+{
-+    mac_keyboard_apply_event(keys, 56, left_shift ? MAC_KEY_EVENT_DOWN : MAC_KEY_EVENT_UP);
-+}
-+
-+static inline void mac_keyboard_clear(uint64_t keys[2])
-+{
-+    keys[0] = keys[1] = 0;
-+}
-+
-+/* Consume keys held through a menu/race transition until each is released.
-+ * This prevents an arrow used to select a menu item from becoming throttle. */
-+static inline void mac_keyboard_context_transition(MacKeyboardContext context,
-+    MacKeyboardContext *previous, uint64_t keys[2], uint64_t blocked[2])
-+{
-+    if (*previous != context) {
-+        blocked[0] |= keys[0];
-+        blocked[1] |= keys[1];
-+        *previous = context;
-+    }
-+    blocked[0] &= keys[0];
-+    blocked[1] &= keys[1];
-+}
-+
-+static inline int mac_keyboard_held(uint64_t lo, uint64_t hi, unsigned key)
-+{
-+    if (key < 64) return (int)((lo >> key) & 1u);
-+    if (key < 128) return (int)((hi >> (key - 64)) & 1u);
-+    return 0;
-+}
-+
-+static inline uint8_t mac_keyboard_axis(uint64_t lo, uint64_t hi,
-+                                        unsigned negative_key, unsigned positive_key)
-+{
-+    const int negative = mac_keyboard_held(lo, hi, negative_key);
-+    const int positive = mac_keyboard_held(lo, hi, positive_key);
-+    return negative == positive ? 128 : negative ? 0 : 255;
-+}
-+
-+static inline MacKeyboardPadState mac_keyboard_pad_state(uint64_t lo, uint64_t hi,
-+                                                         MacKeyboardContext context)
-+{
-+    MacKeyboardPadState s = {0, 128, 128, 128, 128,
-+                             (uint8_t)mac_keyboard_held(lo, hi, 36),
-+                             (uint8_t)mac_keyboard_held(lo, hi, 53)};
-+    const int menu = context == MAC_KEYBOARD_CONTEXT_BOOT ||
-+                     context == MAC_KEYBOARD_CONTEXT_FRONTEND ||
-+                     context == MAC_KEYBOARD_CONTEXT_PAUSE;
-+    /* Arrow keys navigate menus; in a race, Up/Down only control triggers. */
-+    if (menu && mac_keyboard_held(lo, hi, 126)) s.buttons |= 0x0010;
-+    if (menu && mac_keyboard_held(lo, hi, 125)) s.buttons |= 0x0040;
-+    if (mac_keyboard_held(lo, hi, 123)) s.buttons |= 0x0080;
-+    if (mac_keyboard_held(lo, hi, 124)) s.buttons |= 0x0020;
-+    s.left_x = mac_keyboard_axis(lo, hi, 123, 124);
-+    if (context == MAC_KEYBOARD_CONTEXT_GAMEPLAY) {
-+        if (mac_keyboard_held(lo, hi, 126)) s.buttons |= 0x0200; /* R2 throttle */
-+        if (mac_keyboard_held(lo, hi, 125)) s.buttons |= 0x0100; /* L2 brake */
-+    }
-+    s.left_y = mac_keyboard_axis(lo, hi, 13, 1); /* W/S lean */
-+    s.right_y = mac_keyboard_axis(lo, hi, 34, 40); /* I/K */
-+    s.right_x = mac_keyboard_axis(lo, hi, 38, 37); /* J/L */
-+
-+    if (mac_keyboard_held(lo, hi, 49)) s.buttons |= 0x4000; /* Space: Cross */
-+    if (mac_keyboard_held(lo, hi, 56)) s.buttons |= 0x2000; /* left Shift: Circle */
-+    if (mac_keyboard_held(lo, hi, 8)) s.buttons |= 0x1000; /* C: Triangle */
-+    if (mac_keyboard_held(lo, hi, 48)) s.buttons |= 0x0004; /* Tab: R3 */
-+    if (mac_keyboard_held(lo, hi, 15)) s.buttons |= 0x0001; /* R: Select */
-+    if (mac_keyboard_held(lo, hi, 3)) s.buttons |= 0x8000; /* F: Square */
-+    if (s.enter_down) {
-+        if (context == MAC_KEYBOARD_CONTEXT_BOOT) s.buttons |= 0x0008; /* Start */
-+        else if (context == MAC_KEYBOARD_CONTEXT_FRONTEND ||
-+                 context == MAC_KEYBOARD_CONTEXT_PAUSE) s.buttons |= 0x4000;
-+    }
-+    if (s.escape_down) {
-+        if (context == MAC_KEYBOARD_CONTEXT_GAMEPLAY ||
-+            context == MAC_KEYBOARD_CONTEXT_PAUSE) s.buttons |= 0x0008; /* Start */
-+        else if (context == MAC_KEYBOARD_CONTEXT_BOOT ||
-+                 context == MAC_KEYBOARD_CONTEXT_FRONTEND) s.buttons |= 0x2000;
-+    }
-+    return s;
-+}
-+
-+#endif

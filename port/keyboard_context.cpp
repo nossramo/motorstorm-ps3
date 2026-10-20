@@ -38,15 +38,18 @@ extern "C" int motorstorm_keyboard_context() {
                   state == 1 ? MAC_KEYBOARD_CONTEXT_BOOT : MAC_KEYBOARD_CONTEXT_FRONTEND;
     if (state == 5) {
         // OsdSystemComponent singleton (TOC + 0x2E38). Its own FSM is
-        // dispatched by 0x0055FAFC: 2 is the pause menu, 4 its confirmation
-        // dialog. Captured race/pause/resume/pause states were 0/2/0/2.
+        // dispatched by 0x0055FAFC: 2 is pause, 4 its confirmation dialog,
+        // and 7 is the post-race Continue/Retry/Exit menu. State 6 initializes
+        // its three-item selection before entering 7 (0x005606B8); state 7
+        // handles up/down/cross at 0x005609CC. The outer FSM still says race.
         const uint32_t osd = read_word(0x1013b584);
         if (osd) {
             if (!readable(osd, 0x6ac) || read_word(osd) != 0x100e7640)
                 return MAC_KEYBOARD_CONTEXT_UNKNOWN;
             const uint32_t osd_state = read_word(uint64_t(osd) + 0x6a8);
             if (osd_state == 2) context = MAC_KEYBOARD_CONTEXT_PAUSE;
-            else if (osd_state == 4) context = MAC_KEYBOARD_CONTEXT_FRONTEND;
+            else if (osd_state == 4 || osd_state == 7)
+                context = MAC_KEYBOARD_CONTEXT_FRONTEND;
             if (read_word(uint64_t(osd) + 0x6a8) != osd_state ||
                 read_word(0x1013b584) != osd)
                 return MAC_KEYBOARD_CONTEXT_UNKNOWN;
