@@ -181,11 +181,22 @@ The runner needs access to the macOS window server. The probe stops its own
 process group after the requested time; a timeout is not evidence of success.
 
 For an interactive run, open `tools/play.command`. The game window must have
-focus. Arrows navigate, **Z confirms (Cross)**, X goes back (Circle), Enter is
-Start, Tab is Select, A/S are Square/Triangle, Q/W are L1/R1 and 1/2 are L2/R2.
-An attached SDL controller takes precedence over the keyboard. Stop the process
-with Ctrl-C in its Terminal window. Closing the rendering window alone does not
-yet guarantee that every guest thread exits. This remains a research build.
+focus. During races, arrows steer and control throttle/brake, W/S lean, and I/J/K/L
+move the right stick. Space is boost (Cross), left Shift is handbrake (Circle),
+C changes camera (Triangle), Tab looks back (R3), R resets (Select), F performs
+the action button (Square), and Escape pauses or resumes (Start). In menus,
+arrows navigate, Enter confirms (Cross), and Escape goes back (Circle); Enter
+starts the initial Press Start screen. An attached SDL controller takes
+precedence over the keyboard. Stop the process with Ctrl-C in its Terminal
+window. Closing the rendering window alone does not yet guarantee that every
+guest thread exits. This remains a research build.
+
+The keyboard bridge uses the game's front-end FSM and OSD pause state
+to switch between menu navigation and race controls. The keyboard report tests
+cover throttle pressure, independent stick lean, pause navigation, held-key
+transitions, modifier releases and loss of focus. `sh tools/test_keyboard_context.sh`
+checks the pinned guest layouts and invalid-pointer guards;
+`sh tools/test_pad_reports.sh` checks the resulting guest controller packets.
 
 The launch scripts locate FFmpeg in `/opt/homebrew/lib`; override
 `PS3RECOMP_FFMPEG_AVCODEC` and `PS3RECOMP_FFMPEG_AVUTIL` for other installations.

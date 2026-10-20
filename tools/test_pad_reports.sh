@@ -10,3 +10,4 @@ clang -std=gnu17 ${CFLAGS:-} -Ivendor/ps3recomp/include $(sdl2-config --cflags) 
   -Wl,-dead_strip -o "$test_dir/pad"
 "$test_dir/pad"
 "$test_dir/pad" --script-stop
+"$test_dir/pad" --keyboard

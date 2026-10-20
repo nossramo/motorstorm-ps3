@@ -224,6 +224,7 @@ add_executable(${PROJECT_NAME}
     main.cpp
     gpu_read_sync.cpp
     job_wait.cpp
+    keyboard_context.cpp
     stubs.cpp
     ${PS3RECOMP_SCAFFOLD}
     ${HLE_NID_TABLE}

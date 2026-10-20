@@ -479,36 +479,60 @@ index e634dd4..eebe026 100644
      int key;          /* keyframe (IDR for H.264) */
  } VdecFfPicture;
 diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
-index 85b05f8..2527c42 100644
+index 85b05f8..896ce24 100644
 --- a/libs/input/cellPad.c
 +++ b/libs/input/cellPad.c
-@@ -484,6 +484,25 @@ static unsigned long long pad_now_ms(void)
+@@ -12,6 +12,9 @@
+ 
+ #include <time.h>
+ #include "cellPad.h"
++#ifdef __APPLE__
++#include "macos_keyboard_map.h"
++#endif
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -484,6 +487,39 @@ static unsigned long long pad_now_ms(void)
  #endif
  }
  
 +#ifdef __APPLE__
-+extern unsigned rsx_metal_keyboard_buttons(void) __attribute__((weak_import));
++extern uint64_t rsx_metal_keyboard_keys(unsigned word) __attribute__((weak_import));
++extern int motorstorm_keyboard_context(void) __attribute__((weak_import));
 +static void pad_poll_macos_keyboard(void)
 +{
-+    if (!rsx_metal_keyboard_buttons || getenv("PAD_NO_KEYBOARD")) return;
++    if (!rsx_metal_keyboard_keys || getenv("PAD_NO_KEYBOARD")) return;
 +    PadHostState* hs = &s_host_state[0];
-+    unsigned buttons = rsx_metal_keyboard_buttons();
++    uint64_t raw[2] = {rsx_metal_keyboard_keys(0), rsx_metal_keyboard_keys(1)};
++    uint64_t blocked[2] = {0, 0};
++    static MacKeyboardContext previous_context = MAC_KEYBOARD_CONTEXT_UNKNOWN;
++    static uint64_t held_through_transition[2];
++    MacKeyboardContext context = motorstorm_keyboard_context
++        ? (MacKeyboardContext)motorstorm_keyboard_context()
++        : MAC_KEYBOARD_CONTEXT_UNKNOWN;
++    if (context < MAC_KEYBOARD_CONTEXT_UNKNOWN || context > MAC_KEYBOARD_CONTEXT_PAUSE)
++        context = MAC_KEYBOARD_CONTEXT_UNKNOWN;
++    mac_keyboard_context_transition(context, &previous_context, raw,
++                                    held_through_transition);
++    blocked[0] = held_through_transition[0];
++    blocked[1] = held_through_transition[1];
++    MacKeyboardPadState keys = mac_keyboard_pad_state(raw[0] & ~blocked[0],
++        raw[1] & ~blocked[1], context);
 +    hs->connected = 1;
-+    hs->buttons = (u16)buttons;
-+    hs->analog_lx = (buttons & CELL_PAD_CTRL_LEFT) ? 0 :
-+                    (buttons & CELL_PAD_CTRL_RIGHT) ? 255 : 128;
-+    hs->analog_ly = (buttons & CELL_PAD_CTRL_UP) ? 0 :
-+                    (buttons & CELL_PAD_CTRL_DOWN) ? 255 : 128;
-+    hs->analog_rx = hs->analog_ry = 128;
-+    hs->trigger_l2 = (buttons & CELL_PAD_CTRL_L2) ? 255 : 0;
-+    hs->trigger_r2 = (buttons & CELL_PAD_CTRL_R2) ? 255 : 0;
++    hs->buttons = keys.buttons;
++    hs->analog_lx = keys.left_x;
++    hs->analog_ly = keys.left_y;
++    hs->analog_rx = keys.right_x;
++    hs->analog_ry = keys.right_y;
++    hs->trigger_l2 = (keys.buttons & CELL_PAD_CTRL_L2) ? 255 : 0;
++    hs->trigger_r2 = (keys.buttons & CELL_PAD_CTRL_R2) ? 255 : 0;
 +}
 +#endif
 +
  static void pad_poll_backend(void)
  {
      /* Benign race: two threads may poll in the same tick. That costs one extra
-@@ -505,6 +524,9 @@ static void pad_poll_backend(void)
+@@ -505,6 +541,9 @@ static void pad_poll_backend(void)
  #ifdef _WIN32
      if (!s_host_state[0].connected) pad_poll_keyboard();
  #endif
@@ -518,7 +542,7 @@ index 85b05f8..2527c42 100644
  }
  
  /* ---------------------------------------------------------------------------
-@@ -567,6 +589,10 @@ void cellPad_poll(void)
+@@ -567,6 +606,10 @@ void cellPad_poll(void)
  
  s32 cellPadGetData(u32 port_no, CellPadData* data_guest)
  {
@@ -529,7 +553,7 @@ index 85b05f8..2527c42 100644
      { static int _once = 0;
        if (!_once++) printf("[cellPad] GetData polling begins (port %u)\n", port_no); }
      if (!s_pad_initialized)
-@@ -683,8 +709,11 @@ skip_inject: ;
+@@ -683,8 +726,11 @@ skip_inject: ;
      { static int s_sc = -1;
        static struct { double t; unsigned mask; } ev[256]; static int n_ev = 0;
        static unsigned long long t0 = 0;   /* not ULONGLONG: this builds on POSIX too */
@@ -541,7 +565,7 @@ index 85b05f8..2527c42 100644
            const char* e = getenv("PAD_SCRIPT");
            if (e && *e) {
                s_sc = 1; t0 = GetTickCount64();
-@@ -701,6 +730,29 @@ skip_inject: ;
+@@ -701,6 +747,29 @@ skip_inject: ;
            }
        }
        if (s_sc && port_no == 0) {
@@ -571,7 +595,7 @@ index 85b05f8..2527c42 100644
            double now = pad_clock(t0);
            /* Latch, do not window. A fixed time window is missed whenever the
             * title stops polling the pad for longer than the window (it does
-@@ -720,6 +772,7 @@ skip_inject: ;
+@@ -720,6 +789,7 @@ skip_inject: ;
                        printf("[cellPad] PAD_SCRIPT t=%.1fs press 0x%04X\n", ev[i].t, ev[i].mask); }
                }
            }
@@ -579,7 +603,7 @@ index 85b05f8..2527c42 100644
        } }
  
      /* PAD_FILE=<path> -- closed-loop input. Each poll, if the file holds a
-@@ -731,33 +784,38 @@ skip_inject: ;
+@@ -731,33 +801,38 @@ skip_inject: ;
       *
       *   echo 0x0008 > pad.txt    # START
       *   echo 0x4000 > pad.txt    # CROSS
@@ -626,7 +650,7 @@ index 85b05f8..2527c42 100644
        } }
  
      /* Analog sticks */
-@@ -812,6 +870,12 @@ skip_inject: ;
+@@ -812,6 +887,12 @@ skip_inject: ;
      data->button[CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_Y] = hs->analog_ry;
      data->button[CELL_PAD_BTN_OFFSET_ANALOG_LEFT_X]  = hs->analog_lx;
      data->button[CELL_PAD_BTN_OFFSET_ANALOG_LEFT_Y]  = hs->analog_ly;
@@ -639,7 +663,7 @@ index 85b05f8..2527c42 100644
  
      /* Pressure-sensitive buttons (only meaningful if PRESS_ON) */
      if (setting & CELL_PAD_SETTING_PRESS_ON) {
-@@ -893,6 +957,10 @@ emit:
+@@ -893,6 +974,10 @@ emit:
              else                        s_data_fresh[port_no] = 0;
          }
      }
@@ -3743,10 +3767,29 @@ index 670e886..d63dc7c 100644
   * retaining structural identity. This is intended for aggregate diagnostics;
   * PSO identity should use rsx_fp_structural_hash in buffered mode. */
 diff --git a/libs/video/rsx_metal_backend.m b/libs/video/rsx_metal_backend.m
-index 32f0b95..1a9d80a 100644
+index 32f0b95..56fb8a7 100644
 --- a/libs/video/rsx_metal_backend.m
 +++ b/libs/video/rsx_metal_backend.m
-@@ -68,6 +68,7 @@
+@@ -51,11 +51,13 @@
+ #import <QuartzCore/QuartzCore.h>
+ #if !TARGET_OS_IPHONE
+ #  import <AppKit/AppKit.h>
++#  include <IOKit/hidsystem/IOLLEvent.h>
+ #endif
+ 
+ #include <pthread.h>
+ #include "metal_frame_rate.h"
+ #include <stdatomic.h>
++#include <stdint.h>
+ #include "rsx_commands.h"
+ #include "rsx_metal_backend.h"
+ #include "rsx_vertex_fetch.h"
+@@ -64,10 +66,12 @@
+ #include "rsx_fp_decompiler.h"
+ #include "rsx_shader_msl.h"
+ #include "rsx_texture_layout.h"
++#include "../input/macos_keyboard_map.h"
+ #include "../../include/ps3emu/ps3_ftrace.h"   /* PS3_FTRACE: encode / GPU wait / readback spans */
  #include <stdio.h>
  #include <stdlib.h>
  #include <string.h>
@@ -3754,7 +3797,7 @@ index 32f0b95..1a9d80a 100644
  
  /* ------------------------------------------------------------------------- */
  
-@@ -607,8 +608,17 @@ static int create_window_impl(const char* title)
+@@ -607,8 +611,17 @@ static int create_window_impl(const char* title)
      [view setWantsLayer:YES];
      [view setLayer:s_layer];
  
@@ -3774,7 +3817,7 @@ index 32f0b95..1a9d80a 100644
      fps_start();
      return 0;
  }
-@@ -1267,10 +1277,9 @@ static MTLSamplerAddressMode gcm_wrap_to_metal(u32 w)
+@@ -1267,10 +1280,9 @@ static MTLSamplerAddressMode gcm_wrap_to_metal(u32 w)
   * [26:24], and SET_TEXTURE_CONTROL0's max LOD at [18:7] and min LOD at
   * [30:19], both 4.8 fixed point.
   *
@@ -3788,7 +3831,7 @@ index 32f0b95..1a9d80a 100644
  static int samp_slot_for(const rsx_texture_state* t)
  {
      const u32 minf = (t->filter >> 16) & 7u, magf = (t->filter >> 24) & 7u;
-@@ -2191,6 +2200,10 @@ static void release_surfaces(void)
+@@ -2191,6 +2203,10 @@ static void release_surfaces(void)
   * --------------------------------------------------------------------------*/
  
  #include "rsx_draw_engine.h"
@@ -3799,7 +3842,7 @@ index 32f0b95..1a9d80a 100644
  
  #define ENG_MAX_OBJECTS  4096
  #define ENG_MAX_PIPES    4096
-@@ -2202,25 +2215,38 @@ static void release_surfaces(void)
+@@ -2202,25 +2218,38 @@ static void release_surfaces(void)
  /* One frame's staging. Past it the backend submits and waits rather than
   * dropping the rest of the frame: dropping "discarded 181/184 sampled a010
   * groups" once the orphanage workload filled the D3D12 engine's ring. */
@@ -3838,7 +3881,7 @@ index 32f0b95..1a9d80a 100644
  } EngPipeline;
  static EngPipeline s_eng_pipe[ENG_MAX_PIPES];
  static u32 s_eng_pipe_count;
-@@ -2242,7 +2268,8 @@ static void release_surfaces(void)
+@@ -2242,7 +2271,8 @@ static void release_surfaces(void)
  
  typedef enum {
      ENG_REC_DRAW, ENG_REC_CLEAR_COLOR, ENG_REC_CLEAR_DS, ENG_REC_DEPTH_RESOLVE,
@@ -3848,7 +3891,7 @@ index 32f0b95..1a9d80a 100644
  } EngRecKind;
  
  typedef struct {
-@@ -2253,8 +2280,10 @@ static void release_surfaces(void)
+@@ -2253,8 +2283,10 @@ static void release_surfaces(void)
      u32 nrt;
      u32 depth;
      u32 pipeline;
@@ -3859,7 +3902,7 @@ index 32f0b95..1a9d80a 100644
      u32 ib_off, index_count;
      u32 vs_cb_off, vs_cb_bytes;
      u32 ps_cb_off, ps_cb_bytes;
-@@ -2265,11 +2294,15 @@ static void release_surfaces(void)
+@@ -2265,11 +2297,15 @@ static void release_surfaces(void)
      float vp[4];
      u32   sc[4];
      u32   stencil_ref;
@@ -3875,7 +3918,7 @@ index 32f0b95..1a9d80a 100644
  } EngRecord;
  
  static EngRecord s_eng_rec[ENG_MAX_RECORDS];
-@@ -2278,6 +2311,11 @@ static void release_surfaces(void)
+@@ -2278,6 +2314,11 @@ static void release_surfaces(void)
  
  static u8* s_eng_stage;
  static u32 s_eng_stage_used, s_eng_stage_cap;
@@ -3887,7 +3930,7 @@ index 32f0b95..1a9d80a 100644
  
  /* What the bind_* calls have accumulated for the next draw. */
  static EngRecord s_eng_pending;
-@@ -2286,7 +2324,9 @@ static void release_surfaces(void)
+@@ -2286,7 +2327,9 @@ static void release_surfaces(void)
  static id<MTLLibrary>             s_eng_helper_lib;
  static id<MTLRenderPipelineState> s_eng_blit_pso;
  static MTLPixelFormat             s_eng_blit_pso_fmt;
@@ -3898,7 +3941,7 @@ index 32f0b95..1a9d80a 100644
  static id<MTLSamplerState>        s_eng_point_sampler;
  static id<MTLSamplerState>        s_eng_linear_sampler;   /* FXAA's taps */
  
-@@ -2338,7 +2378,7 @@ static void eng_post_options(void)
+@@ -2338,7 +2381,7 @@ static void eng_post_options(void)
  "fragment float4 eng_blit_fs(BOut i [[stage_in]],\n"
  "                            texture2d<float> src [[texture(0)]],\n"
  "                            sampler s [[sampler(0)]]) {\n"
@@ -3907,7 +3950,7 @@ index 32f0b95..1a9d80a 100644
  "}\n"
  /* The present: optional contrast-adaptive sharpening (AMD FidelityFX CAS,
   * the non-scaling form: a cross whose negative weight grows where the 3x3
-@@ -2460,10 +2500,37 @@ static void eng_post_options(void)
+@@ -2460,10 +2503,37 @@ static void eng_post_options(void)
  "    else           posM.y += pixelOffsetSubpix * lengthSign;\n"
  "    return float4(t.sample(s, posM).rgb, rgbyM.a);\n"
  "}\n"
@@ -3946,7 +3989,7 @@ index 32f0b95..1a9d80a 100644
  "}\n";
  
  static u32 eng_obj_add(id<MTLTexture> t)
-@@ -2477,6 +2544,7 @@ static u32 eng_obj_add(id<MTLTexture> t)
+@@ -2477,6 +2547,7 @@ static u32 eng_obj_add(id<MTLTexture> t)
          slot = s_eng_obj_count++;
      }
      s_eng_obj[slot] = t;
@@ -3954,7 +3997,7 @@ index 32f0b95..1a9d80a 100644
      return slot + 1;
  }
  
-@@ -2495,6 +2563,7 @@ static void eng_collect_retired_objects(void)
+@@ -2495,6 +2566,7 @@ static void eng_collect_retired_objects(void)
          if (!s_eng_obj_retired[i]) continue;
          s_eng_obj_retired[i] = 0;
          s_eng_obj[i] = nil;
@@ -3962,7 +4005,7 @@ index 32f0b95..1a9d80a 100644
          s_eng_obj_free[s_eng_obj_free_count++] = i;
      }
  }
-@@ -2537,9 +2606,72 @@ static MTLPixelFormat eng_pixel_format(rsx_be_format f)
+@@ -2537,9 +2609,72 @@ static MTLPixelFormat eng_pixel_format(rsx_be_format f)
  /* ---- staging ------------------------------------------------------------- */
  
  static void eng_encode_and_commit(id<MTLTexture> present_dst);
@@ -4035,7 +4078,7 @@ index 32f0b95..1a9d80a 100644
      const u32 start = (s_eng_stage_used + ENG_ALIGN - 1u) & ~(ENG_ALIGN - 1u);
      if ((u64)start + bytes > ENG_STAGE_MAX) {
          /* Submit and wait rather than drop the rest of the frame; everything
-@@ -2547,7 +2679,9 @@ static int eng_stage_reserve(u32 bytes, u32* out_off)
+@@ -2547,7 +2682,9 @@ static int eng_stage_reserve(u32 bytes, u32* out_off)
          eng_encode_and_commit(nil);
          return eng_stage_reserve(bytes, out_off);
      }
@@ -4046,7 +4089,7 @@ index 32f0b95..1a9d80a 100644
          u32 cap = s_eng_stage_cap ? s_eng_stage_cap : (4u << 20);
          while (start + bytes > cap) cap *= 2u;
          u8* n = (u8*)realloc(s_eng_stage, cap);
-@@ -2568,14 +2702,56 @@ static int eng_stage_copy(const void* src, u32 bytes, u32* out_off)
+@@ -2568,14 +2705,56 @@ static int eng_stage_copy(const void* src, u32 bytes, u32* out_off)
      return 1;
  }
  
@@ -4103,7 +4146,7 @@ index 32f0b95..1a9d80a 100644
      s_eng_helper_lib = [s_dev newLibraryWithSource:kEngHelperMSL options:nil error:&err];
      if (!s_eng_helper_lib) {
          fprintf(stderr, "[rsx engine/metal] helper shader compile failed: %s\n",
-@@ -2597,9 +2773,18 @@ static int eng_init(void* user, u32 width, u32 height)
+@@ -2597,9 +2776,18 @@ static int eng_init(void* user, u32 width, u32 height)
  static void eng_shutdown(void* user)
  {
      (void)user;
@@ -4123,7 +4166,7 @@ index 32f0b95..1a9d80a 100644
          s_eng_pipe[i].ds = nil;
      }
      for (u32 i = 0; i < s_eng_func_count; i++) s_eng_func[i].fn = nil;
-@@ -2608,11 +2793,20 @@ static void eng_shutdown(void* user)
+@@ -2608,11 +2796,20 @@ static void eng_shutdown(void* user)
      memset(s_eng_obj_retired, 0, sizeof s_eng_obj_retired);
      s_eng_pipe_count = s_eng_func_count = s_eng_samp_count = s_eng_view_count = 0;
      s_eng_rec_count = 0;
@@ -4146,7 +4189,7 @@ index 32f0b95..1a9d80a 100644
      s_eng_point_sampler = nil;
      s_eng_linear_sampler = nil;
      s_eng_fxaa_pso = nil;
-@@ -2661,6 +2855,9 @@ static void eng_texture_upload(void* user, u32 handle, u32 face, u32 mip,
+@@ -2661,6 +2858,9 @@ static void eng_texture_upload(void* user, u32 handle, u32 face, u32 mip,
      (void)user; (void)rows;
      id<MTLTexture> t = eng_obj(handle);
      if (!t || !src || !row_bytes) return;
@@ -4156,7 +4199,7 @@ index 32f0b95..1a9d80a 100644
      [t replaceRegion:MTLRegionMake2D(0, 0, w, h)
           mipmapLevel:mip
                 slice:face
-@@ -2698,6 +2895,7 @@ static void eng_texture_upload_3d(void* user, u32 handle, u32 z, u32 mip,
+@@ -2698,6 +2898,7 @@ static void eng_texture_upload_3d(void* user, u32 handle, u32 z, u32 mip,
      (void)user;
      id<MTLTexture> t = eng_obj(handle);
      if (!t || !src || !row_bytes) return;
@@ -4164,7 +4207,7 @@ index 32f0b95..1a9d80a 100644
      [t replaceRegion:MTLRegionMake3D(0, 0, z, w, h, 1)
           mipmapLevel:mip
                 slice:0
-@@ -2742,7 +2940,7 @@ static u32 eng_surface_view(void* user, u32 surface, u32 remap, u32 rsx_format)
+@@ -2742,7 +2943,7 @@ static u32 eng_surface_view(void* user, u32 surface, u32 remap, u32 rsx_format)
      id<MTLTexture> v =
          [t newTextureViewWithPixelFormat:[t pixelFormat]
                               textureType:MTLTextureType2D
@@ -4173,7 +4216,7 @@ index 32f0b95..1a9d80a 100644
                                    slices:NSMakeRange(0, 1)
                                   swizzle:MTLTextureSwizzleChannelsMake(
                                               swizzle_sel(sel[1]), swizzle_sel(sel[2]),
-@@ -2759,24 +2957,168 @@ static u32 eng_surface_view(void* user, u32 surface, u32 remap, u32 rsx_format)
+@@ -2759,24 +2960,168 @@ static u32 eng_surface_view(void* user, u32 surface, u32 remap, u32 rsx_format)
  
  /* Allocate now, copy in command order. The returned object is unique to
   * this draw; later snapshots never overwrite a queued draw's sampled image. */
@@ -4347,7 +4390,7 @@ index 32f0b95..1a9d80a 100644
      return copy;
  }
  
-@@ -2790,7 +3132,8 @@ static u32 eng_depth_target_create(void* user, u32 w, u32 h)
+@@ -2790,7 +3135,8 @@ static u32 eng_depth_target_create(void* user, u32 w, u32 h)
                                                         mipmapped:NO];
      /* ShaderRead as well as RenderTarget: depth-as-texture resolves through a
       * pass that samples this as a depth2d, so it cannot be write-only. */
@@ -4357,7 +4400,7 @@ index 32f0b95..1a9d80a 100644
      td.storageMode = MTLStorageModePrivate;
      return eng_obj_add([s_dev newTextureWithDescriptor:td]);
  }
-@@ -2798,40 +3141,50 @@ static u32 eng_depth_target_create(void* user, u32 w, u32 h)
+@@ -2798,40 +3144,50 @@ static u32 eng_depth_target_create(void* user, u32 w, u32 h)
  /* The sampleable copy of a depth target. The copy is a record in the stream,
   * not an immediate blit, because it has to observe the depth the passes
   * recorded so far actually wrote. */
@@ -4417,7 +4460,7 @@ index 32f0b95..1a9d80a 100644
  /* ---- pipelines ----------------------------------------------------------- */
  
  static id<MTLFunction> eng_function(const char* hlsl, int stage,
-@@ -2842,22 +3195,41 @@ static u32 eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
+@@ -2842,22 +3198,41 @@ static u32 eng_depth_snapshot(void* user, u32 depth, u32 w, u32 h)
          if (s_eng_func[i].hash == hash) return s_eng_func[i].fn;
      if (s_eng_func_count >= ENG_MAX_FUNCS) return nil;
  
@@ -4460,7 +4503,7 @@ index 32f0b95..1a9d80a 100644
      return fn;
  }
  
-@@ -2949,13 +3321,31 @@ static u32 eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_h
+@@ -2949,13 +3324,31 @@ static u32 eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_h
      }
  
      NSError* err = nil;
@@ -4493,7 +4536,7 @@ index 32f0b95..1a9d80a 100644
  
      /* Depth and stencil are pipeline state in D3D12 and an encoder object in
       * Metal, so the engine's render state splits here rather than upstream. */
-@@ -2991,7 +3381,13 @@ static u32 eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_h
+@@ -2991,7 +3384,13 @@ static u32 eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_h
  
      const u32 slot = s_eng_pipe_count++;
      s_eng_pipe[slot].pso = pso;
@@ -4507,7 +4550,7 @@ index 32f0b95..1a9d80a 100644
      /* CULL_FACE FRONT=0x0404 BACK=0x0405 FRONT_AND_BACK=0x0408 (front here,
       * as in the D3D12 engine); FRONT_FACE CW=0x0900 CCW=0x0901. */
      s_eng_pipe[slot].cull = MTLCullModeNone;
-@@ -3011,6 +3407,7 @@ static void eng_pipeline_release(void* user, u32 pipeline)
+@@ -3011,6 +3410,7 @@ static void eng_pipeline_release(void* user, u32 pipeline)
      (void)user;
      if (pipeline && pipeline <= s_eng_pipe_count) {
          s_eng_pipe[pipeline - 1].pso = nil;
@@ -4515,7 +4558,7 @@ index 32f0b95..1a9d80a 100644
          s_eng_pipe[pipeline - 1].ds  = nil;
      }
  }
-@@ -3021,8 +3418,8 @@ static void eng_pipeline_release(void* user, u32 pipeline)
+@@ -3021,8 +3421,8 @@ static void eng_pipeline_release(void* user, u32 pipeline)
   * linearly through a mip chain, which is where a surface seen at a grazing
   * angle (a road, a wall along the view) blurs. Point-filtered and unmipped
   * samplers -- lookup tables, render targets, UI -- keep their filtering, so
@@ -4526,7 +4569,7 @@ index 32f0b95..1a9d80a 100644
  static int eng_aniso_from(const char* e)
  {
      if (!e || !*e) return 0;
-@@ -3042,12 +3439,37 @@ static int eng_aniso(void)
+@@ -3042,12 +3442,37 @@ static int eng_aniso(void)
  
  static int eng_sampler_slot(const rsx_be_sampler_desc* d)
  {
@@ -4566,7 +4609,7 @@ index 32f0b95..1a9d80a 100644
      for (u32 i = 0; i < s_eng_samp_count; i++)
          if (s_eng_samp[i].key == key) return (int)i;
      if (s_eng_samp_count >= ENG_MAX_SAMPLERS) return -1;
-@@ -3065,8 +3487,12 @@ static int eng_sampler_slot(const rsx_be_sampler_desc* d)
+@@ -3065,8 +3490,12 @@ static int eng_sampler_slot(const rsx_be_sampler_desc* d)
      sd.tAddressMode = gcm_wrap_to_metal(d->wrap_t);
      sd.rAddressMode = gcm_wrap_to_metal(d->wrap_r);
      sd.borderColor  = MTLSamplerBorderColorTransparentBlack;
@@ -4581,7 +4624,7 @@ index 32f0b95..1a9d80a 100644
      id<MTLSamplerState> s = [s_dev newSamplerStateWithDescriptor:sd];
      if (!s) return -1;
      const int slot = (int)s_eng_samp_count++;
-@@ -3109,6 +3535,7 @@ static void eng_bind_textures(void* user, const u32* textures,
+@@ -3109,6 +3538,7 @@ static void eng_bind_textures(void* user, const u32* textures,
      (void)user;
      for (u32 u = 0; u < RSX_BE_MAX_TEXTURES; u++) {
          s_eng_pending.tex[u]  = ((mask >> u) & 1u) ? textures[u] : 0;
@@ -4589,7 +4632,7 @@ index 32f0b95..1a9d80a 100644
          s_eng_pending.samp[u] = ((mask >> u) & 1u) ? eng_sampler_slot(&samplers[u]) : -1;
      }
  }
-@@ -3119,6 +3546,7 @@ static void eng_bind_vertex_textures(void* user, const u32* textures,
+@@ -3119,6 +3549,7 @@ static void eng_bind_vertex_textures(void* user, const u32* textures,
      (void)user;
      for (u32 u = 0; u < RSX_BE_MAX_VERTEX_TEXTURES; u++) {
          s_eng_pending.vtex[u]  = ((mask >> u) & 1u) ? textures[u] : 0;
@@ -4597,7 +4640,7 @@ index 32f0b95..1a9d80a 100644
          s_eng_pending.vsamp[u] = ((mask >> u) & 1u) ? eng_sampler_slot(&samplers[u]) : -1;
      }
  }
-@@ -3140,6 +3568,29 @@ static void eng_set_scissor(void* user, u32 x, u32 y, u32 w, u32 h)
+@@ -3140,6 +3571,29 @@ static void eng_set_scissor(void* user, u32 x, u32 y, u32 w, u32 h)
  static void eng_set_stencil_ref(void* user, u32 ref)
  { (void)user; s_eng_pending.stencil_ref = ref; }
  
@@ -4627,7 +4670,7 @@ index 32f0b95..1a9d80a 100644
  static void eng_draw(void* user, rsx_topology topology, const void* vertices,
                       u32 vertex_count, u32 stride, const u32* indices,
                       u32 index_count)
-@@ -3162,6 +3613,72 @@ static void eng_draw(void* user, rsx_topology topology, const void* vertices,
+@@ -3162,6 +3616,72 @@ static void eng_draw(void* user, rsx_topology topology, const void* vertices,
      r->vertex_count = vertex_count;
      r->ib_off       = ib_off;
      r->index_count  = indices ? index_count : 0;
@@ -4700,7 +4743,7 @@ index 32f0b95..1a9d80a 100644
  }
  
  static void eng_clear_color(void* user, u32 surface, const float rgba[4])
-@@ -3203,21 +3720,29 @@ static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
+@@ -3203,21 +3723,29 @@ static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
  {
      if (!r->pipeline || r->pipeline > s_eng_pipe_count) { s_eng_encoding_failed = 1; return; }
      const EngPipeline* p = &s_eng_pipe[r->pipeline - 1];
@@ -4733,7 +4776,7 @@ index 32f0b95..1a9d80a 100644
          [enc setFragmentTexture:(t ? t : s_null_tex) atIndex:(NSUInteger)u];
          [enc setFragmentSamplerState:(r->samp[u] >= 0 ? s_eng_samp[r->samp[u]].samp
                                                        : s_default_sampler)
-@@ -3253,6 +3778,26 @@ static int eng_record_targets_are(const EngRecord* r, const u32* rt, u32 nrt)
+@@ -3253,6 +3781,26 @@ static int eng_record_targets_are(const EngRecord* r, const u32* rt, u32 nrt)
      return 1;
  }
  
@@ -4760,7 +4803,7 @@ index 32f0b95..1a9d80a 100644
  /* A clear names a surface independently of any later draw's attachment set.
   * Replay it alone when it cannot be folded into that draw's load actions. */
  static int eng_encode_clear(id<MTLCommandBuffer> cb, const EngRecord* r)
-@@ -3300,20 +3845,56 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
+@@ -3300,20 +3848,56 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
      u32 i = 0;
      s_ft_passes = s_ft_resolves = s_ft_copies = 0;
      while (i < s_eng_rec_count) {
@@ -4822,7 +4865,7 @@ index 32f0b95..1a9d80a 100644
                        toTexture:dst destinationSlice:0 destinationLevel:0
                destinationOrigin:MTLOriginMake(0, 0, 0)];
              [copy endEncoding];
-@@ -3323,7 +3904,8 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
+@@ -3323,7 +3907,8 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
              const EngRecord* r = &s_eng_rec[i++];
              id<MTLTexture> src = eng_obj(r->depth);
              id<MTLTexture> dst = eng_obj(r->resolve_dst);
@@ -4832,7 +4875,7 @@ index 32f0b95..1a9d80a 100644
              MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
              rp.colorAttachments[0].texture     = dst;
              rp.colorAttachments[0].loadAction  = MTLLoadActionDontCare;
-@@ -3331,7 +3913,7 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
+@@ -3331,7 +3916,7 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
              id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
              if (!e) { s_eng_encoding_failed = 1; continue; }
              s_ft_resolves++;
@@ -4841,7 +4884,7 @@ index 32f0b95..1a9d80a 100644
              [e setFragmentTexture:src atIndex:0];
              [e setFragmentSamplerState:s_eng_point_sampler atIndex:0];
              [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
-@@ -3351,9 +3933,9 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
+@@ -3351,9 +3936,9 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
          u32 cd = 0, ds_flags = 0;
          float cdepth = 1.0f;
          u8 cstencil = 0;
@@ -4854,7 +4897,7 @@ index 32f0b95..1a9d80a 100644
              const EngRecord* r = &s_eng_rec[i];
              if (r->kind == ENG_REC_CLEAR_COLOR) {
                  u32 k = 0;
-@@ -3466,6 +4048,29 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
+@@ -3466,6 +4051,29 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
              rp.renderTargetHeight = [zbuf height];
          }
  
@@ -4884,7 +4927,7 @@ index 32f0b95..1a9d80a 100644
          id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
          /* A draw's pipeline declares as many colour attachments as its record
           * named, so a pass that could not bind them all takes its clears and
-@@ -3480,12 +4085,24 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
+@@ -3480,12 +4088,24 @@ static void eng_encode_records(id<MTLCommandBuffer> cb, id<MTLBuffer> stage)
          s_ft_passes++;
          while (i < s_eng_rec_count && s_eng_rec[i].kind == ENG_REC_DRAW &&
                 eng_record_targets_are(&s_eng_rec[i], rt, nrt) &&
@@ -4909,7 +4952,7 @@ index 32f0b95..1a9d80a 100644
      }
  }
  
-@@ -3585,17 +4202,64 @@ static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
+@@ -3585,17 +4205,64 @@ static void eng_blit_to_display(id<MTLCommandBuffer> cb, id<MTLTexture> src,
  
  /* Encode everything recorded so far and commit it.
   *
@@ -4977,7 +5020,7 @@ index 32f0b95..1a9d80a 100644
      @autoreleasepool {
          id<CAMetalDrawable> drawable = nil;
          id<MTLTexture> dst = nil;
-@@ -3608,7 +4272,9 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
+@@ -3608,7 +4275,9 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
              if (s_headless) {
                  dst = s_offscreen;
              } else {
@@ -4987,7 +5030,7 @@ index 32f0b95..1a9d80a 100644
                  if (!drawable) {           /* compositor is busy; skip */
                      dispatch_semaphore_signal(s_inflight);
                      return;
-@@ -3618,9 +4284,11 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
+@@ -3618,9 +4287,11 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
          }
  
          id<MTLBuffer> stage = nil;
@@ -5002,7 +5045,7 @@ index 32f0b95..1a9d80a 100644
          id<MTLCommandBuffer> cb = [s_queue commandBuffer];
          if (!cb || (s_eng_stage_used && !stage)) {
              s_eng_encoding_failed = 1;
-@@ -3628,30 +4296,38 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
+@@ -3628,30 +4299,38 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
              return;
          }
          const uint64_t ft_e0 = PS3_FT_ON() ? ps3_ft_now() : 0;
@@ -5050,7 +5093,7 @@ index 32f0b95..1a9d80a 100644
              }
              s_eng_checked_completed = [cb status] == MTLCommandBufferStatusCompleted &&
                                        ![cb error] && !s_eng_dropped && !s_eng_encoding_failed;
-@@ -3672,10 +4348,14 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
+@@ -3672,10 +4351,14 @@ static void eng_encode_and_commit(id<MTLTexture> present_dst)
                      s_eng_dropped, ENG_MAX_RECORDS);
              s_eng_dropped = 0;
          }
@@ -5066,7 +5109,7 @@ index 32f0b95..1a9d80a 100644
  }
  
  /* Opt-in readback of the game surface, useful on a locked Mac or in CI.
-@@ -3684,8 +4364,29 @@ static void eng_dump_frame(id<MTLTexture> src)
+@@ -3684,8 +4367,29 @@ static void eng_dump_frame(id<MTLTexture> src)
  {
      const char* path = getenv("PS3RECOMP_METAL_FRAME_DUMP");
      if (!path || !*path) return;
@@ -5097,7 +5140,7 @@ index 32f0b95..1a9d80a 100644
      if ([src pixelFormat] != MTLPixelFormatRGBA8Unorm &&
          [src pixelFormat] != MTLPixelFormatBGRA8Unorm) return;
      size_t w = [src width], h = [src height];
-@@ -3714,13 +4415,72 @@ static void eng_dump_frame(id<MTLTexture> src)
+@@ -3714,13 +4418,72 @@ static void eng_dump_frame(id<MTLTexture> src)
      free(rgba);
  }
  
@@ -5170,7 +5213,7 @@ index 32f0b95..1a9d80a 100644
  }
  
  static void eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
-@@ -3737,8 +4497,8 @@ static void eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
+@@ -3737,8 +4500,8 @@ static void eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
  }
  
  /* Read depth through the existing full-size R32Float resolve, then copy the
@@ -5181,7 +5224,7 @@ index 32f0b95..1a9d80a 100644
   * until both the resolve and the copy have completed successfully. */
  static int eng_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32 h,
                                float* out, u32 out_pitch)
-@@ -3778,6 +4538,7 @@ static int eng_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32 h,
+@@ -3778,6 +4541,7 @@ static int eng_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32 h,
                      toBuffer:staging destinationOffset:0
           destinationBytesPerRow:copy_pitch destinationBytesPerImage:copy_pitch * h];
          [blit endEncoding];
@@ -5189,7 +5232,7 @@ index 32f0b95..1a9d80a 100644
          [cb commit]; [cb waitUntilCompleted];
          const int ok = [cb status] == MTLCommandBufferStatusCompleted && ![cb error];
          if (ok) {
-@@ -3807,8 +4568,13 @@ static int eng_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32 h,
+@@ -3807,8 +4571,13 @@ static int eng_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32 h,
      .depth_target_create  = eng_depth_target_create,
      .depth_target_release = eng_obj_release,
      .depth_snapshot       = eng_depth_snapshot,
@@ -5203,7 +5246,7 @@ index 32f0b95..1a9d80a 100644
      .pipeline_create      = eng_pipeline_create,
      .pipeline_release     = eng_pipeline_release,
      .bind_targets         = eng_bind_targets,
-@@ -3820,7 +4586,13 @@ static int eng_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32 h,
+@@ -3820,7 +4589,13 @@ static int eng_depth_readback(void* user, u32 depth, u32 x, u32 y, u32 w, u32 h,
      .set_viewport         = eng_set_viewport,
      .set_scissor          = eng_set_scissor,
      .set_stencil_ref      = eng_set_stencil_ref,
@@ -5217,50 +5260,56 @@ index 32f0b95..1a9d80a 100644
      .clear_color          = eng_clear_color,
      .clear_depth_stencil  = eng_clear_depth_stencil,
      .present              = eng_present,
-@@ -3971,6 +4743,27 @@ void rsx_metal_backend_shutdown(void)
+@@ -3971,6 +4746,30 @@ void rsx_metal_backend_shutdown(void)
      }
  }
  
 +/* Cocoa events are collected on the main thread; libpad polls on guest threads. */
-+static atomic_uint s_keyboard_buttons;
-+unsigned rsx_metal_keyboard_buttons(void)
++static atomic_uint_fast64_t s_keyboard_keys[2];
++uint64_t rsx_metal_keyboard_keys(unsigned word)
 +{
-+    return atomic_load(&s_keyboard_buttons);
++    return word < 2 ? atomic_load(&s_keyboard_keys[word]) : 0;
 +}
 +
-+static unsigned keyboard_button(unsigned short key)
++static void keyboard_apply_event(unsigned short key, MacKeyboardKeyEvent event)
 +{
-+    switch (key) {
-+        case 126: return 0x0010; case 125: return 0x0040; /* up/down */
-+        case 123: return 0x0080; case 124: return 0x0020; /* left/right */
-+        case 6: return 0x4000; case 7: return 0x2000;    /* Z/X */
-+        case 0: return 0x8000; case 1: return 0x1000;    /* A/S */
-+        case 12: return 0x0400; case 13: return 0x0800;  /* Q/W */
-+        case 18: return 0x0100; case 19: return 0x0200;  /* 1/2 */
-+        case 36: return 0x0008; case 48: return 0x0001;  /* Return/Tab */
-+        default: return 0;
-+    }
++    uint64_t keys[2] = {atomic_load(&s_keyboard_keys[0]),
++                        atomic_load(&s_keyboard_keys[1])};
++    mac_keyboard_apply_event(keys, key, event);
++    atomic_store(&s_keyboard_keys[0], keys[0]);
++    atomic_store(&s_keyboard_keys[1], keys[1]);
++}
++
++static void keyboard_clear(void)
++{
++    uint64_t keys[2];
++    mac_keyboard_clear(keys);
++    atomic_store(&s_keyboard_keys[0], keys[0]);
++    atomic_store(&s_keyboard_keys[1], keys[1]);
 +}
 +
  static int pump_messages_impl(void)
  {
  #if !TARGET_OS_IPHONE
-@@ -3982,8 +4775,18 @@ static int pump_messages_impl(void)
+@@ -3982,8 +4781,21 @@ static int pump_messages_impl(void)
                                                  inMode:NSDefaultRunLoopMode
                                                 dequeue:YES];
              if (!ev) break;
 +            if (([ev type] == NSEventTypeKeyDown || [ev type] == NSEventTypeKeyUp) &&
 +                [ev window] == s_window && [NSApp isActive]) {
-+                unsigned button = keyboard_button([ev keyCode]);
-+                if ([ev type] == NSEventTypeKeyDown)
-+                    atomic_fetch_or(&s_keyboard_buttons, button);
-+                else if ([ev type] == NSEventTypeKeyUp)
-+                    atomic_fetch_and(&s_keyboard_buttons, ~button);
++                /* Repeated key-down events are idempotent; the guest sees a held key. */
++                keyboard_apply_event([ev keyCode], [ev type] == NSEventTypeKeyDown
++                    ? MAC_KEY_EVENT_DOWN : MAC_KEY_EVENT_UP);
++            } else if ([ev type] == NSEventTypeFlagsChanged &&
++                       [ev window] == s_window && [NSApp isActive]) {
++                keyboard_apply_event(56, ([ev modifierFlags] & NX_DEVICELSHIFTKEYMASK)
++                    ? MAC_KEY_EVENT_DOWN : MAC_KEY_EVENT_UP);
 +            }
              [NSApp sendEvent:ev];
          }
-+        if (![NSApp isActive] || ![s_window isKeyWindow])
-+            atomic_store(&s_keyboard_buttons, 0);
++        if (![NSApp isActive] || ![s_window isKeyWindow]) {
++            keyboard_clear();
++        }
      }
  #endif
      return atomic_load(&s_closed) ? -1 : 0;
@@ -20911,3 +20960,133 @@ index 0000000..6062b26
 +    a.out.parent.mkdir(parents=True, exist_ok=True)
 +    a.out.write_text(json.dumps(result, indent=2) + "\n")
 +print(json.dumps(result, indent=2))
+diff --git a/libs/input/macos_keyboard_map.h b/libs/input/macos_keyboard_map.h
+new file mode 100644
+index 0000000..191c6b1
+--- /dev/null
++++ b/libs/input/macos_keyboard_map.h
+@@ -0,0 +1,124 @@
++/* Pure mapping helpers shared by the Metal keyboard bridge and its tests. */
++#ifndef PS3RECOMP_MACOS_KEYBOARD_MAP_H
++#define PS3RECOMP_MACOS_KEYBOARD_MAP_H
++
++#include <stdint.h>
++
++typedef struct MacKeyboardPadState {
++    uint16_t buttons;
++    uint8_t left_x, left_y, right_x, right_y;
++    uint8_t enter_down, escape_down;
++} MacKeyboardPadState;
++
++typedef enum MacKeyboardContext {
++    MAC_KEYBOARD_CONTEXT_UNKNOWN = 0,
++    MAC_KEYBOARD_CONTEXT_BOOT,
++    MAC_KEYBOARD_CONTEXT_FRONTEND,
++    MAC_KEYBOARD_CONTEXT_GAMEPLAY,
++    MAC_KEYBOARD_CONTEXT_PAUSE
++} MacKeyboardContext;
++
++typedef enum MacKeyboardKeyEvent {
++    MAC_KEY_EVENT_DOWN,
++    MAC_KEY_EVENT_UP
++} MacKeyboardKeyEvent;
++
++/* Repeated key-down and release events are idempotent. */
++static inline void mac_keyboard_apply_event(uint64_t keys[2], unsigned key,
++                                            MacKeyboardKeyEvent event)
++{
++    if (key >= 128) return;
++    const unsigned word = key / 64;
++    const uint64_t bit = UINT64_C(1) << (key % 64);
++    if (event == MAC_KEY_EVENT_DOWN) {
++        keys[word] |= bit;
++    } else if (event == MAC_KEY_EVENT_UP) {
++        keys[word] &= ~bit;
++    }
++}
++
++/* Read the actual left-device modifier state; toggling on flagsChanged
++ * would turn a release after focus loss into a stuck handbrake. */
++static inline void mac_keyboard_apply_modifiers(uint64_t keys[2], int left_shift)
++{
++    mac_keyboard_apply_event(keys, 56, left_shift ? MAC_KEY_EVENT_DOWN : MAC_KEY_EVENT_UP);
++}
++
++static inline void mac_keyboard_clear(uint64_t keys[2])
++{
++    keys[0] = keys[1] = 0;
++}
++
++/* Consume keys held through a menu/race transition until each is released.
++ * This prevents an arrow used to select a menu item from becoming throttle. */
++static inline void mac_keyboard_context_transition(MacKeyboardContext context,
++    MacKeyboardContext *previous, uint64_t keys[2], uint64_t blocked[2])
++{
++    if (*previous != context) {
++        blocked[0] |= keys[0];
++        blocked[1] |= keys[1];
++        *previous = context;
++    }
++    blocked[0] &= keys[0];
++    blocked[1] &= keys[1];
++}
++
++static inline int mac_keyboard_held(uint64_t lo, uint64_t hi, unsigned key)
++{
++    if (key < 64) return (int)((lo >> key) & 1u);
++    if (key < 128) return (int)((hi >> (key - 64)) & 1u);
++    return 0;
++}
++
++static inline uint8_t mac_keyboard_axis(uint64_t lo, uint64_t hi,
++                                        unsigned negative_key, unsigned positive_key)
++{
++    const int negative = mac_keyboard_held(lo, hi, negative_key);
++    const int positive = mac_keyboard_held(lo, hi, positive_key);
++    return negative == positive ? 128 : negative ? 0 : 255;
++}
++
++static inline MacKeyboardPadState mac_keyboard_pad_state(uint64_t lo, uint64_t hi,
++                                                         MacKeyboardContext context)
++{
++    MacKeyboardPadState s = {0, 128, 128, 128, 128,
++                             (uint8_t)mac_keyboard_held(lo, hi, 36),
++                             (uint8_t)mac_keyboard_held(lo, hi, 53)};
++    const int menu = context == MAC_KEYBOARD_CONTEXT_BOOT ||
++                     context == MAC_KEYBOARD_CONTEXT_FRONTEND ||
++                     context == MAC_KEYBOARD_CONTEXT_PAUSE;
++    /* Arrow keys navigate menus; in a race, Up/Down only control triggers. */
++    if (menu && mac_keyboard_held(lo, hi, 126)) s.buttons |= 0x0010;
++    if (menu && mac_keyboard_held(lo, hi, 125)) s.buttons |= 0x0040;
++    if (mac_keyboard_held(lo, hi, 123)) s.buttons |= 0x0080;
++    if (mac_keyboard_held(lo, hi, 124)) s.buttons |= 0x0020;
++    s.left_x = mac_keyboard_axis(lo, hi, 123, 124);
++    if (context == MAC_KEYBOARD_CONTEXT_GAMEPLAY) {
++        if (mac_keyboard_held(lo, hi, 126)) s.buttons |= 0x0200; /* R2 throttle */
++        if (mac_keyboard_held(lo, hi, 125)) s.buttons |= 0x0100; /* L2 brake */
++    }
++    s.left_y = mac_keyboard_axis(lo, hi, 13, 1); /* W/S lean */
++    s.right_y = mac_keyboard_axis(lo, hi, 34, 40); /* I/K */
++    s.right_x = mac_keyboard_axis(lo, hi, 38, 37); /* J/L */
++
++    if (mac_keyboard_held(lo, hi, 49)) s.buttons |= 0x4000; /* Space: Cross */
++    if (mac_keyboard_held(lo, hi, 56)) s.buttons |= 0x2000; /* left Shift: Circle */
++    if (mac_keyboard_held(lo, hi, 8)) s.buttons |= 0x1000; /* C: Triangle */
++    if (mac_keyboard_held(lo, hi, 48)) s.buttons |= 0x0004; /* Tab: R3 */
++    if (mac_keyboard_held(lo, hi, 15)) s.buttons |= 0x0001; /* R: Select */
++    if (mac_keyboard_held(lo, hi, 3)) s.buttons |= 0x8000; /* F: Square */
++    if (s.enter_down) {
++        if (context == MAC_KEYBOARD_CONTEXT_BOOT) s.buttons |= 0x0008; /* Start */
++        else if (context == MAC_KEYBOARD_CONTEXT_FRONTEND ||
++                 context == MAC_KEYBOARD_CONTEXT_PAUSE) s.buttons |= 0x4000;
++    }
++    if (s.escape_down) {
++        if (context == MAC_KEYBOARD_CONTEXT_GAMEPLAY ||
++            context == MAC_KEYBOARD_CONTEXT_PAUSE) s.buttons |= 0x0008; /* Start */
++        else if (context == MAC_KEYBOARD_CONTEXT_BOOT ||
++                 context == MAC_KEYBOARD_CONTEXT_FRONTEND) s.buttons |= 0x2000;
++    }
++    return s;
++}
++
++#endif
