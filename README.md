@@ -4,6 +4,36 @@ Target: MotorStorm BCES00006, `APP_VER=03.10`, Apple Silicon macOS first.
 This is a work in progress, not a playable port. Boot, menus and one playable
 track are separate milestones and must be demonstrated with the actual game.
 
+## Audio repair — 20 October 2026
+
+The user confirmed audible game audio after the repair. The existing SDL/CoreAudio
+output was opening correctly, but the Multistream SPU task terminated on a call
+into runtime-loaded DSP code at LS `0x2F810`. Both launchers now enable
+`SPU_INTERP_UNLIFTED=1` through `tools/play.command`: those unlifted overlays run
+through the existing interpreter and return to compiled SPU code. This is still
+a compatibility path, not a claim that all audio code is native ARM64.
+`SPU_INTERP_UNLIFTED=0` explicitly disables the fallback.
+
+Audio output queries also used incorrect guest struct layouts, making the game
+read zero channels/zero Hz and reject the reported modes. The corrected device
+header, sound-mode stride/layout and 20-byte output state follow the ABI
+documented in [RPCS3's audio output definitions](https://github.com/RPCS3/rpcs3/blob/master/rpcs3/Emu/Cell/Modules/cellAudioOut.h).
+Configure/GetConfiguration/GetState now agree on the selected LPCM mode.
+
+`sh tools/test_audio_output.sh` checks guest byte offsets, buffer boundaries,
+48 kHz capabilities and configuration round-trips; it failed before the fix and
+passes afterward. Two bounded runs are saved locally under `logs/audio-01` and
+`logs/audio-02`. The first had silent output and a terminated audio worker.
+The fallback-enabled run produced nonzero stereo samples through CoreAudio,
+and the user confirmed hearing sound. Extended race coverage and the audio
+fallback's performance cost have not been measured.
+
+On macOS, `AUDIO_PEAK=1` now reports mixed-buffer levels; `AUDIO_WAV=<path>`
+records raw float32 stereo 48 kHz output (despite the legacy variable name,
+it is not a WAV container). These diagnostics remain opt-in and recordings
+must stay under ignored `logs/`. A missing optional firmware ATRAC module is
+still reported; complete codec coverage is not established.
+
 ## Source backup and paused status
 
 This is a small source-only backup. See [BACKUP.md](BACKUP.md) for the exact

@@ -288,6 +288,64 @@ index bfa9c6d..c081d69 100644
      snprintf(g_ps3_ft.names[tid], sizeof g_ps3_ft.names[tid], "%s", name);
  }
  
+diff --git a/libs/audio/cellAudio.c b/libs/audio/cellAudio.c
+index 9e3a2d9..d6aec58 100644
+--- a/libs/audio/cellAudio.c
++++ b/libs/audio/cellAudio.c
+@@ -188,6 +188,8 @@ static int audio_backend_init(void)
+     }
+ 
+     SDL_PauseAudioDevice(s_sdl_audio_dev, 0); /* Start playback */
++    fprintf(stderr, "[cellAudio] Output driver=%s, %d Hz, %u channels, block=%u\n",
++            SDL_GetCurrentAudioDriver(), have.freq, have.channels, have.samples);
+     return 0;
+ }
+ 
+@@ -614,9 +616,36 @@ static void* audio_mix_thread_func(void* arg)
+ {
+     (void)arg;
+     printf("[cellAudio] Mixing thread started\n");
++    const int trace = getenv("AUDIO_PEAK") != NULL;
++    const char* capture_path = getenv("AUDIO_WAV");
++    FILE* capture = capture_path ? fopen(capture_path, "wb") : NULL;
++    unsigned blocks = 0, silent = 0, invalid = 0;
++    float peak = 0;
++    if (capture_path && !capture) perror("[cellAudio] AUDIO_WAV");
+ 
+     while (s_mix_thread_running) {
+         audio_mix_one_block();
++        if (trace || capture) {
++            int nonzero = 0;
++            for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; ++i) {
++                float value = s_mix_buffer[i];
++                if (!isfinite(value)) { ++invalid; continue; }
++                if (value != 0) nonzero = 1;
++                if (fabsf(value) > peak) peak = fabsf(value);
++            }
++            ++blocks;
++            if (!nonzero) ++silent;
++            if (capture)
++                fwrite(s_mix_buffer, sizeof(float), CELL_AUDIO_BLOCK_SAMPLES * 2, capture);
++            if (blocks == 188) {
++                if (trace) fprintf(stderr,
++                    "[audio-peak] blocks=%u silent=%u peak=%.6f nonfinite=%u queued=%u\n",
++                    blocks, silent, peak, invalid, audio_backend_queued_samples());
++                if (capture) fflush(capture);
++                blocks = silent = invalid = 0;
++                peak = 0;
++            }
++        }
+         audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
+         audio_notify_event_queues();
+ 
+@@ -628,6 +657,7 @@ static void* audio_mix_thread_func(void* arg)
+         }
+     }
+ 
++    if (capture) fclose(capture);
+     printf("[cellAudio] Mixing thread stopped\n");
+     return NULL;
+ }
 diff --git a/libs/codec/cellVdec.c b/libs/codec/cellVdec.c
 index a411dbd..401fe46 100644
 --- a/libs/codec/cellVdec.c
@@ -592,6 +650,264 @@ index 85b05f8..2527c42 100644
      {
          unsigned int ea = (unsigned int)(uintptr_t)data_guest;
          vm_write32((unsigned long long)ea + 0, (unsigned int)data->len);   /* len (s32) */
+diff --git a/libs/misc/cellAvconfExt.c b/libs/misc/cellAvconfExt.c
+index 2ab88b8..62f891d 100644
+--- a/libs/misc/cellAvconfExt.c
++++ b/libs/misc/cellAvconfExt.c
+@@ -10,13 +10,8 @@
+ #include "../../runtime/ppu/ppu_context.h"  /* the float argument of SetGamma is in f1 */
+ #include <stdlib.h>
+ 
+-/* The HLE ABI adapter passes pointer parameters as raw guest addresses, so a
+- * bare deref here writes to whatever host address shares that number. These
+- * three out-params were dereferenced directly, and cellAudioOutGetDeviceInfo
+- * memset()s through one -- an access violation the moment a title reaches audio
+- * device setup, which is exactly where Tokyo Jungle crashed. Both device structs
+- * are all-u8, so translation alone is correct for them; the float needs a
+- * byte-swapped store. */
++/* HLE pointers are guest addresses. Translate them, then write multi-byte
++ * fields big-endian. ABI reference: RPCS3 Emu/Cell/Modules/cellAudioOut.h. */
+ extern u8* vm_base;
+ #define GUEST_PTR(p, T) ((T)((p) ? (void*)(vm_base + (uint32_t)(uintptr_t)(p)) : (void*)0))
+ #include <stdio.h>
+@@ -27,6 +22,13 @@ extern u8* vm_base;
+  * -----------------------------------------------------------------------*/
+ 
+ static float s_gamma = 1.0f;
++static u8 s_audio_channels = CELL_AUDIO_OUT_CHNUM_2;
++static u32 s_audio_downmixer;
++
++static u32 audio_layout(u32 channels)
++{
++    return channels == 8 ? 0x40000000u : channels == 6 ? 0x00010000u : 1u;
++}
+ 
+ /* ---------------------------------------------------------------------------
+  * API implementations
+@@ -34,126 +36,73 @@ static float s_gamma = 1.0f;
+ 
+ s32 cellAudioOutGetSoundAvailability(u32 audioOut, u32 type, u32 fs, u32 option)
+ {
+-    (void)audioOut;
+     (void)option;
+-
+-    /* Report the SAME capability set a real PS3/RPCS3 reports, not just stereo.
+-     * Golden trace (RPCS3.log, real YDKJ boot) shows:
+-     *   cellAudioOut: found support for Linear PCM 2 Ch. / 5.1 Ch. / 7.1 Ch.
+-     *   cellAudioOut: found support for Dolby Digital 5.1 Ch. / DTS 5.1 Ch.
+-     * This call returns the MAX channel count available for (type, fs). Under-reporting
+-     * stereo (the old behaviour) makes FMOD's init probe fail its 8/6-channel checks and
+-     * then fall through to DTS/AC3 probes that also returned 0 -- YDKJ ends up with no
+-     * FMOD threads at all. Returning the real 7.1 for LPCM matches the console. */
+-    if (type == CELL_AUDIO_OUT_CODING_TYPE_LPCM) {
+-        if (fs & CELL_AUDIO_OUT_FS_48KHZ) return CELL_AUDIO_OUT_CHNUM_6;  /* 5.1 (A/B: was 8) */
+-        return CELL_AUDIO_OUT_CHNUM_2;
+-    }
+-
+-    /* Dolby Digital / DTS: real hardware reports 5.1 for these. */
+-    if (type == CELL_AUDIO_OUT_CODING_TYPE_AC3 || type == CELL_AUDIO_OUT_CODING_TYPE_DTS)
+-        return CELL_AUDIO_OUT_CHNUM_6;
+-
+-    return 0; /* not available */
++    /* Match GetDeviceInfo: LPCM 48 kHz; the host mixer downmixes to stereo. */
++    return audioOut == CELL_AUDIO_OUT_PRIMARY &&
++        type == CELL_AUDIO_OUT_CODING_TYPE_LPCM && fs == CELL_AUDIO_OUT_FS_48KHZ
++        ? CELL_AUDIO_OUT_CHNUM_8 : 0;
+ }
+ 
+ s32 cellAudioOutGetSoundAvailability2(u32 audioOut, u32 type, u32 fs, u32 ch, u32 option)
+ {
+-    (void)audioOut;
+     (void)option;
+-
+-    if (type == CELL_AUDIO_OUT_CODING_TYPE_LPCM &&
+-        (fs & CELL_AUDIO_OUT_FS_48KHZ) &&
+-        (ch == CELL_AUDIO_OUT_CHNUM_2 || ch == CELL_AUDIO_OUT_CHNUM_6 || ch == CELL_AUDIO_OUT_CHNUM_8))
+-        return 1; /* available */
+-
++    if (cellAudioOutGetSoundAvailability(audioOut, type, fs, 0) &&
++        (ch == 2 || ch == 6 || ch == 8)) return (s32)ch;
+     return 0;
+ }
+ 
+-s32 cellAudioOutGetDeviceInfo(u32 audioOut, u32 deviceIndex,
+-                               CellAudioOutDeviceInfo* info)
++s32 cellAudioOutGetDeviceInfo(u32 audioOut, u32 deviceIndex, CellAudioOutDeviceInfo* info)
+ {
+-    (void)audioOut;
+-    (void)deviceIndex;
+-
+-    printf("[cellAvconfExt] AudioOutGetDeviceInfo(out=%u, dev=%u)\n",
+-           audioOut, deviceIndex);
+-
+-    if (!info)
++    printf("[cellAvconfExt] AudioOutGetDeviceInfo(out=%u, dev=%u)\n", audioOut, deviceIndex);
++    if (!info || audioOut != CELL_AUDIO_OUT_PRIMARY || deviceIndex != 0)
+         return CELL_EINVAL;
++    u32 ea = (u32)(uintptr_t)info;
+     info = GUEST_PTR(info, CellAudioOutDeviceInfo*);
+-
+-    memset(info, 0, sizeof(CellAudioOutDeviceInfo));
+-
+-    /* Report the mode set a real PS3 reports. Golden trace (RPCS3.log, real YDKJ boot):
+-     *   "found support for Linear PCM 2 Ch. / 5.1 Ch. / 7.1 Ch."
+-     *   "found support for Dolby Digital 5.1 Ch. / DTS 5.1 Ch."
+-     * Advertising a single stereo mode here while GetSoundAvailability reports 5.1/7.1 is
+-     * self-inconsistent, and middleware (FMOD) validates these against each other. */
++    memset(info, 0, sizeof(*info));
+     info->portType = 0; /* HDMI */
+-    info->state = 2;    /* connected */
++    info->state = 1; /* AVAILABLE */
+     info->availableModeCount = 3;
+-    info->availableModes[0].type    = CELL_AUDIO_OUT_CODING_TYPE_LPCM;
+-    info->availableModes[0].channel = CELL_AUDIO_OUT_CHNUM_2;
+-    info->availableModes[0].fs      = CELL_AUDIO_OUT_FS_48KHZ;
+-    info->availableModes[1].type    = CELL_AUDIO_OUT_CODING_TYPE_LPCM;
+-    info->availableModes[1].channel = CELL_AUDIO_OUT_CHNUM_6;
+-    info->availableModes[1].fs      = CELL_AUDIO_OUT_FS_48KHZ;
+-    info->availableModes[2].type    = CELL_AUDIO_OUT_CODING_TYPE_LPCM;
+-    info->availableModes[2].channel = CELL_AUDIO_OUT_CHNUM_8;
+-    info->availableModes[2].fs      = CELL_AUDIO_OUT_FS_48KHZ;
+-
++    const u8 channels[] = {2, 6, 8};
++    /* Header is 8 bytes, each mode is 8 bytes, including its BE layout. */
++    for (u32 i = 0; i < 3; ++i) {
++        info->availableModes[i].type = CELL_AUDIO_OUT_CODING_TYPE_LPCM;
++        info->availableModes[i].channel = channels[i];
++        info->availableModes[i].fs = CELL_AUDIO_OUT_FS_48KHZ;
++        vm_write32(ea + 8 + i * 8 + 4, audio_layout(channels[i]));
++    }
+     return CELL_OK;
+ }
+ 
+-s32 cellAudioOutGetConfiguration(u32 audioOut,
+-                                  CellAudioOutConfiguration* config,
+-                                  void* option, u32 optionSize)
++s32 cellAudioOutGetConfiguration(u32 audioOut, CellAudioOutConfiguration* config,
++                                void* option, u32 optionSize)
+ {
+-    (void)audioOut;
+-    (void)option;
+-    (void)optionSize;
+-
+-    printf("[cellAvconfExt] AudioOutGetConfiguration()\n");
+-
+-    if (!config)
+-        return CELL_EINVAL;
++    (void)option; (void)optionSize;
++    if (!config || audioOut != CELL_AUDIO_OUT_PRIMARY) return CELL_EINVAL;
++    u32 ea = (u32)(uintptr_t)config;
+     config = GUEST_PTR(config, CellAudioOutConfiguration*);
+-
+-    memset(config, 0, sizeof(CellAudioOutConfiguration));
+-    config->channel = CELL_AUDIO_OUT_CHNUM_2;
++    memset(config, 0, sizeof(*config));
++    config->channel = s_audio_channels;
+     config->encoder = CELL_AUDIO_OUT_CODING_TYPE_LPCM;
+-
++    vm_write32(ea + 12, s_audio_downmixer);
+     return CELL_OK;
+ }
+ 
+-/* cellAudioOutGetState(audioOut, deviceIndex, state) -- the audio sibling of
+- * cellVideoOutGetState. A title checks it before configuring output; Virtua
+- * Fighter 5 calls it once during boot and it was the last unresolved import in
+- * the whole title. The device is always present and enabled here: there is no
+- * "no audio device" case a recompiled port can be in.
+- *
+- * CellAudioOutState { u8 state; u8 encoder; u8 reserved[2]; u32 downMixer;
+- *                     CellAudioOutSoundMode soundMode; } -- written big-endian
+- * a byte at a time, which needs no struct definition to get right. */
++/* Guest state is 20 bytes: reserved[6], downMixer at +8, soundMode at +12.
++ * The old +8 soundMode made MotorStorm read zero channels and zero Hz. */
+ s32 cellAudioOutGetState(u32 audioOut, u32 deviceIndex, void* state)
+ {
+-    (void)deviceIndex;
+-    uint32_t ea = (uint32_t)(uintptr_t)state;
++    u32 ea = (u32)(uintptr_t)state;
+     printf("[cellAvconfExt] AudioOutGetState(audioOut=%u)\n", audioOut);
+-    if (!ea)
++    if (!ea || audioOut != CELL_AUDIO_OUT_PRIMARY || deviceIndex != 0)
+         return CELL_EINVAL;
+-
+-    vm_write8(ea + 0, 0);                                   /* ENABLED        */
++    memset(vm_base + ea, 0, 20);
++    vm_write8(ea, 0); /* ENABLED */
+     vm_write8(ea + 1, CELL_AUDIO_OUT_CODING_TYPE_LPCM);
+-    vm_write8(ea + 2, 0);
+-    vm_write8(ea + 3, 0);
+-    vm_write32(ea + 4, 0);                                  /* no down-mixer  */
+-    vm_write8(ea + 8, CELL_AUDIO_OUT_CODING_TYPE_LPCM);     /* soundMode      */
+-    vm_write8(ea + 9, CELL_AUDIO_OUT_CHNUM_2);
+-    vm_write8(ea + 10, CELL_AUDIO_OUT_FS_48KHZ);
+-    vm_write8(ea + 11, 0);
+-    vm_write32(ea + 12, 0);
++    vm_write32(ea + 8, s_audio_downmixer);
++    vm_write8(ea + 12, CELL_AUDIO_OUT_CODING_TYPE_LPCM);
++    vm_write8(ea + 13, s_audio_channels);
++    vm_write8(ea + 14, CELL_AUDIO_OUT_FS_48KHZ);
++    vm_write32(ea + 16, audio_layout(s_audio_channels));
+     return CELL_OK;
+ }
+ 
+@@ -213,12 +162,20 @@ float cellAvconfExt_display_gamma(void)
+     return env > 0.0f ? env : s_gamma;
+ }
+ 
+-/* cellAudioOutConfigure(audioOut, config, option, waitForEvent) -- set the
+- * audio output mode. We accept any config and report success (request id 0);
+- * the title queries availability separately. NID 0x4692AB35. */
++/* Keep Configure, GetConfiguration and GetState consistent. */
+ s32 cellAudioOutConfigure(u32 audioOut, void* config, void* option, u32 waitForEvent)
+ {
+-    (void)config; (void)option; (void)waitForEvent;
+-    printf("[cellAvconfExt] AudioOutConfigure(audioOut=%u) -> ok\n", audioOut);
+-    return 0;
++    (void)option; (void)waitForEvent;
++    u32 ea = (u32)(uintptr_t)config;
++    if (!ea || audioOut != CELL_AUDIO_OUT_PRIMARY) return CELL_EINVAL;
++    u8 channels = vm_read8(ea), encoder = vm_read8(ea + 1);
++    u32 downmixer = vm_read32(ea + 12);
++    if (encoder != CELL_AUDIO_OUT_CODING_TYPE_LPCM ||
++        (channels != 2 && channels != 6 && channels != 8) || downmixer > 2)
++        return CELL_EINVAL;
++    s_audio_channels = channels;
++    s_audio_downmixer = downmixer;
++    printf("[cellAvconfExt] AudioOutConfigure(out=%u, channels=%u, LPCM 48000 Hz)\n",
++           audioOut, channels);
++    return CELL_OK;
+ }
+diff --git a/libs/misc/cellAvconfExt.h b/libs/misc/cellAvconfExt.h
+index 9ab90ee..c5da909 100644
+--- a/libs/misc/cellAvconfExt.h
++++ b/libs/misc/cellAvconfExt.h
+@@ -23,8 +23,8 @@ extern "C" {
+ 
+ /* Output modes */
+ #define CELL_AUDIO_OUT_CODING_TYPE_LPCM    0
+-#define CELL_AUDIO_OUT_CODING_TYPE_AC3     4
+-#define CELL_AUDIO_OUT_CODING_TYPE_DTS     8
++#define CELL_AUDIO_OUT_CODING_TYPE_AC3     1
++#define CELL_AUDIO_OUT_CODING_TYPE_DTS     6
+ 
+ /* Channel counts */
+ #define CELL_AUDIO_OUT_CHNUM_2             2
+@@ -49,6 +49,7 @@ typedef struct CellAudioOutSoundMode {
+     u8  channel;
+     u8  fs;
+     u8  reserved;
++    u32 layout; /* big-endian in guest memory */
+ } CellAudioOutSoundMode;
+ 
+ typedef struct CellAudioOutDeviceInfo {
+@@ -56,6 +57,7 @@ typedef struct CellAudioOutDeviceInfo {
+     u8  availableModeCount;
+     u8  state;
+     u8  reserved[3];
++    u16 latency; /* big-endian in guest memory */
+     CellAudioOutSoundMode availableModes[16];
+ } CellAudioOutDeviceInfo;
+ 
 diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
 index 015913a..4cd8d43 100644
 --- a/libs/spurs/cellSpurs.c
@@ -6771,7 +7087,7 @@ index 148be1f..ffa2a87 100644
      ctx.gpr[3]  = a0; ctx.gpr[4] = a1; ctx.gpr[5] = a2; ctx.gpr[6] = a3;
      ctx.gpr[7]  = a4; ctx.gpr[8] = a5; ctx.gpr[9] = a6; ctx.gpr[10] = a7;
 diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
-index dbea35b..30daf63 100644
+index dbea35b..c94f9c5 100644
 --- a/runtime/spu/spu_channels.c
 +++ b/runtime/spu/spu_channels.c
 @@ -22,9 +22,9 @@
@@ -7098,7 +7414,26 @@ index dbea35b..30daf63 100644
      /* The launched task owns the shared task-code region: resolve it there FIRST
       * so a co-resident task at the same LS base cannot shadow it. (resident_task
       * is 0 outside the region, so this only ever fires for genuine task code.) */
-@@ -2375,28 +2459,6 @@ void spu_indirect_branch(spu_context* ctx)
+@@ -2329,7 +2413,7 @@ void spu_indirect_branch(spu_context* ctx)
+         if (!known && n_seen < 16) {
+             seen[n_seen++] = ctx->pc;
+             fprintf(stderr, "[spu] img=%d branched into unlifted LS 0x%05X "
+-                    "(lr=0x%05X) -- ending the job\n",
++                    "(lr=0x%05X) -- no native body registered\n",
+                     ctx->image_id, ctx->pc, ctx->gpr[0]._u32[0] & SPU_LS_MASK);
+             { fprintf(stderr, "      last dispatched PCs (oldest first):");
+               for (unsigned q = 0; q < 8; q++) {
+@@ -2363,7 +2447,8 @@ void spu_indirect_branch(spu_context* ctx)
+           uint32_t w0 = ((uint32_t)ctx->ls[p] << 24) | ((uint32_t)ctx->ls[p+1] << 16) |
+                         ((uint32_t)ctx->ls[p+2] << 8) | ctx->ls[p+3];
+           static int s_iu = -1;
+-          if (s_iu < 0) { const char* e = getenv("SPU_INTERP_UNLIFTED"); s_iu = e ? 1 : 0; }
++          if (s_iu < 0) { const char* e = getenv("SPU_INTERP_UNLIFTED");
++              s_iu = e && *e && strcmp(e, "0") != 0; }
+           if (s_iu && w0) {
+               static int _n = 0;
+               if (_n++ < 8)
+@@ -2375,28 +2460,6 @@ void spu_indirect_branch(spu_context* ctx)
          spu_halt(ctx);
          return;
      }
@@ -7127,7 +7462,7 @@ index dbea35b..30daf63 100644
      /* WWS job-code fallback: the jobmanager PM (image 2) stages each job's
       * code into an LS buffer and branches into it. The staged blobs are
       * lifted as their own images at their LS residence addresses (image 1 =
-@@ -2814,4 +2876,4 @@ void spu_trace_rt(spu_context* ctx, uint32_t rt)
+@@ -2814,4 +2877,4 @@ void spu_trace_rt(spu_context* ctx, uint32_t rt)
  
  #ifdef __cplusplus
  }

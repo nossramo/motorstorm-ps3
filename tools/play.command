@@ -3,6 +3,9 @@ set -eu
 cd "$(dirname "$0")/.."
 export PS3_TITLE='MotorStorm — Z: confirm · X: back · Enter: Start'
 export PS3_HLE_UNRESOLVED=fail
+# Multistream loads DSP code into SPU local store at runtime. Continue through
+# the interpreter for those unlifted overlays, then rejoin the compiled code.
+export SPU_INTERP_UNLIFTED="${SPU_INTERP_UNLIFTED:-1}"
 # MotorStorm submits work produced by SPU jobs. Honour RSX acquire waits.
 export GCM_SEMA_ACQUIRE="${GCM_SEMA_ACQUIRE:-1}"
 # The game's exposure calculation reads GPU colour data directly on the PPU.
