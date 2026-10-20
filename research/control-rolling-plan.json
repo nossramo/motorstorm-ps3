@@ -1,0 +1,10 @@
+[
+  {"at": 0, "mask": "0x0200", "axes": [128, 128, 128, 128], "purpose": "accelerate from the grid"},
+  {"at": 4, "mask": "0x0200", "axes": [88, 128, 128, 128], "purpose": "steer left under throttle"},
+  {"at": 5, "mask": "0x0200", "axes": [168, 128, 128, 128], "purpose": "steer right under throttle"},
+  {"at": 6, "mask": "0x0200", "axes": [128, 128, 128, 128], "purpose": "straighten"},
+  {"at": 9, "mask": "0x0100", "axes": [128, 128, 128, 128], "purpose": "brief braking check"},
+  {"at": 9.25, "mask": "0x0200", "axes": [128, 128, 128, 128], "purpose": "resume forward throttle"},
+  {"at": 16, "mask": "0x0100", "axes": [128, 128, 128, 128], "purpose": "second brief braking check"},
+  {"at": 16.25, "mask": "0x0200", "axes": [128, 128, 128, 128], "purpose": "continue forward rather than holding reverse"}
+]

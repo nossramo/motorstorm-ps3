@@ -1,0 +1,7 @@
+[
+  {"at": 0, "mask": "0x0200", "axes": [128, 128, 128, 128], "purpose": "accelerate from the grid"},
+  {"at": 2, "mask": "0x0200", "axes": [104, 128, 128, 128], "purpose": "move left toward the bridge approach"},
+  {"at": 3, "mask": "0x0200", "axes": [128, 128, 128, 128], "purpose": "hold the new heading"},
+  {"at": 4, "mask": "0x0200", "axes": [152, 128, 128, 128], "purpose": "straighten before reaching the bridge"},
+  {"at": 5, "mask": "0x0200", "axes": [128, 128, 128, 128], "purpose": "follow the bridge approach"}
+]

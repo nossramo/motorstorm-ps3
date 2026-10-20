@@ -1,0 +1,86 @@
+# Source-only backup
+
+This repository preserves the authored MotorStorm port work. It does not
+contain the game, firmware, generated game source, installed game data, saves,
+executables, shader caches, recordings or GPU captures. Those remain local.
+Git LFS is not required.
+
+## What is preserved
+
+- `port/`: authored runner, platform adapters, native optimization helpers,
+  CMake build configuration and tests.
+- `MotorStorm/`: the new Xcode project and SwiftUI starter sources. It is not
+  yet connected to the game runtime.
+- `tools/` and `tests/`: source generation, launch, capture, analysis and
+  verification tools.
+- `patches/ps3recomp-local.patch`: tracked changes **and new source files** from
+  our modified runtime/recompiler, against the exact commit in
+  `research/ps3recomp-commit.txt`.
+- `research/`: input hashes, pinned upstream versions, small authored control
+  plans and the original resolution experiment.
+- `README.md`: research history and measured limitations. References to
+  `logs/` refer to local evidence that is deliberately not uploaded.
+
+The main upstream is [ps3recomp](https://github.com/sp00nznet/ps3recomp).
+Its MIT license is preserved in `port/UPSTREAM-LICENSE`; notices for bcdec and
+xxHash are included with their code in the runtime patch.
+[MSMV-unpacker](https://github.com/Scirvir/MSMV-unpacker) was an optional archive
+reference; its pinned commit is recorded, but it is not required by the build.
+No license for the original game or its assets is granted by this repository.
+
+## Restore on another Mac
+
+Install the prerequisites listed in `README.md`, then:
+
+```sh
+python3 tools/bootstrap_runtime.py
+```
+
+This fetches the pinned open-source runtime and applies the saved patch. It
+refuses to overwrite a checkout with unrelated local changes. To verify an
+existing checkout without downloading or changing files:
+
+```sh
+python3 tools/bootstrap_runtime.py --check
+```
+
+Supply your own matching local game files under `game/`. The input used here
+is BCES00006 version 03.10; hashes are in `research/input-manifest.json`.
+Then regenerate the game-derived sources locally and build:
+
+```sh
+sh tools/analyze_game.sh
+sh tools/build_port.sh
+sh tools/play-experimental.command
+```
+
+Generation also restores the manually authored job-wait wrapper with
+`tools/patch_job_wait.py`. That tool stores the wrapper and an expected
+fingerprint, not the original game function. It refuses to patch an unexpected
+function. The SPU overlays and policy are also generated from the local game.
+Existing installations and saved state under `gamedata/` are not backed up.
+
+All 91 changed/new runtime files were restored byte-for-byte in a temporary
+directory from upstream source plus the patch. The wait wrapper was also
+reconstructed byte-for-byte without modifying the live generated source.
+A complete fresh regeneration/build/gameplay run from this backup has not
+been performed. The historical `tools/repair_havok_switch.py` is retained as
+an integration repair; the generic discovery fix is already in the runtime
+patch. The working game build still uses CMake/Ninja; the new Xcode project
+currently contains the default SwiftUI screen.
+
+## Updating the backup
+
+Before committing further runtime changes:
+
+```sh
+python3 tools/export_runtime_patch.py
+python3 tools/bootstrap_runtime.py --check
+git status --short
+git diff --stat
+```
+
+Inspect the staged paths and sizes before pushing. Keep generated game code,
+game data, binaries and captures excluded even if Git offers to force-add them.
+Only the latest runtime patch is versioned; Git history preserves future
+versions without duplicate patch files.

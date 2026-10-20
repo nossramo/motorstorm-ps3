@@ -1,0 +1,302 @@
+--- a/libs/video/rsx_metal_backend.m
++++ b/libs/video/rsx_metal_backend.m
+@@ -85,6 +85,7 @@
+ static int                 s_ready;
+ static u32                 s_width  = 1280;
+ static u32                 s_height = 720;
++static u32                 s_eng_internal_height = 720;
+ 
+ /* Each initialization owns its counters. A drawable callback retained by the
+  * compositor can outlive shutdown without writing into a later session. */
+@@ -533,8 +534,8 @@
+ {
+     MTLTextureDescriptor* td =
+         [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTL_DEPTH_FORMAT
+-                                                           width:s_width
+-                                                          height:s_height
++                                                           width:(s_width * s_eng_internal_height / 720u)
++                                                          height:(s_height * s_eng_internal_height / 720u)
+                                                        mipmapped:NO];
+     td.usage       = MTLTextureUsageRenderTarget;
+     td.storageMode = MTLStorageModePrivate;
+@@ -2215,6 +2216,28 @@
+ static u32 s_eng_obj_free[ENG_MAX_OBJECTS];
+ static u32 s_eng_obj_free_count;
+ static u8 s_eng_obj_retired[ENG_MAX_OBJECTS];
++/* Opt-in resolution experiment. Guest pitches/addresses remain unchanged.
++ * Rectangular scene/effect targets scale; square shadow maps and tiny lookup
++ * targets retain their original quality. Never infer scale from window size. */
++static u32 s_eng_guest_w[ENG_MAX_OBJECTS], s_eng_guest_h[ENG_MAX_OBJECTS];
++static u32 eng_scaled_extent(u32 n, u32 w, u32 h)
++{
++    if (w == h || w < 160 || h < 90) return n;
++    return (u32)(((u64)n * s_eng_internal_height + 360u) / 720u);
++}
++static u32 eng_pixel_bytes(MTLPixelFormat f)
++{
++    switch (f) {
++    case MTLPixelFormatR8Unorm: return 1;
++    case MTLPixelFormatRG8Unorm: case MTLPixelFormatR16Unorm: return 2;
++    case MTLPixelFormatRGBA8Unorm: case MTLPixelFormatBGRA8Unorm:
++    case MTLPixelFormatRG16Unorm: case MTLPixelFormatRG16Float:
++    case MTLPixelFormatR32Float: return 4;
++    case MTLPixelFormatRGBA16Float: return 8;
++    case MTLPixelFormatRGBA32Float: return 16;
++    default: return 0;
++    }
++}
+ 
+ typedef struct {
+     id<MTLRenderPipelineState> pso;
+@@ -2464,8 +2487,8 @@
+ "}\n"
+ /* Integer quantization reproduces round(double(depth)*0xffffff), including
+  * depth==1. Metal float multiply/add can round that to 0x1000000. */
+-"fragment float4 eng_depth_packed_fs(BOut i [[stage_in]], depth2d<float> src [[texture(0)]]) {\n"
+-"    float d=src.read(uint2(i.pos.xy)); uint v=0;\n"
++"fragment float4 eng_depth_packed_fs(BOut i [[stage_in]], depth2d<float> src [[texture(0)]], constant float2& scale [[buffer(0)]]) {\n"
++"    float d=src.read(uint2(i.pos.xy * scale)); uint v=0;\n"
+ "    if(d>=1.0) v=0xffffffu; else if(d>0.0) {\n"
+ "        uint bits=as_type<uint>(d), ex=(bits>>23)&255u;\n"
+ "        if(ex>=102u) { uint sh=150u-ex; ulong m=ulong((bits&0x7fffffu)|0x800000u);\n"
+@@ -2475,8 +2498,8 @@
+ "}\n"
+ "fragment float eng_depth_fs(BOut i [[stage_in]],\n"
+ "                            depth2d<float> src [[texture(0)]],\n"
+-"                            sampler s [[sampler(0)]]) {\n"
+-"    return src.read(uint2(i.pos.xy));\n"
++"                            sampler s [[sampler(0)]], constant float2& scale [[buffer(0)]]) {\n"
++"    return src.read(uint2(i.pos.xy * scale));\n"
+ "}\n";
+ 
+ static u32 eng_obj_add(id<MTLTexture> t)
+@@ -2490,7 +2513,21 @@
+         slot = s_eng_obj_count++;
+     }
+     s_eng_obj[slot] = t;
++    s_eng_guest_w[slot] = (u32)t.width;
++    s_eng_guest_h[slot] = (u32)t.height;
+     return slot + 1;
++}
++
++static u32 eng_target_add(id<MTLTexture> t, u32 w, u32 h)
++{
++    const u32 handle = eng_obj_add(t);
++    if (handle) {
++        s_eng_guest_w[handle-1] = w; s_eng_guest_h[handle-1] = h;
++        if (s_eng_internal_height != 720)
++            fprintf(stderr, "[metal resolution] target %u guest=%ux%u physical=%lux%lu\n",
++                    handle, w, h, (unsigned long)t.width, (unsigned long)t.height);
++    }
++    return handle;
+ }
+ 
+ static id<MTLTexture> eng_obj(u32 handle)
+@@ -2586,6 +2623,18 @@
+ static int eng_init(void* user, u32 width, u32 height)
+ {
+     (void)user; (void)width; (void)height;
++    const char* height_env = getenv("PS3RECOMP_METAL_INTERNAL_HEIGHT");
++    s_eng_internal_height = height_env ? (u32)atoi(height_env) : 720;
++    if (s_eng_internal_height != 720 && s_eng_internal_height != 900 &&
++        s_eng_internal_height != 1080) {
++        fprintf(stderr, "[metal resolution] expected 720, 900 or 1080\n");
++        return -1;
++    }
++    fprintf(stderr, "[metal resolution] internal=%ux%u; display=%ux%u; square targets unchanged\n",
++            s_eng_internal_height*16u/9u, s_eng_internal_height, s_width, s_height);
++    /* Passes without a guest zeta still bind the display fallback. Leaving it
++     * at 720p silently clips a larger colour attachment to the smaller depth. */
++    if (s_depth && create_depth() != 0) return -1;
+     s_eng_encoding_failed = 0;
+     if (!s_dev) return -1;
+     NSError* err = nil;
+@@ -2726,7 +2775,7 @@
+     if (!s_dev || !w || !h) return 0;
+     MTLTextureDescriptor* td =
+         [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:eng_pixel_format(fmt)
+-                                                           width:w height:h
++                                                           width:eng_scaled_extent(w,w,h) height:eng_scaled_extent(h,w,h)
+                                                        mipmapped:NO];
+     /* PixelFormatView because a unit sampling this target wears its own
+      * TEXTURE_CONTROL1 crossbar as a view swizzle. */
+@@ -2734,10 +2783,25 @@
+                MTLTextureUsagePixelFormatView;
+     id<MTLTexture> t = [s_dev newTextureWithDescriptor:td];
+     if (!t) return 0;
+-    if (seed && seed_row_bytes)
+-        [t replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0
+-               withBytes:seed bytesPerRow:seed_row_bytes];
+-    return eng_obj_add(t);
++    if (seed && seed_row_bytes) {
++        if (t.width == w && t.height == h) {
++            [t replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0
++                   withBytes:seed bytesPerRow:seed_row_bytes];
++        } else {
++            const u32 bpp = eng_pixel_bytes(t.pixelFormat);
++            if (!bpp) return 0;
++            u8* scaled = malloc(t.width*t.height*bpp);
++            if (!scaled) return 0;
++            for (u32 y=0; y<t.height; ++y) for (u32 x=0; x<t.width; ++x)
++                memcpy(scaled+((size_t)y*t.width+x)*bpp,
++                       (const u8*)seed+(size_t)((y+.5)*h/t.height)*seed_row_bytes+
++                       (size_t)((x+.5)*w/t.width)*bpp, bpp);
++            [t replaceRegion:MTLRegionMake2D(0,0,t.width,t.height) mipmapLevel:0
++                   withBytes:scaled bytesPerRow:t.width*bpp];
++            free(scaled);
++        }
++    }
++    return eng_target_add(t,w,h);
+ }
+ 
+ static u32 eng_surface_view(void* user, u32 surface, u32 remap, u32 rsx_format)
+@@ -2762,6 +2826,8 @@
+                                              swizzle_sel(sel[3]), swizzle_sel(sel[0]))];
+     const u32 handle = eng_obj_add(v);
+     if (!handle) return 0;
++    s_eng_guest_w[handle-1] = s_eng_guest_w[surface-1];
++    s_eng_guest_h[handle-1] = s_eng_guest_h[surface-1];
+     s_eng_view[s_eng_view_count].surface = surface;
+     s_eng_view[s_eng_view_count].remap   = remap;
+     s_eng_view[s_eng_view_count].format  = rsx_format;
+@@ -2785,6 +2851,8 @@
+     td.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+     const u32 copy = eng_obj_add([s_dev newTextureWithDescriptor:td]);
+     if (!copy) { s_eng_dropped++; return 0; }
++    s_eng_guest_w[copy-1] = s_eng_guest_w[surface-1];
++    s_eng_guest_h[copy-1] = s_eng_guest_h[surface-1];
+     EngRecord* r = &s_eng_rec[s_eng_rec_count++];
+     memset(r, 0, sizeof *r);
+     r->kind = ENG_REC_COLOR_SNAPSHOT;
+@@ -2799,13 +2867,13 @@
+     if (!s_dev || !w || !h) return 0;
+     MTLTextureDescriptor* td =
+         [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTL_DEPTH_FORMAT
+-                                                           width:w height:h
++                                                           width:eng_scaled_extent(w,w,h) height:eng_scaled_extent(h,w,h)
+                                                        mipmapped:NO];
+     /* ShaderRead as well as RenderTarget: depth-as-texture resolves through a
+      * pass that samples this as a depth2d, so it cannot be write-only. */
+     td.usage       = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+     td.storageMode = MTLStorageModePrivate;
+-    return eng_obj_add([s_dev newTextureWithDescriptor:td]);
++    return eng_target_add([s_dev newTextureWithDescriptor:td],w,h);
+ }
+ 
+ /* The sampleable copy of a depth target. The copy is a record in the stream,
+@@ -2860,6 +2928,23 @@
+ static id<MTLFunction> eng_function(const char* hlsl, int stage,
+                                     const char* what)
+ {
++    /* Raster positions are physical pixels; guest WPOS arithmetic still uses
++     * original pixels. Dynamic per-target scale also covers unscaled shadows. */
++    NSString* scaled_hlsl = nil;
++    if (s_eng_internal_height != 720 && stage == RSX_SHADER_STAGE_FRAGMENT) {
++        NSString* source = [NSString stringWithUTF8String:hlsl];
++        NSRange main = [source rangeOfString:@"main(PSInput input)"];
++        if (main.location != NSNotFound) {
++            NSRange body = [source rangeOfString:@"{" options:0
++                            range:NSMakeRange(main.location, source.length-main.location)];
++            if (body.location != NSNotFound) {
++                NSMutableString* text = [source mutableCopy];
++                [text insertString:@" input.position.xy *= metal_guest_pixel_scale.xy; " atIndex:body.location+1];
++                [text insertString:@"cbuffer MetalResolution : register(b2) { float4 metal_guest_pixel_scale; };\n" atIndex:0];
++                scaled_hlsl = text; hlsl = scaled_hlsl.UTF8String;
++            }
++        }
++    }
+     const u64 hash = fnv1a64(hlsl, (u32)strlen(hlsl), 1469598103934665603ull);
+     for (u32 i = 0; i < s_eng_func_count; i++)
+         if (s_eng_func[i].hash == hash) return s_eng_func[i].fn;
+@@ -3240,10 +3325,24 @@
+     [enc setCullMode:p->cull];
+     [enc setFrontFacingWinding:p->winding];
+     [enc setStencilReferenceValue:r->stencil_ref];
+-    MTLViewport vp = { r->vp[0], r->vp[1], r->vp[2], r->vp[3], 0.0, 1.0 };
++    const u32 target = r->nrt ? r->rt[0] : r->depth;
++    id<MTLTexture> target_tex = eng_obj(target);
++    const double sx = target_tex ? (double)target_tex.width/s_eng_guest_w[target-1] : 1;
++    const double sy = target_tex ? (double)target_tex.height/s_eng_guest_h[target-1] : 1;
++    MTLViewport vp = { r->vp[0]*sx, r->vp[1]*sy, r->vp[2]*sx, r->vp[3]*sy, 0.0, 1.0 };
+     [enc setViewport:vp];
+-    if (r->sc[2] && r->sc[3])
+-        [enc setScissorRect:(MTLScissorRect){ r->sc[0], r->sc[1], r->sc[2], r->sc[3] }];
++    if (r->sc[2] && r->sc[3]) {
++        const NSUInteger x = floor(r->sc[0]*sx), y = floor(r->sc[1]*sy);
++        NSUInteger end_x = ceil(((double)r->sc[0]+r->sc[2])*sx);
++        NSUInteger end_y = ceil(((double)r->sc[1]+r->sc[3])*sy);
++        if (target_tex) { end_x=MIN(end_x,target_tex.width); end_y=MIN(end_y,target_tex.height); }
++        if (end_x <= x || end_y <= y) return;
++        [enc setScissorRect:(MTLScissorRect){x,y,end_x-x,end_y-y}];
++    }
++    if (s_eng_internal_height != 720) {
++        const float pixel_scale[4] = {1.0/sx,1.0/sy,0,0};
++        [enc setFragmentBytes:pixel_scale length:sizeof pixel_scale atIndex:2];
++    }
+     [enc setVertexBuffer:stage offset:r->vb_off atIndex:MTL_VB_INDEX];
+     if (r->vs_cb_bytes) [enc setVertexBuffer:stage offset:r->vs_cb_off atIndex:0];
+     if (r->ps_cb_bytes) [enc setFragmentBuffer:stage offset:r->ps_cb_off atIndex:1];
+@@ -3366,6 +3465,9 @@
+             [e setRenderPipelineState:resolve_pso];
+             [e setFragmentTexture:src atIndex:0];
+             [e setFragmentSamplerState:s_eng_point_sampler atIndex:0];
++            const float scale[2] = {(float)src.width/s_eng_guest_w[r->depth-1],
++                                    (float)src.height/s_eng_guest_h[r->depth-1]};
++            [e setFragmentBytes:scale length:sizeof scale atIndex:0];
+             [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+             [e endEncoding];
+             continue;
+@@ -3847,10 +3949,28 @@
+     (void)user;
+     id<MTLTexture> t = eng_obj(surface);
+     if (!t || !out || !out_pitch || !w || !h) return;
+-    if (x + w > [t width] || y + h > [t height]) return;
++    const u32 gw=s_eng_guest_w[surface-1], gh=s_eng_guest_h[surface-1];
++    if (x>=gw || y>=gh || w>gw-x || h>gh-y) return;
+     const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
+-    [t getBytes:out bytesPerRow:out_pitch
+-     fromRegion:MTLRegionMake2D(x, y, w, h) mipmapLevel:0];
++    if (t.width == gw && t.height == gh) {
++        [t getBytes:out bytesPerRow:out_pitch
++         fromRegion:MTLRegionMake2D(x, y, w, h) mipmapLevel:0];
++    } else {
++        /* Guest aliases/pitches cannot grow with a host rendering experiment.
++         * Point sampling preserves packed pixel bytes rather than filtering
++         * what may be depth, velocity or non-colour data. */
++        const u32 bpp=eng_pixel_bytes(t.pixelFormat);
++        if (!bpp || out_pitch < w*bpp) { s_eng_encoding_failed=1; return; }
++        u8* pixels=malloc(t.width*t.height*bpp);
++        if (!pixels) { s_eng_encoding_failed=1; return; }
++        [t getBytes:pixels bytesPerRow:t.width*bpp
++         fromRegion:MTLRegionMake2D(0,0,t.width,t.height) mipmapLevel:0];
++        for (u32 row=0;row<h;++row) for (u32 col=0;col<w;++col) {
++            const size_t py=(y+row+.5)*t.height/gh, px=(x+col+.5)*t.width/gw;
++            memcpy((u8*)out+(size_t)row*out_pitch+col*bpp,pixels+(py*t.width+px)*bpp,bpp);
++        }
++        free(pixels);
++    }
+     if (ft_t0) ps3_ft_span(PS3_FT_READBACK, 0, w, h, ft_t0, ps3_ft_now());
+ }
+ 
+@@ -3866,8 +3986,8 @@
+         s_eng_obj_retired[depth - 1u] || [src pixelFormat] != MTL_DEPTH_FORMAT ||
+         [src textureType] != MTLTextureType2D || [src sampleCount] != 1 ||
+         [src width] > UINT32_MAX || [src height] > UINT32_MAX ||
+-        x >= [src width] || y >= [src height] ||
+-        w > [src width] - x || h > [src height] - y ||
++        x >= s_eng_guest_w[depth-1] || y >= s_eng_guest_h[depth-1] ||
++        w > s_eng_guest_w[depth-1] - x || h > s_eng_guest_h[depth-1] - y ||
+         w > UINT32_MAX / sizeof(float) || out_pitch < w * sizeof(float))
+         return -1;
+     const size_t row_bytes = (size_t)w * sizeof(float);
+@@ -3880,8 +4000,8 @@
+         id<MTLBuffer> staging = [s_dev newBufferWithLength:copy_pitch * h
+                                                  options:MTLResourceStorageModeShared];
+         if (!staging || ![staging contents]) return -1;
+-        const u32 snap = eng_depth_snapshot(user, depth, (u32)[src width],
+-                                                        (u32)[src height]);
++        const u32 snap = eng_depth_snapshot(user, depth, s_eng_guest_w[depth-1],
++                                                        s_eng_guest_h[depth-1]);
+         if (!snap) return -1;
+         eng_encode_and_commit(nil);
+         if (!s_eng_checked_completed) { eng_obj_release(user, snap); return -1; }

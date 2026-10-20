@@ -1,0 +1,9 @@
+[
+  {"at": 0, "mask": "0x0200", "axes": [128, 128, 128, 128], "purpose": "accelerate straight"},
+  {"at": 4, "mask": "0x0200", "axes": [88, 128, 128, 128], "purpose": "steer left"},
+  {"at": 5, "mask": "0x0200", "axes": [168, 128, 128, 128], "purpose": "steer right"},
+  {"at": 6, "mask": "0x0200", "axes": [128, 128, 128, 128], "purpose": "straighten"},
+  {"at": 9, "mask": "0x0100", "axes": [128, 128, 128, 128], "purpose": "brake"},
+  {"at": 12, "mask": "0x0200", "axes": [128, 128, 128, 128], "purpose": "accelerate again"},
+  {"at": 16, "mask": "0x0100", "axes": [128, 128, 128, 128], "purpose": "brake to finish check"}
+]

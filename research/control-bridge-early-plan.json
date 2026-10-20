@@ -1,0 +1,7 @@
+[
+  {"at": 0, "mask": "0x0200", "axes": [128, 128, 128, 128], "purpose": "accelerate after the first HUD cancellation acknowledgement"},
+  {"at": 1.5, "mask": "0x0200", "axes": [64, 128, 128, 128], "purpose": "turn left toward the bridge lane while speed is low"},
+  {"at": 2.25, "mask": "0x0200", "axes": [128, 128, 128, 128], "purpose": "hold the leftward heading"},
+  {"at": 3.25, "mask": "0x0200", "axes": [192, 128, 128, 128], "purpose": "briefly countersteer before the approach"},
+  {"at": 3.65, "mask": "0x0200", "axes": [128, 128, 128, 128], "purpose": "continue onto the bridge"}
+]

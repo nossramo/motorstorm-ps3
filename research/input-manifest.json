@@ -1,0 +1,23 @@
+{
+  "title": "MotorStorm",
+  "title_id": "BCES00006",
+  "app_ver": "03.10",
+  "files": {
+    "EBOOT.BIN": {
+      "bytes": 17310760,
+      "sha256": "319e93e17d83412a2f807f187380e6c66d58fb932b975aaebed38ca13dae3b46"
+    },
+    "EBOOT.elf": {
+      "bytes": 17308328,
+      "sha256": "983baf06f5357a66b3f97fd5ac20252b50a4161b6373ba290c8206a833250c0d"
+    },
+    "cache_ps3.bin": {
+      "bytes": 306392,
+      "sha256": "cc106e4cbc610c369beeb37b1bb1ad10f5cec08779e6fa168c8d13ad7ac9318c"
+    },
+    "cache_ps3.cnk": {
+      "bytes": 803524,
+      "sha256": "a82f5ace184bdd0496b017d31c7268cda45919d4689b144c99d54de9f125cbaf"
+    }
+  }
+}
