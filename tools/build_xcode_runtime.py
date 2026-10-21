@@ -38,6 +38,10 @@ def main():
     # five-unit/FMA-only configuration for comparison.
     ios_vmx = os.environ.get('MOTORSTORM_BUILD_IOS_VMX') != '0'
     inline_stores = os.environ.get('MOTORSTORM_BUILD_IOS_INLINE_STORES') != '0'
+    # Measurement only: approximate SPU floats, switched at run time.
+    float_probe = os.environ.get('MOTORSTORM_BUILD_IOS_SPU_FLOAT_PROBE') == '1'
+    # Exact native RTZ SPU floats for the duration of each SPU run.
+    thread_rtz = os.environ.get('MOTORSTORM_BUILD_IOS_SPU_THREAD_RTZ') != '0'
     # Units holding ~90% of out-of-line store/coherence-check time in the
     # iPhone gameplay trace (logs/ios-vmx-01, main and physics threads).
     store_units = ('083;065;091;082;092;063;075;089;064;060;070;000;055;002;076;056;081;062;069;068'
@@ -81,6 +85,8 @@ def main():
                 '-DMOTORSTORM_JOB_ARITHMETIC=ON',
                 '-DMOTORSTORM_INLINE_STORES=' + ('ON' if inline_stores else 'OFF'),
                 f'-DMOTORSTORM_INLINE_STORE_UNITS={store_units}',
+                '-DMOTORSTORM_SPU_FLOAT_PROBE=' + ('ON' if float_probe else 'OFF'),
+                '-DMOTORSTORM_SPU_THREAD_RTZ=' + ('ON' if thread_rtz else 'OFF'),
                 '-DMOTORSTORM_VMX_BENCHMARK=' + ('ON' if os.environ.get(
                     'MOTORSTORM_BUILD_VMX_BENCHMARK') == '1' else 'OFF'),
                 '-DMOTORSTORM_AUDIO_BENCHMARK=' + ('ON' if os.environ.get(
@@ -126,7 +132,9 @@ def main():
             config = {'environment': values, 'files': files,
                       'build_options': {'ppu_vmx_units': vmx_units.split(';'),
                                         'ppu_vmx_arithmetic': ios_vmx,
-                                        'ppu_inline_store_units': store_units.split(';') if store_units else []}}
+                                        'ppu_inline_store_units': store_units.split(';') if store_units else [],
+                                        'spu_float_probe': float_probe,
+                                        'spu_thread_rtz': thread_rtz}}
         else:
             config = {'root': str(root), 'environment': environment(root)}
         write_changed(resources / 'MotorStormLaunch.json', json.dumps(config, indent=2, ensure_ascii=False) + '\n')

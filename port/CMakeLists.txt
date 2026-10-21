@@ -408,6 +408,50 @@ if(MOTORSTORM_APPROX_HOT_SPU)
     set_property(SOURCE "${SPU_DIR}/jobmod_be896a6374ba_e12230/spu_recomp.c"
         APPEND PROPERTY COMPILE_OPTIONS "-include;${CMAKE_CURRENT_SOURCE_DIR}/spu_float_approx_experiment.h")
 endif()
+# Measurement-only: runtime-switched hardware single precision in every SPU
+# unit, to bound the gain of exact native rounding. Changes results when on.
+option(MOTORSTORM_SPU_FLOAT_PROBE "Measurement: runtime-switched IEEE single precision in all SPU units" OFF)
+if(MOTORSTORM_SPU_FLOAT_PROBE)
+    if(MOTORSTORM_APPROX_HOT_SPU)
+        message(FATAL_ERROR "The SPU float probe and hot SPU experiment cannot be combined")
+    endif()
+    if(NOT APPLE OR NOT CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
+        message(FATAL_ERROR "The SPU float probe requires Apple ARM64")
+    endif()
+    target_sources(${PROJECT_NAME} PRIVATE spu_float_probe.c)
+    set_property(SOURCE ${SPU_SOURCES}
+        APPEND PROPERTY COMPILE_OPTIONS "-include;${CMAKE_CURRENT_SOURCE_DIR}/spu_float_probe.h")
+endif()
+
+# Exact hardware single-precision while an SPU context is on the host
+# thread (FPCR round-toward-zero). Interpreter and lifted units share the
+# same helpers. The approximate probe above changes results; this path does
+# not. macOS keeps the option off unless a task explicitly enables it.
+option(MOTORSTORM_SPU_THREAD_RTZ "Exact native RTZ SPU floats during SPU execution" OFF)
+if(MOTORSTORM_SPU_THREAD_RTZ)
+    if(NOT APPLE OR NOT CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
+        message(FATAL_ERROR "Thread RTZ SPU floats require Apple ARM64")
+    endif()
+    if(MOTORSTORM_SPU_FLOAT_PROBE OR MOTORSTORM_APPROX_HOT_SPU)
+        message(FATAL_ERROR "Thread RTZ cannot be combined with approximate SPU float probes")
+    endif()
+    target_sources(${PROJECT_NAME} PRIVATE spu_thread_rtz.c)
+    if(SPU_SOURCES)
+        set_property(SOURCE ${SPU_SOURCES} APPEND PROPERTY
+            COMPILE_DEFINITIONS MOTORSTORM_SPU_THREAD_RTZ)
+        set_property(SOURCE ${SPU_SOURCES} APPEND PROPERTY
+            COMPILE_OPTIONS "-include;${CMAKE_CURRENT_SOURCE_DIR}/spu_thread_rtz.h;-ffp-contract=off")
+    endif()
+    set_property(SOURCE "${PS3RECOMP_DIR}/runtime/spu/spu_interp.c"
+        TARGET_DIRECTORY ps3recomp_runtime
+        APPEND PROPERTY COMPILE_DEFINITIONS MOTORSTORM_SPU_THREAD_RTZ)
+    set_property(SOURCE "${PS3RECOMP_DIR}/runtime/spu/spu_interp.c"
+        TARGET_DIRECTORY ps3recomp_runtime
+        APPEND PROPERTY INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}")
+    set_property(SOURCE "${PS3RECOMP_DIR}/runtime/spu/spu_interp.c"
+        TARGET_DIRECTORY ps3recomp_runtime
+        APPEND PROPERTY COMPILE_OPTIONS "-include;${CMAKE_CURRENT_SOURCE_DIR}/spu_thread_rtz.h;-ffp-contract=off")
+endif()
 
 # app.rc carries the icon, the version block and the manifest, and needs a
 # resource compiler. Listing it as a source on a host that has none is not a
