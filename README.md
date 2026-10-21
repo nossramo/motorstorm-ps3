@@ -11,12 +11,34 @@ intermediate states as well as the current fixes.
 
 Open `MotorStorm/MotorStorm.xcodeproj`, select the **MotorStorm** scheme and
 **My Mac**, then press **Command-R**. Stop with Xcode's stop button before
-starting a separate Terminal build. The **MotorStorm iOS** target remains a
-starter and does not yet run the game.
+starting a separate Terminal build. iOS integration is being developed
+separately and is not included in this macOS checkpoint.
+
+**macOS is isolated from iOS work.** `port/macos-baseline.json` pins its engine
+to commit `04910a9c6667d3e0ac3d9d9b0443f75d28608c26`, the saved macOS Xcode
+integration. `tools/build_macos_runtime.py` restores that commit's authored
+sources, upstream runtime plus patch, generators and launch defaults into
+ignored `build/macos-stable/source`. It regenerates PPU/SPU code there from the
+local executable and builds into that snapshot's own `build/game`. It does not
+reuse the development tree's runtime, generated sources, objects or iOS build
+settings. Source checksums reject accidental edits to the snapshot. There is
+no automatic update to a newer commit; promoting the pin requires a separate
+macOS review and gameplay validation.
+The small macOS app entry point completes native-job registration after reading
+its bundle environment if the old runtime's static constructor skipped it.
+This preserves the earlier Terminal launch behavior without pulling iOS
+startup or diagnostic code into the pinned engine.
+
+The working-tree `port/`, `vendor/ps3recomp`, generated sources and
+`patches/ps3recomp-local.patch` are reserved for separate iOS development.
+That work must use its own `build/ios-game/` output and must not consume or
+modify the macOS snapshot. `tools/build_port.sh` and the normal Terminal play
+launchers now use the pinned macOS runtime too. Verify its source integrity
+with `python3 tools/build_macos_runtime.py --check`.
 
 The macOS app links the existing native runtime into its own process; it does
 not launch a second game executable. Xcode builds the small Objective-C++ app
-entry point; a build phase asks CMake/Ninja to update the shared game archive
+entry point; a build phase asks CMake/Ninja to update the pinned macOS archive
 and obtains its exact link dependencies through CMake's File API. The Terminal
 runner still works. Both use the same optimized game objects, even when the
 app scheme is Debug, to preserve the tested arithmetic and gameplay speed.
@@ -24,8 +46,8 @@ The native culling and VMX build specializations are explicitly enabled by
 `tools/build_port.sh`. A first build can take several minutes; later builds
 reuse unchanged objects. Requires CMake 3.24 or newer.
 
-`port/macos-launch.json` is the shared play profile for the Xcode app and
-`tools/play-experimental.command`. Xcode scheme environment overrides may be
+The pinned commit's `port/macos-launch.json` is the play profile for the Xcode
+app and `tools/play-experimental.command`. Xcode scheme environment overrides may be
 used for profiling. Game data, installed data/saves and shader caches remain
 in the existing local `game/`, `gamedata/` and `logs/` folders. A generated
 resource records the local project path; rebuild after moving the project.
@@ -39,12 +61,29 @@ signing to reject Finder metadata added by the file provider. Local ad-hoc
 signing is selected for macOS; an Apple Developer subscription is not required.
 The iOS target's signing settings are independent.
 
-Validation: the macOS scheme builds successfully and Command-R launches the
+Historical validation: the macOS scheme builds successfully and Command-R launches the
 native runtime under Xcode, with Metal presentation and CoreAudio initialized.
-The existing linker warning about reducing `__DATA,__common` alignment from
-32 KB to 16 KB is non-fatal. All 24 common symbols in the linked static
-archives request at most 16-byte alignment; the resulting section preserves
-that requirement. A full race has not yet been repeated through this app target.
+The Apple runtime C build uses `-fno-common` to give zero-initialized globals
+ordinary definitions, avoiding the linker's excessive common-block alignment
+and its `__DATA,__common` warning. The rebuilt app links without that warning;
+all affected globals have one definition, and the linked globals retain their
+required alignment.
+A full race has not yet been repeated through this app target.
+The isolated baseline predates that uncommitted `-fno-common` change. The macOS
+builder now reapplies that build fix through `tools/macos_runtime_options.cmake`,
+an explicit CMake include restricted to the runtime's C files. The pinned source
+stays unchanged, and iOS does not load this include. The alignment warning is
+fixed at compilation rather than suppressed at link time; other historical
+compiler warnings may still appear on a full rebuild.
+Restoration validation (21 October): both a fresh Derived Data build and the
+normal Xcode build succeeded. The 18-second app startup reached Metal rendering
+and initialized CoreAudio at 48 kHz stereo; the test then stopped the app.
+`tools/test_macos_isolation.py --compiled` checked 362 compile commands plus
+Xcode's link dependencies against the source boundary. Early/late native-job
+registration checks passed with ASan/UBSan. A full race is still required to
+reconfirm gameplay after the isolation. Of the 44 reported compiler warnings,
+43 also appeared in the clean pinned baseline; the iOS passive-metrics warning
+does not belong to that baseline. Local evidence: `logs/macos-isolation-01/`.
 
 ## Audio repair — 20 October 2026
 

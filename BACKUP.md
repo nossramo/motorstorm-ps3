@@ -87,6 +87,15 @@ generated link response and launch resource are local build output, not backup
 content. `port/macos-launch.json` preserves the shared launch defaults. Use
 Xcode's normal Derived Data location outside iCloud Drive for app products.
 
+The macOS target now builds an independent snapshot of the revision recorded
+in `port/macos-baseline.json`, via `tools/build_macos_runtime.py`. Keep that
+commit in Git history: its runtime patch and generators reconstruct the macOS
+version even while the working tree's sources and patch evolve for iOS.
+The generated snapshot and compiled files in `build/macos-stable/` are local
+only. The game assets are referenced, not copied or uploaded. The iOS target
+continues building the working tree; changing iOS source cannot change the
+pinned macOS source. Do not edit the generated macOS snapshot in place.
+
 ## Updating the backup
 
 Before committing further runtime changes:

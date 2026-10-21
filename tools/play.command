@@ -23,4 +23,4 @@ play_log="${MOTORSTORM_LOG:-logs/play.log}"
 printf 'MotorStorm research build. Drive: arrows, W/S, I/J/K/L. Space: boost; Shift: handbrake.\n'
 printf 'Menus: arrows navigate, Enter confirm/start, Escape back or pause/resume.\n'
 printf 'Stop with Ctrl-C in this terminal. Output: %s\n' "$play_log"
-exec ./build/game/MotorStormRecomp ./game/PS3_GAME/USRDIR/EBOOT.elf > "$play_log" 2>&1
+exec ./build/macos-stable/source/build/game/MotorStormRecomp ./game/PS3_GAME/USRDIR/EBOOT.elf > "$play_log" 2>&1

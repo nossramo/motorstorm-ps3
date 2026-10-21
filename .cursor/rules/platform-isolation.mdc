@@ -1,0 +1,7 @@
+---
+description: Preserve the separation between the stable macOS build and iOS development
+alwaysApply: true
+---
+
+Read and follow the repository-root `AGENTS.md` before changing this project.
+It is the canonical policy for macOS/iOS source, build and validation isolation.

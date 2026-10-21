@@ -1,0 +1,4 @@
+{
+  "commit": "04910a9c6667d3e0ac3d9d9b0443f75d28608c26",
+  "description": "Validated macOS runtime before iOS development; promote only after macOS gameplay validation."
+}

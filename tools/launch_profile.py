@@ -12,7 +12,8 @@ def environment(root):
 
 
 if __name__ == '__main__':
+    from build_macos_runtime import macos_environment
     root = Path(__file__).resolve().parents[1]
     # Values are shell-quoted, including project paths containing spaces.
-    for key, value in environment(root).items():
+    for key, value in macos_environment(root).items():
         print(f'export {key}={shlex.quote(os.environ.get(key) or value)}')

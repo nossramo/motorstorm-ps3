@@ -4,6 +4,7 @@
 #include <unistd.h>
 
 extern "C" int motorstorm_main(int argc, char** argv);
+extern "C" void port_jobmods_register_all(void);
 
 static int launchError(NSString *message)
 {
@@ -21,6 +22,12 @@ static int launchError(NSString *message)
 
 int main(int argc, char **argv)
 {
+    // The pinned runtime registers native jobs in a static constructor only
+    // when the launch environment already exists (as it does in Terminal).
+    // AppKit loads the bundle profile below, so finish that same registration
+    // once here when the constructor skipped it. Keep this in the macOS app,
+    // without importing the iOS runtime's startup/diagnostics changes.
+    const bool jobsRegisteredBeforeMain = getenv("MOTORSTORM_NATIVE_JOBS") != nullptr;
     @autoreleasepool {
         // Build-time local paths stay inside the ignored app product. The app
         // reads the existing game/install/saves; it never bundles the PS3 data.
@@ -45,12 +52,17 @@ int main(int argc, char **argv)
             // Scheme overrides remain useful for Instruments and GPU captures.
             setenv(key.UTF8String, value.UTF8String, 0);
         }
+        if (!jobsRegisteredBeforeMain && getenv("MOTORSTORM_NATIVE_JOBS"))
+            port_jobmods_register_all();
         const char *cache = getenv("PS3RECOMP_MSL_CACHE");
         NSError *error = nil;
         if (cache && ![[NSFileManager defaultManager] createDirectoryAtPath:[NSString stringWithUTF8String:cache]
                 withIntermediateDirectories:YES attributes:nil error:&error])
             return launchError([NSString stringWithFormat:@"Cannot create the shader cache: %@", error.localizedDescription]);
         fprintf(stderr, "[app] native runtime; project=%s\n", root.fileSystemRepresentation);
+        NSString *revision = config[@"source_commit"];
+        if ([revision isKindOfClass:[NSString class]])
+            fprintf(stderr, "[app] macOS source baseline=%s\n", revision.UTF8String);
 
         [NSApplication sharedApplication];
         NSMenu *menu = [[NSMenu alloc] initWithTitle:@"MotorStorm"];

@@ -1,13 +1,6 @@
 #!/bin/sh
 set -eu
 cd "$(dirname "$0")/.."
-export DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}"
-if [ -f game/PS3_GAME/USRDIR/EBOOT.elf ] && [ -d port/spu ]; then
-  python3 tools/lift_motorstorm_audio.py
-fi
-cmake -S port -B build/game -G Ninja \
-  -DPS3RECOMP_DIR="$PWD/vendor/ps3recomp" -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_OSX_ARCHITECTURES=arm64 \
-  -DPS3RECOMP_FFMPEG_RUNTIME=ON \
-  -DMOTORSTORM_CULL_SCOPE=ON -DMOTORSTORM_NEON_VMX=ON
-cmake --build build/game -j "${BUILD_JOBS:-4}"
+# The pinned snapshot contains the original builder. iOS continues to build
+# the development tree through build_xcode_runtime.py.
+exec python3 tools/build_macos_runtime.py --build-only
