@@ -12,8 +12,12 @@
 #include <atomic>
 extern "C" void cellGcm_fifo_kick(void);
 namespace {
-std::mutex mutex;
-std::condition_variable changed;
+// Guest process exit can run C++ static destructors while the render and PPU
+// workers are still alive. Keep their rendezvous valid until OS process
+// teardown; destroying it early turns a guest exit into a host mutex abort.
+// There is one pair per process, reclaimed with the process itself.
+std::mutex& mutex = *new std::mutex;
+std::condition_variable& changed = *new std::condition_variable;
 std::thread::id owner;
 struct Request { uint32_t address, bytes; bool done = false; Request* next = nullptr; };
 Request* head;

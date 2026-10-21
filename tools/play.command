@@ -3,6 +3,12 @@ set -eu
 cd "$(dirname "$0")/.."
 export PS3_TITLE='MotorStorm — arrows: drive/menu · Space: boost · Shift: handbrake'
 export PS3_HLE_UNRESOLVED=fail
+# Normal play does not need per-wait/per-signal diagnostics. Errors and
+# explicitly enabled probes remain visible; PS3_VERBOSE=1 restores full logs.
+export PS3_VERBOSE="${PS3_VERBOSE:-0}"
+# Validated with the player-driven race in run 27. Explicit SPU diagnostics
+# still select the complete dispatch hook inside the runtime.
+export SPU_FAST_DISPATCH="${SPU_FAST_DISPATCH:-1}"
 # Multistream loads DSP code into SPU local store at runtime. Continue through
 # the interpreter for those unlifted overlays, then rejoin the compiled code.
 export SPU_INTERP_UNLIFTED="${SPU_INTERP_UNLIFTED:-1}"

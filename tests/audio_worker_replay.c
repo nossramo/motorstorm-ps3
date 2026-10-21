@@ -45,7 +45,7 @@ void spu_img_restore(spu_context* ctx, int image) { assert_host_mode(); assert(c
 extern void spu_1136862334bb6208f794040f3a7f26e4991cd6b00eac6229331432566f1535d1_spu_recomp_register(void);
 
 static double now(void) {
-    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    struct timespec ts; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
     return ts.tv_sec + ts.tv_nsec * 1e-9;
 }
 static void test_arithmetic(void) {
@@ -63,10 +63,11 @@ static void test_arithmetic(void) {
         u128 want[] = {spu_fa_ref(a,b),spu_fs_ref(a,b),spu_fm_ref(a,b),spu_fma_ref(a,b,c),spu_fms_ref(a,b,c)};
         uint64_t old = ms_rtz_enter();
         u128 got[] = {ms_rtz_fa(a,b,old),ms_rtz_fs(a,b,old),ms_rtz_fm(a,b,old),ms_rtz_fma(a,b,c,old),ms_audio_rtz_fms(a,b,c,old)};
+        u128 compact[] = {ms_audio_compact_fa(a,b,old),ms_audio_compact_fs(a,b,old),ms_audio_compact_fm(a,b,old),ms_audio_compact_fma(a,b,c,old),ms_audio_compact_fms(a,b,c,old)};
         ms_rtz_leave(old);
-        if (memcmp(want,got,sizeof want)) { fprintf(stderr,"Arithmetic mismatch at %u\n",i); abort(); }
+        if (memcmp(want,got,sizeof want) || memcmp(want,compact,sizeof want)) { fprintf(stderr,"Arithmetic mismatch at %u\n",i); abort(); }
     }
-    puts("PASS: 4 million arithmetic lane comparisons, including extended floats and boundaries");
+    puts("PASS: 8 million arithmetic lane comparisons, including extended floats and boundaries");
 }
 static double execute(spu_context* ctx, int merged) {
     *ctx = input; ctx->ls = ctx->ls_store;
@@ -91,8 +92,9 @@ int main(int argc, char** argv) {
         assert(fgetc(file) == EOF); fclose(file);
         assert(input.image_id == 286484578 && !input.policy_mode);
         assert(input.pc < SPU_LS_SIZE && functions[input.pc / 4]);
-        double old_time = 0, new_time = 0, scoped_time = 0;
-        for (unsigned repeat = 0; repeat < 100; ++repeat) {
+        double old_time = 0, new_time = 0, scoped_time = 0, compact_time = 0;
+        const unsigned repeats = 1000;
+        for (unsigned repeat = 0; repeat < repeats; ++repeat) {
             old_time += execute(&reference, 0);
             new_time += execute(&candidate, 1);
             assert(reference.pc == candidate.pc && reference.status == candidate.status);
@@ -100,14 +102,21 @@ int main(int argc, char** argv) {
                 memcmp(reference.ls_store, candidate.ls_store, SPU_LS_SIZE)) {
                 fprintf(stderr, "State mismatch: %s\n", argv[file_index]); return 1;
             }
-            scoped_time += execute(&candidate, 2);
-            assert(reference.pc == candidate.pc && reference.status == candidate.status);
-            if (memcmp(reference.gpr, candidate.gpr, sizeof reference.gpr) ||
-                memcmp(reference.ls_store, candidate.ls_store, SPU_LS_SIZE)) {
-                fprintf(stderr, "Scoped state mismatch: %s\n", argv[file_index]); return 1;
+            /* Alternate candidate/reference order to reduce thermal and
+             * scheduling bias. The clock measures this thread's CPU work. */
+            for (unsigned order = 0; order < 2; ++order) {
+                int mode = 2 + ((repeat + order) & 1);
+                double elapsed = execute(&candidate, mode);
+                if (mode == 2) scoped_time += elapsed; else compact_time += elapsed;
+                assert(reference.pc == candidate.pc && reference.status == candidate.status);
+                if (memcmp(reference.gpr, candidate.gpr, sizeof reference.gpr) ||
+                    memcmp(reference.ls_store, candidate.ls_store, SPU_LS_SIZE)) {
+                    fprintf(stderr, "Scoped mode %d mismatch: %s\n", mode, argv[file_index]); return 1;
+                }
             }
         }
-        printf("PASS %s: all registers/LS/FPCR, original %.4f ms merged %.4f ms scoped %.4f ms\n",
-               argv[file_index], old_time * 10, new_time * 10, scoped_time * 10);
+        printf("PASS %s: all registers/LS/FPCR, original %.4f ms merged %.4f ms scoped %.4f ms compact %.4f ms\n",
+               argv[file_index], old_time * 1000 / repeats, new_time * 1000 / repeats,
+               scoped_time * 1000 / repeats, compact_time * 1000 / repeats);
     }
 }

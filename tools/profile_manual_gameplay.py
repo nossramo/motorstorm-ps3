@@ -31,6 +31,18 @@ def main():
     out = args.out.resolve()
     trigger = out / 'trigger.txt'
     if args.action == 'start':
+        # A second game invalidates CPU/energy comparisons. In particular,
+        # sending SIGTERM does not prove the previous process has exited.
+        processes = subprocess.run(['ps', '-axo', 'pid=,comm='],
+                                   capture_output=True, text=True, check=True)
+        running = []
+        for line in processes.stdout.splitlines():
+            fields = line.strip().split(None, 1)
+            if len(fields) == 2 and Path(fields[1]).name == 'MotorStormRecomp':
+                running.append(fields[0])
+        if running:
+            parser.error('MotorStorm is still running (PID ' + ', '.join(running) +
+                         '); stop it and verify exit before starting a comparison')
         if out.exists():
             parser.error('Use a fresh output directory; existing evidence is preserved')
         env = dict(os.environ)

@@ -9,6 +9,11 @@
 extern "C" void motorstorm_gpu_sync_init();
 extern "C" void motorstorm_gpu_sync_service();
 extern "C" int motorstorm_gpu_sync_pending();
+// Register before normal C++ static constructors, so this runs after their
+// destructors. The render worker can still service requests during guest exit.
+__attribute__((constructor(101))) static void check_late_exit_service() {
+    std::atexit([] { motorstorm_gpu_sync_service(); });
+}
 static std::thread::id render_thread;
 static std::atomic<unsigned> calls;
 static std::mutex wake_mutex;

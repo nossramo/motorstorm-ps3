@@ -1136,7 +1136,7 @@ index 9ab90ee..c5da909 100644
  } CellAudioOutDeviceInfo;
  
 diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
-index 015913a..4cd8d43 100644
+index 015913a..ec15d75 100644
 --- a/libs/spurs/cellSpurs.c
 +++ b/libs/spurs/cellSpurs.c
 @@ -11,6 +11,7 @@
@@ -1161,7 +1161,17 @@ index 015913a..4cd8d43 100644
      SRWLOCK lock;
      CONDITION_VARIABLE wake;
      HANDLE coordinator;
-@@ -1534,7 +1536,8 @@ s32 cellSpursAddWorkloadWithAttribute(CellSpurs* spurs,
+@@ -1290,7 +1292,8 @@ s32 cellSpursSendSignal(CellSpursTaskset* taskset, CellSpursTaskId taskId)
+      * waiter (spu_taskset_wait_signal) keys on the guest EA + taskId. */
+     uint32_t taskset_ea = (uint32_t)(uintptr_t)taskset;
+ 
+-    printf("[cellSpurs] SendSignal(taskset=0x%08X id=%u)\n", taskset_ea, taskId);
++    if (ps3_log_verbose())
++        printf("[cellSpurs] SendSignal(taskset=0x%08X id=%u)\n", taskset_ea, taskId);
+ 
+     /* Deliver the signal for real: set the task's bit in the guest taskset's
+      * SIGNALLED bitset and wake its blocked host thread. (Was a documented
+@@ -1534,7 +1537,8 @@ s32 cellSpursAddWorkloadWithAttribute(CellSpurs* spurs,
   * r3..r10; writes the REAL BE layout so AddWorkloadWithAttribute round-trips. */
  s32 _cellSpursWorkloadAttributeInitialize(u64 attr_ea, u32 revision, u32 sdkVersion,
                                            u64 pm_ea, u32 size, u64 data,
@@ -1171,7 +1181,7 @@ index 015913a..4cd8d43 100644
  {
      if (!attr_ea) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
      vm_write32((u32)attr_ea + WKATTR_REVISION,   revision);
-@@ -1546,16 +1549,29 @@ s32 _cellSpursWorkloadAttributeInitialize(u64 attr_ea, u32 revision, u32 sdkVers
+@@ -1546,16 +1550,29 @@ s32 _cellSpursWorkloadAttributeInitialize(u64 attr_ea, u32 revision, u32 sdkVers
          *(vm_base + (u32)attr_ea + WKATTR_PRIORITY + i) =
              prio_ea ? *(vm_base + (u32)prio_ea + i) : 0;
      vm_write32((u32)attr_ea + WKATTR_MIN_CONT, minContention);
@@ -1204,7 +1214,7 @@ index 015913a..4cd8d43 100644
  s32 cellSpursWorkloadAttributeSetName(u64 attr_ea, u64 nameClass_ea, u64 nameInstance_ea)
  {
      if (!attr_ea) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
-@@ -1659,6 +1675,7 @@ static WklPm* spurs_resolve_pm(u32 wid)
+@@ -1659,6 +1676,7 @@ static WklPm* spurs_resolve_pm(u32 wid)
   * never runs under that lock, and only a genuine return releases contention. */
  static DWORD WINAPI spurs_pm_worker(LPVOID p)
  {
@@ -1212,7 +1222,7 @@ index 015913a..4cd8d43 100644
      struct SpursPmSlot* slot = (struct SpursPmSlot*)p;
      struct SpursInst* si = slot->instance;
  #ifdef _WIN32
-@@ -1667,7 +1684,8 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
+@@ -1667,7 +1685,8 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
      AcquireSRWLockExclusive(&si->lock);
      for (;;) {
          while (!slot->busy && !si->stopping)
@@ -1222,7 +1232,7 @@ index 015913a..4cd8d43 100644
          if (si->stopping && !slot->busy) break;
          ReleaseSRWLockExclusive(&si->lock);
          spu_run_policy_module(slot->fn, slot->image_id, slot->pm, slot->pm_size,
-@@ -1691,6 +1709,7 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
+@@ -1691,6 +1710,7 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
  
  static DWORD WINAPI spurs_kernel_thread(LPVOID p)
  {
@@ -1230,7 +1240,7 @@ index 015913a..4cd8d43 100644
      struct SpursInst* si = (struct SpursInst*)p;
      int disabled = getenv("PS3_NO_SPURS_PM") != NULL;
      AcquireSRWLockExclusive(&si->lock);
-@@ -1741,7 +1760,11 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+@@ -1741,7 +1761,11 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
                  vm_base[ea + SPURS_WKL_CURCONT + wid] = si->active[wid];
                  ef_line_end(ea);
                  slot->busy = 1;
@@ -1243,7 +1253,7 @@ index 015913a..4cd8d43 100644
                  break;
              }
          }
-@@ -1753,12 +1776,16 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
+@@ -1753,12 +1777,16 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
  
  static s32 spurs_scheduler_start(struct SpursInst* si)
  {
@@ -1260,7 +1270,7 @@ index 015913a..4cd8d43 100644
          slot->instance = si; slot->spu_num = sn;
          slot->thread = CreateThread(NULL, 1u << 20, spurs_pm_worker, slot, 0, NULL);
          if (!slot->thread) goto failed;
-@@ -1769,6 +1796,8 @@ static s32 spurs_scheduler_start(struct SpursInst* si)
+@@ -1769,6 +1797,8 @@ static s32 spurs_scheduler_start(struct SpursInst* si)
  failed:
      AcquireSRWLockExclusive(&si->lock);
      si->stopping = 1; WakeAllConditionVariable(&si->wake);
@@ -1269,7 +1279,7 @@ index 015913a..4cd8d43 100644
      ReleaseSRWLockExclusive(&si->lock);
      for (u32 sn = 0; sn < si->nspus; sn++) {
          HANDLE h = si->slots[sn].thread;
-@@ -1788,6 +1817,8 @@ static s32 spurs_scheduler_stop(struct SpursInst* si, u32 ea)
+@@ -1788,6 +1818,8 @@ static s32 spurs_scheduler_stop(struct SpursInst* si, u32 ea)
      for (u32 wid = 0; wid < 16; wid++)
          if (si->active[wid]) { ReleaseSRWLockExclusive(&si->lock); return CELL_SPURS_CORE_ERROR_BUSY; }
      si->stopping = 1; WakeAllConditionVariable(&si->wake);
@@ -1278,6 +1288,16 @@ index 015913a..4cd8d43 100644
      ReleaseSRWLockExclusive(&si->lock);
      if (si->coordinator) { WaitForSingleObject(si->coordinator, INFINITE); CloseHandle(si->coordinator); si->coordinator = NULL; }
      for (u32 sn = 0; sn < si->nspus; sn++) {
+@@ -2178,7 +2210,8 @@ s32 _cellSpursEventFlagInitialize(void* spurs, void* taskset,
+ s32 _cellSpursSendSignal(void* taskset, u32 taskId)
+ {
+     uint32_t taskset_ea = (uint32_t)(uintptr_t)taskset;
+-    printf("[cellSpurs] _SendSignal(taskset=0x%08X id=%u)\n", taskset_ea, taskId);
++    if (ps3_log_verbose())
++        printf("[cellSpurs] _SendSignal(taskset=0x%08X id=%u)\n", taskset_ea, taskId);
+     /* Real delivery now that SPU tasks execute (comment was stale). */
+     if (taskset_ea) spu_taskset_signal_task(taskset_ea, taskId);
+     return CELL_OK;
 diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
 index d7c6f5e..e021fad 100644
 --- a/libs/video/cellGcmSys.c
@@ -7445,7 +7465,7 @@ index d9ce0c3..2a67d03 100644
      }
      g_last_hle_name = e->name;
 diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
-index 148be1f..ffa2a87 100644
+index 148be1f..cdc2558 100644
 --- a/runtime/ppu/ppu_loader.cpp
 +++ b/runtime/ppu/ppu_loader.cpp
 @@ -1,3 +1,4 @@
@@ -7453,7 +7473,45 @@ index 148be1f..ffa2a87 100644
  /*
   * ps3recomp - PPU runtime loader
   *
-@@ -1558,7 +1559,7 @@ static struct VmInlineInit {
+@@ -1209,12 +1210,28 @@ static uint32_t g_tls_vaddr = 0, g_tls_filesz = 0, g_tls_memsz = 0;
+  * memory and stays on the fast path (spu_raw_is_reg excludes it). */
+ #include "../spu/spu_raw.h"
+ 
++extern "C" void ppu_dump_guest_stack(ppu_context*, const char*);
+ static int vm_oob_report(uint32_t a, uint32_t n)
+ {
+     {
+         static int logged = 0;
+-        if (logged < 40) {
++        const int index = __atomic_fetch_add(&logged, 1, __ATOMIC_RELAXED);
++        if (index < 40) {
+             fprintf(stderr, "[vm] OOB access 0x%08X (+%u)\n", a, n);
++#ifndef _WIN32
++            // Capture the first invalid access, before later null reads obscure
++            // its origin. This is confined to the already-invalid cold path.
++            if (index == 0) {
++                char caller[100]; ppu_guest_caller(caller, sizeof caller);
++                fprintf(stderr, "[vm-oob] first caller=%s\n", caller);
++                ppu_dump_guest_stack(g_active_ctx, "first-oob");
++                void* frames[24];
++                const unsigned short count = RtlCaptureStackBackTrace(0, 24, frames, 0);
++                for (unsigned short i = 0; i < count; ++i)
++                    fprintf(stderr, "[vm-oob] host #%u %p guest=%08X\n", i,
++                            frames[i], ppu_prof_resolve_host(frames[i]));
++            }
++#endif
+ #ifdef _WIN32
+             /* one-shot backtrace on the first OOB so the lifted caller is known */
+             static int bt = 0;
+@@ -1234,7 +1251,6 @@ static int vm_oob_report(uint32_t a, uint32_t n)
+                 }
+             }
+ #endif
+-            logged++;
+         }
+         return 1;
+     }
+@@ -1558,7 +1574,7 @@ static struct VmInlineInit {
      }
  } s_vm_inline_init;
  
@@ -7462,7 +7520,7 @@ index 148be1f..ffa2a87 100644
      if ((uint32_t)a < 0x10000u) ppu_null_read_report((uint32_t)a, 1, __builtin_return_address(0));
  #ifdef VM_SAMPLE_READS
      { static uint64_t c=0; if ((++c % 2000000ull)==0) fprintf(stderr, "[sample] read8  0x%08X ra0=%p ra1=%p\n", (uint32_t)a, __builtin_return_address(0), __builtin_return_address(1)); }
-@@ -1594,11 +1595,11 @@ uint8_t  vm_read8 (uint64_t a) { if (vm_oob((uint32_t)a,1)) return 0; vm_hotmap(
+@@ -1594,11 +1610,11 @@ uint8_t  vm_read8 (uint64_t a) { if (vm_oob((uint32_t)a,1)) return 0; vm_hotmap(
            n=0; } }
        else { last=(uint32_t)a; n=0; } }
      return vm_base[(uint32_t)a]; }
@@ -7476,7 +7534,7 @@ index 148be1f..ffa2a87 100644
      if ((uint32_t)a < 0x10000u) ppu_null_read_report((uint32_t)a, 4, __builtin_return_address(0));
      /* Raw SPU problem state: reading the outbound mailbox POPS it, so that one
       * cannot be served out of memory. Everything else in the window the SPU
-@@ -1711,7 +1712,7 @@ uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0; ppu_rwatch
+@@ -1711,7 +1727,7 @@ uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0; ppu_rwatch
        } }
        else { last=(uint32_t)a; n=0; } }
      return __builtin_bswap32(v); }
@@ -7485,7 +7543,7 @@ index 148be1f..ffa2a87 100644
      if ((uint32_t)a < 0x10000u) ppu_null_read_report((uint32_t)a, 8, __builtin_return_address(0)); uint64_t v; memcpy(&v, vm_base + (uint32_t)a, 8);
  #ifdef VM_SAMPLE_READS
      { static uint64_t c=0; if ((++c % 2000000ull)==0) fprintf(stderr, "[sample] read64 0x%08X\n", (uint32_t)a); }
-@@ -1772,7 +1773,15 @@ static void ww_arm_inline_window(uint32_t ww)
+@@ -1772,7 +1788,15 @@ static void ww_arm_inline_window(uint32_t ww)
      g_ww_lo = ww & ~15u;
      g_ww_hi = (ww & ~15u) + len;
  }
@@ -7502,7 +7560,7 @@ index 148be1f..ffa2a87 100644
  {
      /* PPU_WVAL=<hexvalue>: log every PPU store that WRITES this value, wherever
       * it lands. PPU_WWATCH answers "who writes this address"; when a bad value is
-@@ -1893,6 +1902,18 @@ static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra
+@@ -1893,6 +1917,18 @@ static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra
      }
  }
  
@@ -7521,7 +7579,7 @@ index 148be1f..ffa2a87 100644
  /* See the note on the forward declaration above ppu_stwcx32. */
  extern "C" void ppu_ww_note_atomic(uint32_t ea, uint32_t val, int width, void* ra)
  {
-@@ -3082,6 +3103,7 @@ extern "C" void lv2_syscall(ppu_context* ctx)
+@@ -3082,6 +3118,7 @@ extern "C" void lv2_syscall(ppu_context* ctx)
      struct _ScGuard {
          ppu_context* c; uint64_t num, t0; uint32_t lr;
          ~_ScGuard() { unsigned t = (unsigned)c->thread_id;
@@ -7529,7 +7587,7 @@ index 148be1f..ffa2a87 100644
                        if (t < PS3_SC_INFLIGHT_MAX) g_sc_inflight[t] = 0;
                        if (PS3_FT_ON() && t0) {
                            const uint64_t t1 = ps3_ft_now();
-@@ -3090,6 +3112,7 @@ extern "C" void lv2_syscall(ppu_context* ctx)
+@@ -3090,6 +3127,7 @@ extern "C" void lv2_syscall(ppu_context* ctx)
                                ps3_ft_span(PS3_FT_SYSCALL, t, (uint32_t)num, lr, t0, t1);
                        } }
      } _sg{ ctx, num, PS3_FT_ON() ? ps3_ft_now() : 0, (uint32_t)ctx->lr };
@@ -7537,7 +7595,7 @@ index 148be1f..ffa2a87 100644
      { unsigned t = (unsigned)ctx->thread_id;
        if (t < PS3_SC_INFLIGHT_MAX) g_sc_inflight[t] = (uint32_t)num; }
      /* Guest-PC breadcrumb for the sampling profiler: record the syscall
-@@ -3676,6 +3699,11 @@ extern "C" void ppu_register_opd_fixup(uint32_t opd, uint32_t code, uint32_t toc
+@@ -3676,6 +3714,11 @@ extern "C" void ppu_register_opd_fixup(uint32_t opd, uint32_t code, uint32_t toc
          s_opd_fixups[s_opd_fixup_n].code = code; s_opd_fixups[s_opd_fixup_n].toc = toc; s_opd_fixup_n++; }
  }
  
@@ -7549,7 +7607,7 @@ index 148be1f..ffa2a87 100644
  extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
                                     uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
                                     uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
-@@ -3707,7 +3735,7 @@ extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
+@@ -3707,7 +3750,7 @@ extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
  
      ppu_context ctx;
      memset(&ctx, 0, sizeof(ctx));
@@ -7558,7 +7616,7 @@ index 148be1f..ffa2a87 100644
      ctx.gpr[2]  = toc;
      ctx.gpr[3]  = a0; ctx.gpr[4] = a1; ctx.gpr[5] = a2; ctx.gpr[6] = a3;
      ctx.gpr[7]  = a4; ctx.gpr[8] = a5; ctx.gpr[9] = a6; ctx.gpr[10] = a7;
-@@ -3752,7 +3780,7 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
+@@ -3752,7 +3795,7 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
  
      ppu_context ctx;
      memset(&ctx, 0, sizeof(ctx));
@@ -7567,6 +7625,33 @@ index 148be1f..ffa2a87 100644
      ctx.gpr[2]  = toc;
      ctx.gpr[3]  = a0; ctx.gpr[4] = a1; ctx.gpr[5] = a2; ctx.gpr[6] = a3;
      ctx.gpr[7]  = a4; ctx.gpr[8] = a5; ctx.gpr[9] = a6; ctx.gpr[10] = a7;
+diff --git a/runtime/ppu/ppu_sysprx.cpp b/runtime/ppu/ppu_sysprx.cpp
+index 2362631..ba59f7f 100644
+--- a/runtime/ppu/ppu_sysprx.cpp
++++ b/runtime/ppu/ppu_sysprx.cpp
+@@ -13,6 +13,7 @@
+ #define PPU_NO_INLINE_LOADS   /* declares its own out-of-line vm_read* below */
+ #include "ppu_recomp.h"     /* ppu_context */
+ #include "ps3emu/nid.h"     /* ps3_compute_nid */
++#include "ps3emu/error_codes.h"
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -269,7 +270,13 @@ static void sys_lwmutex_trylock(ppu_context* ctx)
+             ctx->gpr[3] = 0;
+             return;
+         }
+-        if (WaitForSingleObject(s, 0) != WAIT_OBJECT_0) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000Bu; return; } // EBUSY
++        if (WaitForSingleObject(s, 0) != WAIT_OBJECT_0) {
++            // A failed nonblocking acquire is EBUSY, not ETIMEDOUT. Games
++            // branch on EBUSY to enter their blocking-lock fallback; returning
++            // a timeout here let MotorStorm use shared file buffers unlocked.
++            ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_EBUSY;
++            return;
++        }
+     }
+     if (lwm_trace()) { struct LwmSlot* sl = lwm_find(lwm); if (sl) { sl->holder = (long)self; sl->acq_us = lwm_now_us(); sl->acq_fences = g_gcm_ref_pub_count; sl->acq_cpu_us = ppu_thread_cpu_us(self); } }
+     vm_write32(lwm + LWM_OWNER, self);
 diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
 index dbea35b..278d153 100644
 --- a/runtime/spu/spu_channels.c

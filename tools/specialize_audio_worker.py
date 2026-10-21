@@ -90,13 +90,18 @@ def generate(output):
         optimized = fresh[fresh_begin:fresh_end].replace(f'void {name}(', f'static void ms_audio_merged_{entry:X}(', 1)
         reference = old_body.replace(f'void {name}(', f'static void ms_audio_reference_{entry:X}(', 1)
         scoped = arithmetic_scope(optimized, entry)
+        compact = scoped.replace(f'ms_audio_scoped_{entry:X}(', f'ms_audio_compact_{entry:X}(', 1)
+        for op in ('fa', 'fs', 'fm', 'fma'):
+            compact = compact.replace('ms_rtz_' + op + '(', 'ms_audio_compact_' + op + '(')
+        compact = compact.replace('ms_audio_rtz_fms(', 'ms_audio_compact_fms(')
         wrapper = f'''void {name}(spu_context* ctx) {{
     ms_audio_worker_capture(ctx, 0x{entry:X}, {index});
-    if (ms_audio_worker_mode() >= 2 && ms_audio_worker_scope_safe(ctx)) ms_audio_scoped_{entry:X}(ctx);
+    if (ms_audio_worker_mode() >= 3 && ms_audio_worker_scope_safe(ctx)) ms_audio_compact_{entry:X}(ctx);
+    else if (ms_audio_worker_mode() >= 2 && ms_audio_worker_scope_safe(ctx)) ms_audio_scoped_{entry:X}(ctx);
     else if (ms_audio_worker_mode()) ms_audio_merged_{entry:X}(ctx);
     else ms_audio_reference_{entry:X}(ctx);
 }}'''
-        source = source.replace(old_body, reference + '\n' + optimized + '\n' + scoped + '\n' + wrapper, 1)
+        source = source.replace(old_body, reference + '\n' + optimized + '\n' + scoped + '\n' + compact + '\n' + wrapper, 1)
         additions.append(f'{entry:05X}-{groups[entry]:05X}')
     if lifter.unsupported:
         raise SystemExit('Unsupported instructions in merged audio loops.')

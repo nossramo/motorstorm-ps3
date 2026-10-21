@@ -14,6 +14,41 @@ static inline u128 ms_audio_rtz_fms(u128 a, u128 b, u128 c, uint64_t old) {
     uint32x4_t negative_c = veorq_u32(vld1q_u32(c._u32), vdupq_n_u32(0x80000000));
     return ms_rtz_fma(a, b, spu__nv_u128(negative_c), old);
 }
+/* Same scoped SPU arithmetic, with one horizontal operand-range reduction
+ * per instruction. Shifting left removes the sign without losing exponent
+ * information: exponent zero is below 0x01000000, exponent 255 starts at
+ * 0xff000000. Keep the exact extended/overflow fallback and positive zero. */
+static inline __attribute__((always_inline)) uint32x4_t ms_audio_compact_normalize(uint32x4_t x) {
+    return vandq_u32(x, vcgeq_u32(vshlq_n_u32(x, 1), vdupq_n_u32(0x01000000u)));
+}
+#define MS_AUDIO_COMPACT_BINARY(NAME, INSTRUCTION, OP) \
+static inline __attribute__((always_inline)) u128 NAME(u128 a,u128 b,uint64_t old) { \
+    uint32x4_t x=vld1q_u32(a._u32),y=vld1q_u32(b._u32),r; \
+    uint32x4_t magnitudes=vmaxq_u32(vshlq_n_u32(x,1),vshlq_n_u32(y,1)); \
+    if(vmaxvq_u32(magnitudes)>=0xff000000u)return ms_rtz_fallback(a,b,a,OP,old); \
+    x=ms_audio_compact_normalize(x);y=ms_audio_compact_normalize(y); \
+    __asm__ volatile(INSTRUCTION " %0.4s, %1.4s, %2.4s" : "=w"(r) : "w"(x),"w"(y)); \
+    if(vmaxvq_u32(vshlq_n_u32(r,1))>=0xfefffffeu)return ms_rtz_fallback(a,b,a,OP,old); \
+    return spu__nv_u128(ms_audio_compact_normalize(r)); \
+}
+MS_AUDIO_COMPACT_BINARY(ms_audio_compact_fa,"fadd",0)
+MS_AUDIO_COMPACT_BINARY(ms_audio_compact_fm,"fmul",1)
+#undef MS_AUDIO_COMPACT_BINARY
+static inline __attribute__((always_inline)) u128 ms_audio_compact_fs(u128 a,u128 b,uint64_t old) {
+    return ms_audio_compact_fa(a,spu__nv_u128(veorq_u32(vld1q_u32(b._u32),vdupq_n_u32(0x80000000u))),old);
+}
+static inline __attribute__((always_inline)) u128 ms_audio_compact_fma(u128 a,u128 b,u128 c,uint64_t old) {
+    uint32x4_t x=vld1q_u32(a._u32),y=vld1q_u32(b._u32),r=vld1q_u32(c._u32);
+    uint32x4_t magnitudes=vmaxq_u32(vmaxq_u32(vshlq_n_u32(x,1),vshlq_n_u32(y,1)),vshlq_n_u32(r,1));
+    if(vmaxvq_u32(magnitudes)>=0xff000000u)return ms_rtz_fallback(a,b,c,2,old);
+    x=ms_audio_compact_normalize(x);y=ms_audio_compact_normalize(y);r=ms_audio_compact_normalize(r);
+    __asm__ volatile("fmla %0.4s, %1.4s, %2.4s" : "+w"(r) : "w"(x),"w"(y));
+    if(vmaxvq_u32(vshlq_n_u32(r,1))>=0xfefffffeu)return ms_rtz_fallback(a,b,c,2,old);
+    return spu__nv_u128(ms_audio_compact_normalize(r));
+}
+static inline __attribute__((always_inline)) u128 ms_audio_compact_fms(u128 a,u128 b,u128 c,uint64_t old) {
+    return ms_audio_compact_fma(a,b,spu__nv_u128(veorq_u32(vld1q_u32(c._u32),vdupq_n_u32(0x80000000u))),old);
+}
 static inline int ms_audio_worker_scope_safe(const spu_context* ctx) {
     /* LS helpers only touch bytes in this mode. Diagnostic callbacks and
      * another image/policy must never execute with the arithmetic FPCR. */
@@ -32,7 +67,7 @@ static int ms_audio_qos_enabled;
 static const char* ms_audio_capture_dir;
 __attribute__((constructor)) static void ms_audio_worker_init(void) {
     const char* setting = getenv("MOTORSTORM_AUDIO_MERGE");
-    ms_audio_merge_enabled = setting ? atoi(setting) : 2;
+    ms_audio_merge_enabled = setting ? atoi(setting) : 3;
     ms_audio_capture_dir = getenv("MOTORSTORM_AUDIO_WORKER_CAPTURE");
     ms_audio_timing_enabled = getenv("MOTORSTORM_AUDIO_WORKER_TIMING") != NULL;
     setting = getenv("MOTORSTORM_AUDIO_QOS");

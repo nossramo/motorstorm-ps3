@@ -128,14 +128,17 @@ NEON arithmetic scopes using the existing exact SPU float helpers: the host
 rounding mode is saved once for a loop, and restored at every exit and guest
 call boundary. Extended-range values retain the exact fallback. Image/policy
 checks and diagnostic guards prevent callbacks from running in guest rounding
-mode. `MOTORSTORM_AUDIO_MERGE=2` is the default; `1` selects merging without
+mode. `MOTORSTORM_AUDIO_MERGE=3` is now the default, retaining this arithmetic
+with combined SIMD guards (see the CPU-efficiency comparison below); `2`
+selects the original scoped guards, and `1` selects merging without
 the arithmetic scope and `0` selects the original worker for comparison.
 
-`sh tools/test_audio_worker.sh logs/audio-worker-capture-17` compares all 128
-registers, all 256 KiB of local store, PC/status and restored host FPCR for
-32 locally captured inputs, 100 replays per mode/input. It also checks four
-million arithmetic lanes, including extended floats and boundary cases.
-All pass. Mean isolated call times across the eight inputs per loop are
+The original `sh tools/test_audio_worker.sh logs/audio-worker-capture-17`
+validation compared all 128 registers, all 256 KiB of local store, PC/status
+and restored host FPCR for 32 locally captured inputs, 100 replays per
+mode/input, plus four million arithmetic lanes. The current expanded test is
+described in the CPU-efficiency section below. All original checks passed.
+Mean isolated call times across the eight inputs per loop were
 approximately 0.0248→0.0121 ms, 0.0320→0.0155 ms, 0.0291→0.0144 ms and
 0.0184→0.0107 ms: **1.7–2.1× faster in these loops**, not a whole-game speedup.
 
@@ -194,6 +197,61 @@ must stay under ignored `logs/`. A missing optional firmware ATRAC module is
 still reported; complete codec coverage is not established.
 
 ## Frame stability: 30 FPS target, 20 October 2026
+
+### Exit after a completed race: player-confirmed fix (21 October)
+
+The player can now select Exit in the results menu, but the reported return to
+the frontend terminated the application. Two underlying runtime defects have
+been corrected below. The player subsequently confirmed that results-menu
+Exit works correctly in run 39; its log records the return load/save without
+a fatal error. Starting another event is still a useful regression check.
+Closing the app or quitting
+from the pause menu is a different path and cannot establish this result.
+
+Run 35 reports byte reads from invalid guest address `0xEFC60504`, followed
+by null accesses/call in `func_00255388` (`LR=0x002553FC`). The guest then
+reports a fatal resource lookup failure at `guisystemobject.cpp:1171` for
+`swz911xc42`, type 17, and calls `sys_process_exit(0)`. The exact origin of
+that run's invalid state is not established; a missing file is not proven.
+
+The macOS crash report shows a secondary shutdown race: the render thread
+throws from `std::mutex::lock` in `motorstorm_gpu_sync_service` while another
+thread is inside `exit`/C++ static destruction. Fixing only this shutdown
+failure would still close the game instead of restoring the menu.
+
+Subsequent pause-menu Quit probes (runs 37/38) exposed a concrete file-buffer
+race during frontend loading. In run 38 the compressed input header changed
+while decompression was using it. The context-aware `sys_lwmutex_trylock`
+handler incorrectly returned `CELL_ETIMEDOUT` (`0x8001000B`) when the lock was
+busy. MotorStorm explicitly checks for `CELL_EBUSY` (`0x8001000A`) before
+falling back to a blocking lock; the wrong code allowed it into the shared
+buffer critical section without owning the lock. The handler now returns
+`CELL_EBUSY`, consistent with
+[RPCS3's implementation](https://github.com/RPCS3/rpcs3/blob/master/rpcs3/Emu/Cell/Modules/sys_lwmutex_.cpp).
+The player's successful results-menu check supports this fix; it does not
+prove that every resource-loading failure has the same cause.
+
+The GPU read rendezvous mutex and condition variable now live for the process
+lifetime, matching the workers that can still use them during guest exit.
+This prevents their early static destruction from causing a secondary host
+abort. Guest fatal errors remain visible; no resources or errors are skipped.
+
+`tools/test_lwmutex_contention.sh` exercises the actual context-aware handler:
+busy status, timeout status, ownership, and the blocking handoff. Its busy-code
+assertion fails with the old handler and passes after the fix. The GPU sync
+regression also services the rendezvous after normal static destruction; the
+old implementation aborts with `mutex lock failed: Invalid argument`, and the
+fixed implementation passes. GPU sync, keyboard context and pad report checks
+passed, and the game was rebuilt. Temporary generated-code probes were removed.
+
+Run 39 is the fresh player-controlled validation launch. Profiling remains
+unarmed; no automated controls are sent. These fixes make no FPS or CPU-saving
+claim. With the player-confirmed Exit check complete, CPU work has resumed.
+
+Preserved local evidence: `logs/exit-crash-36/triage.json`, the copied macOS
+crash report and log tail, plus `logs/cpu-manual-35/native.log`,
+`logs/exit-repro-37/`, `logs/exit-repro-38/`, and
+`logs/exit-validation-39/`. Captures, generated code, and logs stay untracked.
 
 The current target is stable **30 FPS at 1280×720**, with unchanged visual
 quality and less CPU overhead that can also benefit a later iOS port. There is
@@ -355,13 +413,117 @@ changes. Its timing trigger was never armed, so that report is player feedback,
 not a new CPU/GPU benchmark. The current priority is reduced CPU work while
 preserving the accepted graphics, audio and 30 FPS target.
 
-## Source backup and paused status
+### Normal-play diagnostic overhead, 21 October 2026
+
+The launcher now defaults to `PS3_VERBOSE=0` and `SPU_FAST_DISPATCH=1`.
+The latter was already enabled in the player's run 27; this promotes that
+validated path to the normal launch configuration. Both SPURS signal APIs
+now respect the existing verbosity gate without changing signal delivery.
+Errors and explicitly requested diagnostics remain available. Set
+`PS3_VERBOSE=1 SPU_FAST_DISPATCH=0` to restore the previous launch behavior.
+
+The Release build and the 2,048-case dispatch differential test pass. The
+planned CPU comparison was deferred for the player's end-of-race keyboard
+test. No new gameplay CPU reduction or fan/energy benefit is claimed yet.
+Evidence: `logs/cpu-efficiency-33/`; fresh manual launch: `logs/cpu-manual-35/`.
+
+### Player-driven CPU/GPU measurement (run 35)
+
+At the player's request, one 60-second trace was armed as they began the game,
+followed by a separate five-second Instruments Time Profiler recording. The
+game remained open and no automated controls or screenshot capture were used.
+The timing trace contains 2,019,838 records with zero drops. The full window
+includes the startup transition and measures 30.12 guest flips/s; its 357 ms
+maximum must not be conflated with steady gameplay.
+
+The final approximately 30 seconds contain 898 complete frame intervals:
+**29.96 FPS**, 34.30 ms p95, 38.85 ms p99, and 60.02 ms maximum (one interval
+over 50 ms). Process CPU averages **329.15%**, or 3.29 CPU-seconds per elapsed
+second, summed across threads. Per frame: 109.87 ms process CPU, 12.77 ms main
+PPU CPU, 10.57 ms RSX CPU, 43.91 ms policy/native-job CPU across workers,
+5.69 ms measured Havok-worker CPU, and 0.084 ms SPU interpreter CPU. GPU
+execution averages **10.46 ms/frame**. These lanes overlap; the GPU number is
+execution time, not an Activity Monitor GPU-utilization percentage.
+
+The separate CPU sample attributes 39.7% of resolved sampled CPU to SPURS
+policy/native jobs, 20.8% to the audio worker, 11.2% to RSX/render and 11.2%
+to the main PPU/game thread. It observes 667 thread identities, consistent
+with the repeated short-lived task launches in the log, but directly sampled
+thread-creation cost is small. Thread reuse is a lead, not a demonstrated
+dominant bottleneck. Native job and audio arithmetic remain the larger targets.
+This recording is not a matched before/after experiment and does not establish
+that the new launch defaults reduced CPU consumption or fan noise.
+
+Evidence: `logs/cpu-manual-35/{report.json,steady-summary.json,cpu.trace,
+cpu-summary.json}`. The local indexed report script preserves the existing
+report's interval calculations and checks its span selection against the
+original selection at five frame windows; it avoids rescanning the entire
+trace for every frame. No further runtime changes were made during this test.
+
+### Exact audio SIMD guard reduction (runs 40, 42/43; 21 October)
+
+The previous CPU sample's two largest individual leaf functions were the
+scoped audio loops at 0x5238 and 0x98D8 (7.55% of resolved samples together).
+The four already-specialized audio loops now combine their operand range
+checks into one SIMD horizontal reduction per operation. A sign-removing
+integer shift also simplifies exponent-zero normalization. SPU extended
+values, overflow fallback, truncation, positive zero, intermediate rounding,
+local-store accesses, and host FPCR restoration are preserved. No audio
+samples, graphics features, resolution, or game tasks are dropped.
+
+The existing mode 2 implementation remains available for comparison; mode 3
+is the new default. The differential test performs eight million arithmetic
+lane comparisons and replays all 32 local input snapshots 1,000 times each.
+Every tested register, local-store byte, return PC/status, and host FPCR
+matches the original lift. Alternating mode 2/3 order and measuring thread
+CPU time gives mean per-call reductions of **12.1%, 12.0%, 11.2%, and 6.9%**
+for entries 0x5238, 0x5670, 0x5848, and 0x98D8 respectively. These are
+repeatable component savings, not percentages of total game CPU usage.
+
+The player then drove the first default track with a motorcycle for two
+60-second recordings, with one game process at a time, identical executable
+hashes and launcher settings except `MOTORSTORM_AUDIO_MERGE=2` versus `3`.
+Both traces have zero dropped records. Observed before -> after results:
+
+* Guest throughput: **29.47 -> 29.52 FPS**; mean frame interval 33.93 -> 33.86 ms.
+* Aggregate process CPU: **378.47% -> 354.04%**, or 128.43 -> 119.89 CPU ms/frame.
+* GPU execution: **10.53 -> 10.60 ms/frame**.
+* Frame p95: **36.13 -> 38.37 ms**; p99: 39.16 -> 41.61 ms.
+* Maximum completed interval: **223.18 -> 48.58 ms**; intervals over 50 ms: 9 -> 0.
+
+The player-driven trajectories and workloads differ: policy/native-job CPU
+also changes from 60.76 to 50.00 ms/frame and RSX CPU from 15.02 to 12.87 ms,
+neither of which this audio guard change directly optimizes. Therefore the
+observed 6.5% lower total CPU and disappearance of large hitches cannot be
+attributed entirely to this change. Tail pacing does not improve uniformly,
+and fan noise, energy use, sustained thermal behavior and iOS are unmeasured.
+The directly established benefit is the exact audio-loop CPU reduction.
+
+All audio-rate reports between trace arming and completion (13 before, 12
+after) report zero entirely silent mixed blocks. Neither run has a guest
+fatal or native mutex error. This is bounded evidence, not a guarantee of
+dropout-free play. The new Release build and differential test pass. The
+game remains open after the measurements; no recurring test is scheduled.
+
+The initially attempted runs 39/41 are excluded from this CPU comparison:
+a requested restart interrupted the first attempt and SIGTERM did not fully
+stop the old process before the next launch. Both processes were subsequently
+stopped and confirmed absent before run 42. The manual profiling launcher now
+rejects a new start while any MotorStormRecomp process remains; that guard
+was exercised without creating an extra process or output directory.
+
+Evidence remains local under `logs/cpu-efficiency-40/`, `logs/cpu-before-42/`,
+and `logs/cpu-after-43/`; snapshots and generated game code remain untracked.
+
+## Source backup and historical paused status
 
 This is a small source-only backup. See [BACKUP.md](BACKUP.md) for the exact
 scope and restoration steps. Game files, generated game code, runtime
 checkouts, binaries and captures are intentionally excluded. Restore the
 pinned runtime with `python3 tools/bootstrap_runtime.py` before regenerating.
 
+The following pause describes the earlier run-137 research session; newer
+player-driven results above supersede its performance/validation status.
 Automatic optimization and gameplay tests were stopped at the user's request.
 The last normal eight-second probe (run 137) measured **24.75 guest FPS**,
 40.544 ms mean, 49.413 ms p95 and 89.108 ms maximum frame time; RSX CPU averaged
