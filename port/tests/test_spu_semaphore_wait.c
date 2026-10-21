@@ -61,9 +61,14 @@ static void* waiter(void* p) {
 }
 static int registered(spu_context* ctx) {
     int found=0; spu_lockline_lock();
-    for (spu_host_resv_waiter* w=s_host_waiters;w;w=w->next)
-        if(w->ctx==ctx) found=1;
+    for (unsigned s=0;s<COH_STRIPES;++s)
+        for (spu_host_resv_waiter* w=s_host_waiters[s];w;w=w->next)
+            if(w->ctx==ctx) found=1;
     spu_lockline_unlock(); return found;
+}
+static int any_registered(void) {
+    for (unsigned s=0;s<COH_STRIPES;++s) if(s_host_waiters[s]) return 1;
+    return 0;
 }
 static void await_registration(task* t) {
     struct timespec start,now; clock_gettime(CLOCK_MONOTONIC,&start);
@@ -119,6 +124,6 @@ int main(void) {
         assert(race.result==0 || race.result==1);
         assert(!registered(&race.ctx)); spu_coh_unregister(&race.ctx);
     }
-    assert(!s_host_waiters);
+    assert(!any_registered());
     puts("PASS: 2000 full-register/LS differential cases, fallback guards, 1000 wake races, timeout, late notify, six sleepers, self exclusion, preserved events");
 }

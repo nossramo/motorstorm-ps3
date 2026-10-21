@@ -2066,7 +2066,7 @@ index b1972b1..7aa7854 100644
  
  static struct { uint32_t nid; void (*fn)(ppu_context*); } s_reg[16];
 diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
-index d7c6f5e..a9c35ad 100644
+index d7c6f5e..e9ed735 100644
 --- a/libs/video/cellGcmSys.c
 +++ b/libs/video/cellGcmSys.c
 @@ -18,10 +18,15 @@
@@ -2116,7 +2116,22 @@ index d7c6f5e..a9c35ad 100644
      return 0;
  }
  /* ponytail: fixed headroom, far above one frame's commands (Simpsons ~10 KB);
-@@ -277,8 +288,18 @@ static CellGcmSecondVHandler s_second_v_handler = NULL;
+@@ -210,6 +221,14 @@ typedef struct IoMapping {
+ static IoMapping s_io_mappings[CELL_GCM_MAX_IO_MAPPINGS];
+ static int s_io_mapping_count = 0;
+ 
++/* Bumped after every change to s_io_mappings (each one also moves
++ * s_io_mapping_count); invalidates the SPU PUT page index below. */
++static u32 s_io_map_gen = 1;
++static void gcm_io_mappings_changed(void)
++{
++    __atomic_add_fetch(&s_io_map_gen, 1, __ATOMIC_RELEASE);
++}
++
+ /* Callback handlers — these are GUEST OPD addresses passed by the
+  * recompiled game, not host function pointers. Stored as uint32_t and
+  * invoked through g_ps3_guest_caller (see ps3emu/guest_call.h). */
+@@ -277,8 +296,18 @@ static CellGcmSecondVHandler s_second_v_handler = NULL;
  /* Flip timing */
  static u64 s_last_flip_time = 0;
  
@@ -2137,7 +2152,15 @@ index d7c6f5e..a9c35ad 100644
  
  /* IO map reservation tracking */
  static u32 s_io_map_reserved = 0;  /* bytes reserved for IO mapping */
-@@ -515,7 +536,8 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
+@@ -501,6 +530,7 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
+ 
+     s_local_mem_allocated = 0;
+     s_io_mapping_count = 0;
++    gcm_io_mappings_changed();
+     /* Unmapped = 0xFFFF. The tables are static (zero-initialized), so without
+      * this every unmapped EA page silently aliased io page 0 (and vice versa),
+      * producing plausible-but-wrong offsets instead of a translation failure. */
+@@ -515,7 +545,8 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
      s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
      s_flip_mode = CELL_GCM_DISPLAY_VSYNC;
      s_debug_level = CELL_GCM_DEBUG_LEVEL0;
@@ -2147,7 +2170,15 @@ index d7c6f5e..a9c35ad 100644
      s_io_map_reserved = 0;
      s_default_fifo_mode = 0;
      s_graphics_handler = NULL;
-@@ -650,29 +672,60 @@ void cellGcmSetFlipMode(u32 mode)
+@@ -534,6 +565,7 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
+         s_io_mappings[0].size   = ioSize;
+         s_io_mappings[0].active = 1;
+         s_io_mapping_count = 1;
++        gcm_io_mappings_changed();
+     }
+ 
+     /* Zero the guest-visible control register (put/get/ref). */
+@@ -650,29 +682,60 @@ void cellGcmSetFlipMode(u32 mode)
      s_flip_mode = mode;
  }
  
@@ -2230,7 +2261,7 @@ index d7c6f5e..a9c35ad 100644
  
  /* NID: 0x51C9D62B */
  void cellGcmResetFlipStatus(void)
-@@ -718,28 +771,60 @@ u32 cellGcmGetFlipStatus(void)
+@@ -718,28 +781,60 @@ u32 cellGcmGetFlipStatus(void)
  #ifdef _WIN32
  #include <windows.h>
  static volatile LONG s_gcm_pending = 0;    /* bit0 = vblank, bit1 = flip */
@@ -2294,7 +2325,7 @@ index d7c6f5e..a9c35ad 100644
      /* GCM_FLIP_NEEDS_FIFO=1: only mark a flip pending once the walker has
       * actually consumed up to `put`.
       *
-@@ -783,18 +868,27 @@ void ppu_gcm_pump(void)
+@@ -783,18 +878,27 @@ void ppu_gcm_pump(void)
  {
      if (!GCM_PUMP_TRY_ENTER()) return;
      long p = (long)GCM_PENDING_TAKE();
@@ -2326,7 +2357,7 @@ index d7c6f5e..a9c35ad 100644
      }
      if (p & 2) {
          /* Delivery waits for a guest thread to reach an HLE call or a timer
-@@ -823,7 +917,7 @@ void ppu_gcm_pump(void)
+@@ -823,7 +927,7 @@ void ppu_gcm_pump(void)
  
  /* Back-compat: the old direct entry points now just mark a tick pending (so any
   * caller other than the ticker still works) -- delivery stays on the main thread. */
@@ -2335,7 +2366,7 @@ index d7c6f5e..a9c35ad 100644
  /* Only deliver a flip completion when a flip is actually outstanding.
   *
   * Ticking unconditionally at 60 Hz fires the guest's flip handler even when
-@@ -1008,11 +1102,11 @@ static void gcm_row_copy(u32 d, u32 s, u32 n)
+@@ -1008,11 +1112,11 @@ static void gcm_row_copy(u32 d, u32 s, u32 n)
      int reserved = 0;
      for (u32 a = l0; a <= l1 && !reserved; a += 128) reserved = spu_coh_is_reserved(a);
      if (!reserved) { memmove(vm_base + d, vm_base + s, n); return; }
@@ -2349,7 +2380,80 @@ index d7c6f5e..a9c35ad 100644
  }
  
  static void nv3089_blit(void)
-@@ -1613,6 +1707,13 @@ static void gcm_ref_publish_one(void)
+@@ -1417,10 +1521,11 @@ static void gcm_ref_push_at(u32 v, u32 getoff);
+ static struct { u32 io_start, io_end; } s_spu_blk[GCM_SPU_BLK_N];
+ static int s_spu_blk_w = 0;
+ 
+-/* EA -> IO through the mapping list (range lookup; the by-ea helper is exact). */
+-static u32 gcm_ea2io_range(u32 ea, u32* room)
++/* EA -> IO through the mapping list (range lookup; the by-ea helper is exact).
++ * Slots below `first` must not contain ea; the first match is returned. */
++static u32 gcm_ea2io_range(u32 ea, u32* room, int first)
+ {
+-    for (int i = 0; i < CELL_GCM_MAX_IO_MAPPINGS; i++) {
++    for (int i = first; i < CELL_GCM_MAX_IO_MAPPINGS; i++) {
+         IoMapping* m = &s_io_mappings[i];
+         if (!m->active || !m->size) continue;
+         if (ea >= m->ea && ea < m->ea + m->size) {
+@@ -1437,11 +1542,56 @@ void gcm_forget_spu_blocks(void)
+     s_spu_blk_w = 0;
+ }
+ 
++/* Every SPU PUT asks whether it landed in RSX-visible memory. Per 1 MiB EA
++ * page: the lowest mapping slot that overlaps the page, or 0xFFFF. A slot
++ * below it cannot contain an address in the page, so a lookup may start
++ * there, and a page no mapping touches needs no lookup at all. Rebuilt for
++ * each s_io_map_gen; s_io_page_gen is 0 while a rebuild writes, and a reader
++ * that overlaps one (seqlock order) scans the whole list as before. */
++#define GCM_EA_PAGES 4096u
++static u16 s_io_page_first[GCM_EA_PAGES];
++static u32 s_io_page_gen;
++static int s_io_page_busy;
++
++static void gcm_io_pages_rebuild(u32 gen)
++{
++    if (__atomic_exchange_n(&s_io_page_busy, 1, __ATOMIC_ACQUIRE)) return;
++    __atomic_store_n(&s_io_page_gen, 0, __ATOMIC_RELAXED);
++    __atomic_thread_fence(__ATOMIC_RELEASE);
++    static u16 first[GCM_EA_PAGES];
++    memset(first, 0xFF, sizeof first);
++    for (int i = CELL_GCM_MAX_IO_MAPPINGS - 1; i >= 0; i--) {
++        const IoMapping* m = &s_io_mappings[i];
++        if (!m->active || !m->size) continue;
++        const u64 end = (u64)m->ea + m->size;
++        const u32 last = (u32)(((end > 0x100000000ull ? 0x100000000ull : end) - 1) >> 20);
++        for (u32 p = m->ea >> 20; p <= last; p++) first[p] = (u16)i;
++    }
++    for (u32 p = 0; p < GCM_EA_PAGES; p++)
++        __atomic_store_n(&s_io_page_first[p], first[p], __ATOMIC_RELAXED);
++    __atomic_store_n(&s_io_page_gen, gen, __ATOMIC_RELEASE);
++    __atomic_store_n(&s_io_page_busy, 0, __ATOMIC_RELEASE);
++}
++
++/* First slot to scan for ea, or -1 when no mapping can contain it. */
++static int gcm_io_first_slot(u32 ea)
++{
++    const u32 gen = __atomic_load_n(&s_io_map_gen, __ATOMIC_ACQUIRE);
++    if (__atomic_load_n(&s_io_page_gen, __ATOMIC_ACQUIRE) != gen) gcm_io_pages_rebuild(gen);
++    if (__atomic_load_n(&s_io_page_gen, __ATOMIC_ACQUIRE) != gen) return 0;
++    const u16 first = __atomic_load_n(&s_io_page_first[ea >> 20], __ATOMIC_RELAXED);
++    __atomic_thread_fence(__ATOMIC_ACQUIRE);
++    if (__atomic_load_n(&s_io_page_gen, __ATOMIC_RELAXED) != gen) return 0;
++    return first == 0xFFFFu ? -1 : first;
++}
++
+ void gcm_note_spu_put(u32 ea, u32 size)
+ {
+     if (!size || size > 0x40000u) return;
++    const int first = gcm_io_first_slot(ea);
++    if (first < 0) return;                          /* not in RSX-visible memory */
+     u32 room = 0;
+-    u32 io = gcm_ea2io_range(ea, &room);
++    u32 io = gcm_ea2io_range(ea, &room, first);
+     if (io == 0xFFFFFFFFu || size > room) return;   /* not in RSX-visible memory */
+ 
+     /* Coalesce with the previous block when an SPU emits one buffer in several
+@@ -1613,6 +1763,13 @@ static void gcm_ref_publish_one(void)
   * itself performs guest reads) and never blocks a spinning game thread. */
  static SRWLOCK s_gcm_fifo_lock = SRWLOCK_INIT;
  static void gcm_rsx_process_fifo_unlocked(void);
@@ -2363,7 +2467,7 @@ index d7c6f5e..a9c35ad 100644
  
  /* Kick event: a game thread whose fence wait finds the queue DRY signals the
   * present thread to run the FIFO walker NOW instead of on its next 16 ms
-@@ -1627,6 +1728,13 @@ void* cellGcm_fifo_kick_event(void)
+@@ -1627,6 +1784,13 @@ void* cellGcm_fifo_kick_event(void)
      return (void*)s_gcm_kick_ev;
  }
  
@@ -2377,7 +2481,7 @@ index d7c6f5e..a9c35ad 100644
  /* The present thread's idle wait. It used to be a flat Sleep(4), which meant
   * the kick above was created, signalled -- and waited on by nobody, so a
   * starved guest still paid the full tick. Waiting here instead costs nothing
-@@ -1677,11 +1785,13 @@ static uint64_t s_ft_sema_t0;          /* PS3_FTRACE: when the walker began wait
+@@ -1677,11 +1841,13 @@ static uint64_t s_ft_sema_t0;          /* PS3_FTRACE: when the walker began wait
  void cellGcm_rsx_process_fifo(void)
  {
      const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
@@ -2391,7 +2495,7 @@ index d7c6f5e..a9c35ad 100644
          if (t1 - ft_t0 >= ps3_ft_min_ns())
              ps3_ft_span(PS3_FT_DRAIN, 0, s_ft_sema_t0 ? 1u : 0u, 0, ft_t0, t1);
      }
-@@ -1811,7 +1921,17 @@ static void gcm_rsx_process_fifo_unlocked(void)
+@@ -1811,7 +1977,17 @@ static void gcm_rsx_process_fifo_unlocked(void)
       * short of `put` every tick is the signature of a FIFO that can never
       * catch up, and the reason is the whole diagnosis. */
      const char* why = "caught-up";
@@ -2409,7 +2513,7 @@ index d7c6f5e..a9c35ad 100644
          u32 ea = gcm_io2ea(s_fifo_getoff);
          if (!ea) {
              /* get is sitting on an IO offset with no mapping -- the title
-@@ -1956,7 +2076,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
+@@ -1956,7 +2132,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
          }
          if ((w & 3) == 2) {                    /* CALL: offset | 2 */
              { u32 tgt = w & 0x1FFFFFFCu;
@@ -2418,7 +2522,7 @@ index d7c6f5e..a9c35ad 100644
                s_fifo_calloff = s_fifo_getoff + 4;
                s_fifo_getoff  = tgt; }
              continue;
-@@ -2271,7 +2391,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
+@@ -2271,7 +2447,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
       * for good that way in about one New Marais run in five ("stuck-get" at a
       * self-jump with no "jump-park" before it). */
      { static u32 last = 0xFFFFFFFFu; static int stuck = 0;
@@ -2427,7 +2531,7 @@ index d7c6f5e..a9c35ad 100644
            stuck = 0; last = s_fifo_getoff; s_sema_blocked_pass = 0; s_park_pass = 0; }
        else if (s_fifo_getoff == last && s_fifo_getoff != put) {
            if (++stuck >= 8) { gcm_fifo_dump_around(s_fifo_getoff);
-@@ -2343,7 +2463,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
+@@ -2343,7 +2519,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
           * writes included, so the title then waits on a reference that never
           * comes (The Simpsons Arcade Game froze at its 4th recycle). The next
           * pass drains to `put` and recycles then. */
@@ -2436,7 +2540,7 @@ index d7c6f5e..a9c35ad 100644
          /* Only once the title has been SEEN to overrun. Near `end` is also
           * where a title whose callback does recycle sits just before calling
           * it: Tornado Outbreak's steps its context through 64 KB segments of a
-@@ -2354,7 +2474,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
+@@ -2354,7 +2530,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
           * and near-end recycling is enabled from then on. */
          static int s_title_overran = 0;
          if (begin && end > begin && cur >= end) { head_consumed = 1; s_title_overran = 1; }
@@ -2445,7 +2549,7 @@ index d7c6f5e..a9c35ad 100644
                  && head_consumed && s_title_overran) {
              u32 io_begin = gcm_ea2io(begin);
              if (io_begin != 0xFFFFFFFFu) {
-@@ -2587,15 +2707,23 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
+@@ -2587,15 +2763,23 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
          s_flip_request_count++;
          s_flip_direct_pending = 1;
      }
@@ -2472,7 +2576,7 @@ index d7c6f5e..a9c35ad 100644
  
      /* Invoke via OPD resolution, not a raw call into guest code.
       *
-@@ -2661,13 +2789,24 @@ static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
+@@ -2661,13 +2845,24 @@ static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
      return 1;
  }
  
@@ -2502,7 +2606,7 @@ index d7c6f5e..a9c35ad 100644
  }
  
  /* NID: 0xD01B570F */
-@@ -2768,7 +2907,10 @@ void cellGcmSetUserHandler(CellGcmUserHandler handler)
+@@ -2768,7 +2963,10 @@ void cellGcmSetUserHandler(CellGcmUserHandler handler)
  /* NID: 0x21AC3697 */
  u64 cellGcmGetLastFlipTime(void)
  {
@@ -2514,7 +2618,47 @@ index d7c6f5e..a9c35ad 100644
  }
  
  /* ---------------------------------------------------------------------------
-@@ -3494,7 +3636,8 @@ void cellGcmTerminate(void)
+@@ -2897,6 +3095,7 @@ s32 cellGcmAddressToOffset(u32 address, u32* offset)
+         if (m) {
+             m->ea = ea_page; m->io = io; m->size = 0x100000u; m->active = 1;
+             s_io_mapping_count++;
++            gcm_io_mappings_changed();
+         } else {
+             printf("[cellGcmSys] WARNING: auto-map has no free IO mapping slot; "
+                    "the FIFO will not be able to walk io 0x%08X\n", io);
+@@ -2975,6 +3174,7 @@ s32 cellGcmMapMainMemory(u32 ea, u32 size, u32* offset)
+     mapping->size   = size;
+     mapping->active = 1;
+     s_io_mapping_count++;
++    gcm_io_mappings_changed();
+ 
+     populate_offset_table(ea, io_offset, size);
+ 
+@@ -3014,6 +3214,7 @@ s32 cellGcmMapEaIoAddress(u32 ea, u32 io, u32 size)
+     mapping->size   = size;
+     mapping->active = 1;
+     s_io_mapping_count++;
++    gcm_io_mappings_changed();
+ 
+     populate_offset_table(ea, io, size);
+ 
+@@ -3063,6 +3264,7 @@ s32 cellGcmUnmapEaIoAddress(u32 ea)
+     clear_offset_table(mapping->ea, mapping->io, mapping->size);
+     mapping->active = 0;
+     s_io_mapping_count--;
++    gcm_io_mappings_changed();
+ 
+     return CELL_OK;
+ }
+@@ -3079,6 +3281,7 @@ s32 cellGcmUnmapIoAddress(u32 io)
+     clear_offset_table(mapping->ea, mapping->io, mapping->size);
+     mapping->active = 0;
+     s_io_mapping_count--;
++    gcm_io_mappings_changed();
+ 
+     return CELL_OK;
+ }
+@@ -3494,7 +3697,8 @@ void cellGcmTerminate(void)
      s_flip_mode   = CELL_GCM_DISPLAY_VSYNC;
      s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
      s_debug_level = CELL_GCM_DEBUG_LEVEL0;
@@ -2524,7 +2668,15 @@ index d7c6f5e..a9c35ad 100644
      s_io_map_reserved = 0;
      s_default_fifo_mode = 0;
      GCM_USER_STORE(0);
-@@ -3566,11 +3709,11 @@ s32 cellGcmUnreserveIoMapSize(u32 size)
+@@ -3521,6 +3725,7 @@ void cellGcmTerminate(void)
+     s_queue_handler    = NULL;
+     s_local_mem_allocated = 0;
+     s_io_mapping_count = 0;
++    gcm_io_mappings_changed();
+     /* Unmapped = 0xFFFF. The tables are static (zero-initialized), so without
+      * this every unmapped EA page silently aliased io page 0 (and vice versa),
+      * producing plausible-but-wrong offsets instead of a translation failure. */
+@@ -3566,11 +3771,11 @@ s32 cellGcmUnreserveIoMapSize(u32 size)
      return CELL_OK;
  }
  
@@ -2540,7 +2692,7 @@ index d7c6f5e..a9c35ad 100644
  }
  
  /* Return tile info for a given index */
-@@ -3723,6 +3866,7 @@ void cellGcmQueueUserCommand(u32 cmd)
+@@ -3723,6 +3928,7 @@ void cellGcmQueueUserCommand(u32 cmd)
  {
      GCM_USER_STORE(cmd);
      GCM_USER_PENDING_STORE((1ULL << 32) | cmd);
@@ -2548,6 +2700,14 @@ index d7c6f5e..a9c35ad 100644
  }
  
  /* Invalidate a tile region (unbind + clear) */
+@@ -3854,6 +4060,7 @@ void cellGcm_syscall_iomap(u32 ea, u32 io, u32 size)
+     if (m) {
+         m->ea = ea; m->io = io; m->size = size; m->active = 1;
+         s_io_mapping_count++;
++        gcm_io_mappings_changed();
+     }
+     if (!s_config.ioSize) { s_config.ioAddress = ea; s_config.ioSize = size; }
+ }
 diff --git a/libs/video/cellGcmSys.h b/libs/video/cellGcmSys.h
 index eab83e1..06ed7f9 100644
 --- a/libs/video/cellGcmSys.h
@@ -9532,7 +9692,7 @@ index dbea35b..0c6168e 100644
 \ No newline at end of file
 +#endif
 diff --git a/runtime/spu/spu_coherency.c b/runtime/spu/spu_coherency.c
-index 923d8bd..043a28c 100644
+index 923d8bd..3b716c1 100644
 --- a/runtime/spu/spu_coherency.c
 +++ b/runtime/spu/spu_coherency.c
 @@ -2,59 +2,197 @@
@@ -9765,7 +9925,15 @@ index 923d8bd..043a28c 100644
  
  /* ===========================================================================
   * The reserved-line bitmap
-@@ -77,8 +215,8 @@ static unsigned char s_coh_bitmap[SPU_COH_BITMAP_SZ];
+@@ -72,13 +210,15 @@ void spu_lockline_unlock(void) { atomic_flag_clear_explicit(&g_lockline, memory_
+ #define SPU_COH_LINES       (1u << (32 - SPU_COH_LINE_SHIFT))   /* 2^25 lines */
+ #define SPU_COH_BITMAP_SZ   (SPU_COH_LINES / 8)                 /* 4 MiB */
+ 
+-static unsigned char s_coh_bitmap[SPU_COH_BITMAP_SZ];
++/* Extern for inline guest-store fast paths compiled outside this file; they
++ * read it with the same acquire loads as spu_coh_is_reserved. */
++unsigned char g_spu_coh_bitmap[SPU_COH_BITMAP_SZ];
+ 
  /* Zero until the first GETLLAR anywhere. Keeps the PPU fast path off the
   * bitmap entirely for a title that runs no SPU code, and keeps every existing
   * test that stores through vm_write* paying one compare against a hot global.
@@ -9776,7 +9944,7 @@ index 923d8bd..043a28c 100644
  static int s_coh_armed;
  
  /* Every live virtual context may retain a reservation between scheduling
-@@ -88,28 +226,110 @@ typedef struct spu_coh_entry {
+@@ -88,28 +228,110 @@ typedef struct spu_coh_entry {
      spu_context* ctx;
      struct spu_coh_entry* next;
  } spu_coh_entry;
@@ -9871,7 +10039,7 @@ index 923d8bd..043a28c 100644
 -    s_coh_bitmap[line >> 3] |= (unsigned char)(1u << (line & 7));
 -    s_coh_armed = 1;
 -
-+    __atomic_fetch_or(&s_coh_bitmap[line >> 3], (unsigned char)(1u << (line & 7)), __ATOMIC_RELEASE);
++    __atomic_fetch_or(&g_spu_coh_bitmap[line >> 3], (unsigned char)(1u << (line & 7)), __ATOMIC_RELEASE);
 +    __atomic_store_n(&s_coh_armed, 1, __ATOMIC_RELEASE);
      if (!ctx) return;
 -    for (spu_coh_entry* entry = s_coh_ctxs; entry; entry = entry->next)
@@ -9899,7 +10067,7 @@ index 923d8bd..043a28c 100644
  }
  
  /* Drop a context from the reserving set.
-@@ -131,12 +351,12 @@ void spu_coh_unregister(spu_context* ctx)
+@@ -131,12 +353,12 @@ void spu_coh_unregister(spu_context* ctx)
       * (or its whole async thread) was gone. GH3 at -O2 crashed that way in
       * spu_coh_notify_write, reading a freed thread stack. */
      spu_lockline_lock();
@@ -9915,7 +10083,7 @@ index 923d8bd..043a28c 100644
      }
      spu_lockline_unlock();
  }
-@@ -150,7 +370,8 @@ void spu_coh_unregister(spu_context* ctx)
+@@ -150,7 +372,8 @@ void spu_coh_unregister(spu_context* ctx)
  void spu_coh_forget_range(uintptr_t lo, uintptr_t hi)
  {
      spu_lockline_lock();
@@ -9925,7 +10093,7 @@ index 923d8bd..043a28c 100644
          spu_coh_entry* entry = *link;
          uintptr_t c = (uintptr_t)entry->ctx;
          if (c >= lo && c < hi) {
-@@ -169,9 +390,9 @@ void spu_coh_forget_range(uintptr_t lo, uintptr_t hi)
+@@ -169,9 +392,9 @@ void spu_coh_forget_range(uintptr_t lo, uintptr_t hi)
  
  int spu_coh_is_reserved(uint32_t addr)
  {
@@ -9933,11 +10101,11 @@ index 923d8bd..043a28c 100644
 +    if (!__atomic_load_n(&s_coh_armed, __ATOMIC_ACQUIRE)) return 0;
      uint32_t line = addr >> SPU_COH_LINE_SHIFT;
 -    return (s_coh_bitmap[line >> 3] >> (line & 7)) & 1u;
-+    return (__atomic_load_n(&s_coh_bitmap[line >> 3], __ATOMIC_ACQUIRE) >> (line & 7)) & 1u;
++    return (__atomic_load_n(&g_spu_coh_bitmap[line >> 3], __ATOMIC_ACQUIRE) >> (line & 7)) & 1u;
  }
  
  /* A DMA PUT is issued BY an SPU, and hardware does not take that SPU's own
-@@ -187,13 +408,14 @@ int spu_coh_is_reserved(uint32_t addr)
+@@ -187,13 +410,14 @@ int spu_coh_is_reserved(uint32_t addr)
  void spu_coh_notify_write_except(uint32_t ea, const void* self)
  {
      uint32_t line = ea & ~127u;
@@ -9954,7 +10122,7 @@ index 923d8bd..043a28c 100644
              spu_ch_wake(c);
          }
      }
-@@ -202,7 +424,7 @@ void spu_coh_notify_write_except(uint32_t ea, const void* self)
+@@ -202,7 +426,7 @@ void spu_coh_notify_write_except(uint32_t ea, const void* self)
  void spu_coh_notify_write(uint32_t ea)
  {
      uint32_t line = ea & ~127u;
@@ -9963,7 +10131,7 @@ index 923d8bd..043a28c 100644
          spu_context* c = entry->ctx;
          if (!c) continue;
          if (c->resv_valid && (c->resv_ea & ~127u) == line) {
-@@ -212,12 +434,18 @@ void spu_coh_notify_write(uint32_t ea)
+@@ -212,12 +436,18 @@ void spu_coh_notify_write(uint32_t ea)
               * always fails for "no reservation" is useless without knowing who
               * took it away -- a peer SPU, or the PPU committing to the line. */
              { static int s_w = -1;
@@ -10040,6 +10208,62 @@ index ca76ccd..4636cfd 100644
  /* Count of LR events delivered. A parked SPURS service that never wakes with
   * this at zero is a coherence miss; nonzero moves the question downstream. */
  extern unsigned long g_spu_lr_raise;
+diff --git a/runtime/spu/spu_context.h b/runtime/spu/spu_context.h
+index fa88c3f..09050fe 100644
+--- a/runtime/spu/spu_context.h
++++ b/runtime/spu/spu_context.h
+@@ -851,11 +851,38 @@ static inline void spu_pchist_tick(const spu_context* ctx)
+     }
+ }
+ 
++/* Release form of the per-hop hooks. spu_drain.c sets g_spu_hop_fast once
++ * SPU_FAST_DISPATCH is on and SPU_TAILRET and lockstep have resolved off;
++ * then a nonzero-PC hop outside a policy-flow capture is exactly the fast
++ * path of spu_task_launch_check, and the lockstep tick and tail-return probe
++ * are no-ops. Every other hop takes the out-of-line hooks. */
++extern int g_spu_hop_fast;
++extern void* volatile g_pm_flow_ctx;
++void spu_check_stack_reset(spu_context* ctx, void (*fn)(spu_context*));
++
++static inline int spu_hop_release_ok(const spu_context* ctx)
++{
++    return __builtin_expect(__atomic_load_n(&g_spu_hop_fast, __ATOMIC_RELAXED), 1) &&
++           ((uint32_t)ctx->pc & SPU_LS_MASK) && g_pm_flow_ctx != (const void*)ctx;
++}
++
++static inline void spu_hop_release(spu_context* ctx, void (*fn)(spu_context*))
++{
++    if (!ctx->policy_mode && ctx->host_depth) spu_check_stack_reset(ctx, fn);
++    ++ctx->steps;
++}
++
+ /* Drain the pending trampoline chain: run each queued transfer target until
+  * none remain. The one central hook site for the faithful execution model. */
+ #define SPU_DRAIN(ctx) do {                                    \
+         spu_depth_guard(ctx);                                  \
+         while (g_spu_trampoline_fn) {                           \
++            void (*_tf)(spu_context*);                          \
++            if (spu_hop_release_ok(ctx)) {                      \
++                _tf = g_spu_trampoline_fn;                      \
++                g_spu_trampoline_fn = 0;                        \
++                spu_hop_release((ctx), _tf);                    \
++            } else {                                            \
+             /* SPU_TAILRET=1: a pending transfer whose target equals the   \
+              * link register IS a return. SPU_RET only recognises `bi $r0`;\
+              * code returning through another register (`bi $r6`, r6 = the \
+@@ -869,10 +896,11 @@ static inline void spu_pchist_tick(const spu_context* ctx)
+                 g_spu_trampoline_fn = 0;                                   \
+                 break;                                                     \
+             }                                                              \
+-            void (*_tf)(spu_context*) = g_spu_trampoline_fn;    \
++            _tf = g_spu_trampoline_fn;                          \
+             g_spu_trampoline_fn = 0;                            \
+             yz_lockstep_tick(ctx);                             \
+             spu_task_launch_check((ctx), (void*)_tf);          \
++            }                                                   \
+             if ((ctx)->int_enable &&                            \
+                 ((ctx)->event_status & (ctx)->event_mask))      \
+                 _tf = spu_take_interrupt((ctx), _tf);          \
 diff --git a/runtime/spu/spu_dispatch_mt.c b/runtime/spu/spu_dispatch_mt.c
 index d9f86bb..245cab9 100644
 --- a/runtime/spu/spu_dispatch_mt.c
@@ -10113,10 +10337,10 @@ index 9820cc2..ec306e2 100644
               * AFTER the arming code finishes. We run it inline here, so hold the
               * resulting interrupt off for a few drain ticks -- otherwise the WWS
 diff --git a/runtime/spu/spu_drain.c b/runtime/spu/spu_drain.c
-index 931d3b3..22bf1e9 100644
+index 931d3b3..11a36e5 100644
 --- a/runtime/spu/spu_drain.c
 +++ b/runtime/spu/spu_drain.c
-@@ -48,17 +48,56 @@ void* volatile    g_pm_flow_ctx = 0;
+@@ -48,17 +48,59 @@ void* volatile    g_pm_flow_ctx = 0;
  extern void spu_halt(spu_context*);
  /* Last 32 drain steps on this host thread (pc), for post-mortems of a run that
   * ended where it should not have (spurs_policy.c, [pm-end]). */
@@ -10124,8 +10348,11 @@ index 931d3b3..22bf1e9 100644
 + * tracing or SPU_FAST_DISPATCH=0 retains the original hook in full. */
 +static int s_fast_dispatch = -1;
 +static int s_lean_dispatch;
++/* See spu_hop_release_ok in spu_context.h. */
++int g_spu_hop_fast;
 +static int spu_fast_dispatch_init(void)
 +{
++    __atomic_store_n(&g_spu_hop_fast, 0, __ATOMIC_RELAXED);
 +    const char* e = getenv("SPU_FAST_DISPATCH");
 +    int fast = e && e[0] == '1';
 +    const char* probes[] = {"MOTORSTORM_WWS_WAIT_TRACE", "SPU_NO_LS0_END",
@@ -10174,7 +10401,7 @@ index 931d3b3..22bf1e9 100644
      t_recent[t_recent_n++ & 31] = (uint32_t)ctx->pc & SPU_LS_MASK;
      extern void spu_check_stack_reset(spu_context*, void (*)(spu_context*));
      spu_check_stack_reset(ctx, (void (*)(spu_context*))fn);
-@@ -149,6 +188,25 @@ void spu_task_launch_check(spu_context* ctx, void* fn)
+@@ -149,6 +191,30 @@ void spu_task_launch_check(spu_context* ctx, void* fn)
          fprintf(stderr, "[pm-jobdrain] ring-full spin: marked %d pending records done\n", marked);
  }
  
@@ -10187,6 +10414,11 @@ index 931d3b3..22bf1e9 100644
 +    int fast = __atomic_load_n(&s_fast_dispatch, __ATOMIC_RELAXED);
 +    if (fast < 0) fast = spu_fast_dispatch_init();
 +    if (fast && (ctx->pc & SPU_LS_MASK) && g_pm_flow_ctx != (void*)ctx) {
++        /* The lockstep tick of this hop has resolved its switch already. */
++        extern volatile int g_yz_lockstep_on;
++        if (__builtin_expect(!__atomic_load_n(&g_spu_hop_fast, __ATOMIC_RELAXED), 0) &&
++            g_yz_lockstep_on == 0 && !spu_tailret_enabled())
++            __atomic_store_n(&g_spu_hop_fast, 1, __ATOMIC_RELAXED);
 +        if (!ctx->policy_mode && ctx->host_depth) {
 +            extern void spu_check_stack_reset(spu_context*, void (*)(spu_context*));
 +            spu_check_stack_reset(ctx, (void (*)(spu_context*))fn);
@@ -10200,7 +10432,7 @@ index 931d3b3..22bf1e9 100644
  /* Restore the active image after a lifted call bracket. The brsl/bisl emission
   * saves image_id in a call-site local and hands it back here so an image
   * adopted inside the callee cannot leak into the caller's continuation. A
-@@ -336,32 +394,46 @@ void (*spu_take_interrupt(spu_context* ctx,
+@@ -336,32 +402,46 @@ void (*spu_take_interrupt(spu_context* ctx,
  void spu_depth_guard(spu_context* ctx)
  {
      static uint32_t s_max = 0;
@@ -10260,7 +10492,21 @@ index 931d3b3..22bf1e9 100644
          fprintf(stderr, "\n");
          fflush(stderr);
      }
-@@ -460,6 +532,16 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
+@@ -416,8 +496,11 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
+             void (*fn)(spu_context*) = g_spu_trampoline_fn;
+             g_spu_trampoline_fn = 0;
+             ctx->drain_ret_pc = return_pc & SPU_LS_MASK;   /* re-set: a nested drain changed it */
+-            yz_lockstep_tick(ctx);
+-            spu_task_launch_check(ctx, (void*)fn);
++            if (spu_hop_release_ok(ctx)) spu_hop_release(ctx, fn);
++            else {
++                yz_lockstep_tick(ctx);
++                spu_task_launch_check(ctx, (void*)fn);
++            }
+             if (ctx->int_enable && (ctx->event_status & ctx->event_mask)) {
+                 void (*vf)(spu_context*) = spu_take_interrupt(ctx, fn);
+                 if (!ctx->int_enable) {   /* taken (a take clears the enable; a deferral leaves it) */
+@@ -460,6 +543,16 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
                  continue;
              }
          }
@@ -11230,6 +11476,95 @@ index 6e28f3b..3f8ff9e 100644
          _dbg(all_insns[i].addr, f"bases={_bases} toc={toc}")
          if not _bases or not toc:
              continue
+diff --git a/tools/test_gcm_io_mappings.py b/tools/test_gcm_io_mappings.py
+index fb2a31f..9e87580 100644
+--- a/tools/test_gcm_io_mappings.py
++++ b/tools/test_gcm_io_mappings.py
+@@ -39,10 +39,16 @@ def function(signature):
+ 
+ 
+ slots = re.search(r'^#define CELL_GCM_MAX_IO_MAPPINGS\s+(\d+)', hdr, re.M).group(1)
+-parts = [function(r'static IoMapping\* find_free_mapping\(void\)'),
++page_index = re.search(r'^#define GCM_EA_PAGES .*?^static int s_io_page_busy;$', src, re.M | re.S).group(0)
++parts = [function(r'static void gcm_io_mappings_changed\(void\)'),
++         function(r'static IoMapping\* find_free_mapping\(void\)'),
+          function(r'static u32 gcm_io_alloc\(u32 size\)\n\{'),
+          function(r's32 cellGcmMapMainMemory\(u32 ea, u32 size, u32\* offset\)'),
+-         function(r'void cellGcm_syscall_iomap\(u32 ea, u32 io, u32 size\)')]
++         function(r'void cellGcm_syscall_iomap\(u32 ea, u32 io, u32 size\)'),
++         function(r'static u32 gcm_ea2io_range\(u32 ea, u32\* room, int first\)'),
++         page_index,
++         function(r'static void gcm_io_pages_rebuild\(u32 gen\)'),
++         function(r'static int gcm_io_first_slot\(u32 ea\)')]
+ 
+ HARNESS = r'''
+ #include <stdint.h>
+@@ -62,6 +68,7 @@ static CellGcmConfig s_config = { 0x100000u, 0x200000u };
+ typedef struct IoMapping { u32 ea; u32 io; u32 size; int active; } IoMapping;
+ static IoMapping s_io_mappings[CELL_GCM_MAX_IO_MAPPINGS];
+ static int s_io_mapping_count = 0;
++static u32 s_io_map_gen = 1;
+ static unsigned char mem[0x1000];
+ static void vm_write32(u32 a, u32 v) { for (int i = 0; i < 4; i++) mem[a + i] = (unsigned char)(v >> (24 - 8 * i)); }
+ static u32 rd32(u32 a) { return (u32)mem[a] << 24 | mem[a + 1] << 16 | mem[a + 2] << 8 | mem[a + 3]; }
+@@ -69,6 +76,24 @@ static void populate_offset_table(u32 ea, u32 io, u32 size) { (void)ea; (void)io
+ static u32 s_io_alloc_next = 0;
+ static u32 gcm_io_alloc(u32 size);
+ %s
++/* The SPU PUT page index must give the full scan's answer at every EA. */
++static int index_matches_scan(void)
++{
++    static const u32 offsets[] = {0, 1, 0x7FFFF, 0x80000, 0xFFFFF};
++    for (u32 page = 0; page < 4096; page++)
++        for (unsigned k = 0; k < sizeof offsets / sizeof offsets[0]; k++) {
++            const u32 ea = (page << 20) | offsets[k];
++            u32 room_full = 0, room_index = 0;
++            const u32 full = gcm_ea2io_range(ea, &room_full, 0);
++            const int first = gcm_io_first_slot(ea);
++            const u32 indexed = first < 0 ? 0xFFFFFFFFu : gcm_ea2io_range(ea, &room_index, first);
++            if (full != indexed || (full != 0xFFFFFFFFu && room_full != room_index)) {
++                printf("index mismatch at ea 0x%%08X: scan 0x%%08X index 0x%%08X\n", ea, full, indexed);
++                return 0;
++            }
++        }
++    return 1;
++}
+ int main(void)
+ {
+     u32* out = (u32*)(uintptr_t)0x100;     /* guest out-param address */
+@@ -77,7 +102,7 @@ int main(void)
+     /* 3: map A and B, unmap A (as cellGcmUnmapIoAddress does), then iomap C. */
+     cellGcmMapMainMemory(0x20000000u, 0x100000u, out);
+     cellGcmMapMainMemory(0x20100000u, 0x100000u, out);
+-    s_io_mappings[0].active = 0; s_io_mapping_count--;
++    s_io_mappings[0].active = 0; s_io_mapping_count--; gcm_io_mappings_changed();
+     cellGcm_syscall_iomap(0x30000000u, 0x00A00000u, 0x100000u);
+     int b_kept = 0, c_found = 0;
+     for (int i = 0; i < CELL_GCM_MAX_IO_MAPPINGS; i++) {
+@@ -108,6 +133,23 @@ int main(void)
+     printf("%%s refused call leaves the IO allocator alone: %%s\n",
+            leaked == 0 ? "ok  " : "FAIL", leaked < 0 ? "no refusal" : leaked ? "leaked" : "yes");
+     ok &= leaked == 0;
++
++    /* 4: SPU PUT page index against the full scan, across mapping changes:
++     * the table above, unmapped holes, an unaligned, overlapping, top-of-
++     * address-space and wrapping range (iomap checks none of these). */
++    int index_ok = index_matches_scan();
++    for (int i = 3; i < 40; i += 5) { s_io_mappings[i].active = 0; s_io_mapping_count--; gcm_io_mappings_changed(); }
++    index_ok &= index_matches_scan();
++    cellGcm_syscall_iomap(0x40280000u, 0x0FE00000u, 0x100000u);
++    cellGcm_syscall_iomap(0x7FF80000u, 0x0FD00000u, 0x00180000u);
++    cellGcm_syscall_iomap(0xFFF00000u, 0x0FC00000u, 0x00100000u);
++    cellGcm_syscall_iomap(0xFFF80000u, 0x0FB00000u, 0x00100000u);
++    index_ok &= index_matches_scan();
++    memset(s_io_mappings, 0, sizeof s_io_mappings); s_io_mapping_count = 0; gcm_io_mappings_changed();
++    index_ok &= index_matches_scan();
++    printf("%%s SPU PUT page index matches the full scan at every 1 MB page: %%s\n",
++           index_ok ? "ok  " : "FAIL", index_ok ? "yes" : "no");
++    ok &= index_ok;
+     return ok ? 0 : 1;
+ }
+ '''
 diff --git a/tools/test_ppu_entry_arguments.py b/tools/test_ppu_entry_arguments.py
 index a143ed3..29181d7 100644
 --- a/tools/test_ppu_entry_arguments.py
@@ -15443,10 +15778,10 @@ index 0000000..ca28358
 +}
 diff --git a/runtime/spu/tests/test_dispatch_checks.c b/runtime/spu/tests/test_dispatch_checks.c
 new file mode 100644
-index 0000000..d3c0a24
+index 0000000..8a1b0ba
 --- /dev/null
 +++ b/runtime/spu/tests/test_dispatch_checks.c
-@@ -0,0 +1,103 @@
+@@ -0,0 +1,146 @@
 +/* Differentially compare release transfers with the complete diagnostic hook. */
 +#include "../spu_drain.c"
 +#include <assert.h>
@@ -15461,6 +15796,7 @@ index 0000000..d3c0a24
 +    }
 +}
 +void spu_halt(spu_context* ctx) { ctx->status=0x1234;longjmp(stop,1); }
++volatile int g_yz_lockstep_on=0;
 +static int invoke(spu_context* ctx,int fast,void* fn)
 +{
 +    int result=setjmp(stop);
@@ -15469,6 +15805,24 @@ index 0000000..d3c0a24
 +        else spu_task_launch_slow(ctx,fn);
 +    }
 +    return result;
++}
++/* The drain loops' hop: inline release form, else the out-of-line hook. */
++static int hop_invoke(spu_context* ctx,void* fn)
++{
++    int result=setjmp(stop);
++    if(!result) {
++        if(spu_hop_release_ok(ctx))spu_hop_release(ctx,(void (*)(spu_context*))fn);
++        else spu_task_launch_check(ctx,fn);
++    }
++    return result;
++}
++static void fill(spu_context* a,unsigned i)
++{
++    memset(a,0,sizeof *a);
++    a->pc=(i%5==0)?0:((i%7==0)?SPU_LS_SIZE:0x4000+i*4);
++    a->steps=i%3==0?0:i;
++    a->image_id=(i%3==0)?0:900;a->policy_mode=i&1;
++    a->host_depth=(i%4);a->gpr[3]._u32[0]=0x12345678;
 +}
 +static double clock_s(void)
 +{
@@ -15510,34 +15864,58 @@ index 0000000..d3c0a24
 +    setenv("SPU_HOST_DEPTH_MAX","64",1);
 +    assert(spu_fast_dispatch_init()==1 && s_lean_dispatch==1);
 +    spu_context* a=calloc(1,sizeof *a);spu_context* b=calloc(1,sizeof *b);assert(a&&b);
++    assert(!g_spu_hop_fast);
 +    for(unsigned i=0;i<2048;++i) {
-+        memset(a,0,sizeof *a);
-+        a->pc=(i%5==0)?0:((i%7==0)?SPU_LS_SIZE:0x4000+i*4);
-+        a->steps=i%3==0?0:i;
-+        a->image_id=(i%3==0)?0:900;a->policy_mode=i&1;
-+        a->host_depth=(i%4);a->gpr[3]._u32[0]=0x12345678;
++        fill(a,i);
 +        memcpy(b,a,sizeof *b);
 +        void* fn=i%11==0?(void*)switches_stack:NULL;
 +        int reference=invoke(a,0,fn),candidate=invoke(b,1,fn);
 +        assert(reference==candidate && !memcmp(a,b,sizeof *a));
 +    }
 +    assert(stack_switches);
++    /* Lockstep resolved off and no tail-return probe: the inline hop is on,
++     * and must leave the same context and take the same exits. */
++    assert(g_spu_hop_fast==1);
++    const unsigned switches_before=stack_switches;
++    for(unsigned i=0;i<2048;++i) {
++        fill(a,i);
++        memcpy(b,a,sizeof *b);
++        void* fn=i%11==0?(void*)switches_stack:NULL;
++        int reference=invoke(a,1,fn),candidate=hop_invoke(b,fn);
++        assert(reference==candidate && !memcmp(a,b,sizeof *a));
++    }
++    assert(stack_switches>switches_before);
 +    memset(a,0,sizeof *a);a->pc=0x1234;a->policy_mode=1;
 +    g_pm_flow_ctx=a;g_pm_flow_n=0;
 +    assert(!invoke(a,1,NULL) && g_pm_flow_n==1 && g_pm_flow_buf[0]==0x1234);
++    assert(!hop_invoke(a,NULL) && g_pm_flow_n==2 && g_pm_flow_buf[1]==0x1234);
 +    g_pm_flow_ctx=NULL;
 +    uint32_t recent[32];assert(!spu_recent_pcs(recent,32));
++    /* Lockstep armed or not yet resolved keeps every hop out of line. */
++    const int lockstep_states[]={1,-1};
++    for(unsigned i=0;i<2;++i) {
++        g_yz_lockstep_on=lockstep_states[i];
++        assert(spu_fast_dispatch_init()==1 && !g_spu_hop_fast);
++        memset(a,0,sizeof *a);a->pc=0x4000;
++        assert(!invoke(a,1,NULL) && a->steps==1 && !g_spu_hop_fast);
++    }
++    g_yz_lockstep_on=0;
 +    /* Every existing observation/compatibility option forces the full path,
 +     * even a value of zero: some legacy switches use presence semantics. */
 +    const char* probes[]={"MOTORSTORM_WWS_WAIT_TRACE","SPU_NO_LS0_END",
 +        "SPU_EXITTRACE","SPU_STEPTRACE","SPU_STEPTRACE_FROM","SPU_JOBDRAIN"};
 +    for(unsigned i=0;i<sizeof probes/sizeof probes[0];++i) {
-+        setenv(probes[i],"0",1);assert(!spu_fast_dispatch_init() && !s_lean_dispatch);unsetenv(probes[i]);
++        setenv(probes[i],"0",1);assert(!spu_fast_dispatch_init() && !s_lean_dispatch);
++        memset(a,0,sizeof *a);a->pc=0x4000;
++        assert(!spu_hop_release_ok(a));
++        (void)invoke(a,1,NULL);assert(!g_spu_hop_fast);
++        unsetenv(probes[i]);
 +    }
 +    assert(spu_fast_dispatch_init()==1);
 +    memset(a,0,sizeof *a);a->image_id=900;a->host_depth=4;a->policy_mode=1;
 +    double slow=bench(a,0),fast=bench(a,1);
 +    printf("PASS: 2048 identical contexts/exits, stack switches, flow capture and probe fallback; 5M policy transfers %.3f -> %.3f s (%.2fx)\n",slow,fast,slow/fast);
++    printf("PASS inline hop: 2048 identical contexts/exits against the release hook; flow capture, unresolved/armed lockstep and probes stay out of line\n");
 +    for(unsigned i=0;i<256;++i) {
 +        memset(a,0,sizeof *a);a->host_depth=i;a->pc=0x1000+i*4;
 +        memcpy(b,a,sizeof *b);

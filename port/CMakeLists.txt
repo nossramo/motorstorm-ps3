@@ -519,6 +519,25 @@ if(MOTORSTORM_NEON_VMX)
     endforeach()
 endif()
 
+# Plain lifted guest stores inline; watched, null-page, out-of-range, raw-SPU
+# and SPU-reserved stores keep the runtime's out-of-line vm_write* path.
+option(MOTORSTORM_INLINE_STORES "Inline ordinary lifted PPU guest stores" OFF)
+set(MOTORSTORM_INLINE_STORE_UNITS "" CACHE STRING
+    "Generated PPU units selected by store caller profiles (three-digit IDs)")
+if(MOTORSTORM_INLINE_STORES)
+    if(NOT MOTORSTORM_INLINE_STORE_UNITS)
+        message(FATAL_ERROR "MOTORSTORM_INLINE_STORES needs MOTORSTORM_INLINE_STORE_UNITS")
+    endif()
+    foreach(unit IN LISTS MOTORSTORM_INLINE_STORE_UNITS)
+        if(NOT unit MATCHES "^[0-9][0-9][0-9]$" OR
+           NOT EXISTS "${RECOMP_DIR}/ppu_recomp_${unit}.cpp")
+            message(FATAL_ERROR "Invalid inline store profile unit: ${unit}")
+        endif()
+        set_property(SOURCE "${RECOMP_DIR}/ppu_recomp_${unit}.cpp" APPEND PROPERTY
+            COMPILE_OPTIONS "-include;${CMAKE_CURRENT_SOURCE_DIR}/ppu_store_inline.h")
+    endforeach()
+endif()
+
 option(MOTORSTORM_VMX_BENCHMARK "Include isolated developer VMX equivalence/CPU test" OFF)
 if(MOTORSTORM_VMX_BENCHMARK)
     if(NOT APPLE OR NOT CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")

@@ -196,6 +196,7 @@ def main():
     k = args.e_core_ratio
     roles = {}
     vmx_callers = collections.defaultdict(collections.Counter)
+    memory_callers = collections.defaultdict(collections.Counter)
     threads = collections.defaultdict(lambda: collections.Counter())
     for tid, kind, ms, names, bins in samples:
         names = [sym.get(n, n) for n in names]
@@ -203,12 +204,13 @@ def main():
         leaf = names[0] if names else '<no stack>'
         binary = bins[0] if bins else None
         cat = classify(leaf, binary, names) if names else 'no_stack'
-        if cat == 'vmx_helper':
-            # Static VMX helpers have the same name in many generated units.
-            # Preserve the guest caller so a hot helper can be optimized in
-            # the units actually used by this trace, not guessed from its name.
+        if cat in ('vmx_helper', 'guest_memory'):
+            # Static VMX helpers have the same name in many generated units,
+            # and out-of-line guest memory calls come from every unit.
+            # Preserve the guest caller so a hot helper or store path can be
+            # optimized in the units actually used by this trace.
             caller = next((n for n in names[1:] if n.startswith(('func_', '_Z13func_'))), '<unknown>')
-            vmx_callers[(role, leaf, caller)][kind] += ms
+            (vmx_callers if cat == 'vmx_helper' else memory_callers)[(role, leaf, caller)][kind] += ms
         app = next((n for n, b in zip(names, bins) if b == 'MotorStorm iOS'), None)
         r = roles.setdefault(role, {'ms': 0.0, 'P_ms': 0.0, 'E_ms': 0.0,
                                     'categories': collections.Counter(),
@@ -248,6 +250,9 @@ def main():
     report['vmx_callers'] = [
         {'role': key[0], 'helper': key[1], 'caller': key[2], 'P_ms': value['P'], 'E_ms': value['E']}
         for key, value in sorted(vmx_callers.items(), key=lambda kv: -kv[1]['P'])]
+    report['guest_memory_callers'] = [
+        {'role': key[0], 'helper': key[1], 'caller': key[2], 'P_ms': value['P'], 'E_ms': value['E']}
+        for key, value in sorted(memory_callers.items(), key=lambda kv: -kv[1]['P'])]
     if duration < 5:
         warning = 'Less than five seconds of samples: diagnostic fragment, not a stable performance baseline.'
         print('WARNING: ' + warning)

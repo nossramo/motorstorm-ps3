@@ -34,10 +34,14 @@ def main():
         return
     ios = platform != 'macosx'
     # iPhone caller samples: historical full trace + current lock-candidate
-    # fragment. Keep macOS's five-unit/FMA-only configuration independent.
-    # The component test is positive, but hot-phone gameplay is inconclusive.
-    # Require an explicit comparison build until matched gameplay validates it.
-    ios_vmx = os.environ.get('MOTORSTORM_BUILD_IOS_VMX') == '1'
+    # fragment. Bit-exact in the device lane test; =0 selects the previous
+    # five-unit/FMA-only configuration for comparison.
+    ios_vmx = os.environ.get('MOTORSTORM_BUILD_IOS_VMX') != '0'
+    inline_stores = os.environ.get('MOTORSTORM_BUILD_IOS_INLINE_STORES') != '0'
+    # Units holding ~90% of out-of-line store/coherence-check time in the
+    # iPhone gameplay trace (logs/ios-vmx-01, main and physics threads).
+    store_units = ('083;065;091;082;092;063;075;089;064;060;070;000;055;002;076;056;081;062;069;068'
+                   if inline_stores else '')
     vmx_units = ('001;002;034;035;036;042;051;055;057;058;060;064;065;068;069;070;074;075;076;081;082;092'
                  if ios_vmx else '002;057;075;076;082')
     for required in ('vendor/ps3recomp/CMakeLists.txt', 'port/recompiled/ppu_recomp.h',
@@ -75,6 +79,8 @@ def main():
                 f'-DMOTORSTORM_NEON_VMX_UNITS={vmx_units}',
                 '-DMOTORSTORM_NEON_ARITHMETIC=' + ('ON' if ios_vmx else 'OFF'),
                 '-DMOTORSTORM_JOB_ARITHMETIC=ON',
+                '-DMOTORSTORM_INLINE_STORES=' + ('ON' if inline_stores else 'OFF'),
+                f'-DMOTORSTORM_INLINE_STORE_UNITS={store_units}',
                 '-DMOTORSTORM_VMX_BENCHMARK=' + ('ON' if os.environ.get(
                     'MOTORSTORM_BUILD_VMX_BENCHMARK') == '1' else 'OFF'),
                 '-DMOTORSTORM_AUDIO_BENCHMARK=' + ('ON' if os.environ.get(
@@ -119,7 +125,8 @@ def main():
                      and not any(part.startswith('.') for part in p.relative_to(game).parts)}
             config = {'environment': values, 'files': files,
                       'build_options': {'ppu_vmx_units': vmx_units.split(';'),
-                                        'ppu_vmx_arithmetic': ios_vmx}}
+                                        'ppu_vmx_arithmetic': ios_vmx,
+                                        'ppu_inline_store_units': store_units.split(';') if store_units else []}}
         else:
             config = {'root': str(root), 'environment': environment(root)}
         write_changed(resources / 'MotorStormLaunch.json', json.dumps(config, indent=2, ensure_ascii=False) + '\n')
