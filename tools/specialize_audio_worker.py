@@ -9,12 +9,40 @@ import hashlib
 import json
 from pathlib import Path
 import sys
+from specialize_audio_bounds import specialize as bounded_arithmetic
 
 ROOT = Path(__file__).resolve().parents[1]
 IMAGE = 'spu_1136862334bb6208f794040f3a7f26e4991cd6b00eac6229331432566f1535d1'
 INPUT = ROOT / 'port/spu' / IMAGE
 ENTRIES = (0x5238, 0x5670, 0x5848, 0x98D8)
 CODE_SHA = '97480975c296a627dca1edbeecd1a6114cdc960564338778600c6b61da9eb82e'
+
+
+def private_registers(body):
+    """Keep loop registers separate from LS; publish at every host/guest exit.
+
+    With diagnostics excluded, the only observers of guest registers are the
+    calls and exits below. A private array also proves that LS stores cannot
+    alias registers, allowing the compiler to keep live values in ARM64 SIMD
+    registers instead of spilling them after each sample load/store.
+    """
+    save = 'memcpy(ctx->gpr, audio_registers, sizeof audio_registers);'
+    load = 'memcpy(audio_registers, ctx->gpr, sizeof audio_registers);'
+    lines = body.splitlines()
+    result = [lines[0], '    u128 audio_registers[128];', '    ' + load]
+    for line in lines[1:-1]:
+        if 'spu_drain_call(' in line:
+            # arithmetic_scope already restored host FPCR before this line.
+            # Keep its link-register assignment in the published guest state.
+            result += ['    ' + save, line, '    ' + load]
+            continue
+        line = line.replace('ctx->gpr', 'audio_registers')
+        line = line.replace('SPU_RET(ctx);', save + ' SPU_RET(ctx);')
+        line = line.replace('return;', save + ' return;')
+        result.append(line)
+    # Includes the fallthrough exit; FPCR was restored by arithmetic_scope.
+    result += ['    ' + save, lines[-1]]
+    return '\n'.join(result)
 
 
 def arithmetic_scope(body, entry):
@@ -94,23 +122,46 @@ def generate(output):
         for op in ('fa', 'fs', 'fm', 'fma'):
             compact = compact.replace('ms_rtz_' + op + '(', 'ms_audio_compact_' + op + '(')
         compact = compact.replace('ms_audio_rtz_fms(', 'ms_audio_compact_fms(')
+        direct_ls = compact.replace(f'ms_audio_compact_{entry:X}(', f'ms_audio_direct_ls_{entry:X}(', 1)
+        direct_ls = direct_ls.replace('spu_ls_read128(', 'ms_audio_ls_read128(')
+        direct_ls = direct_ls.replace('spu_ls_write128(', 'ms_audio_ls_write128(')
+        direct_ls = private_registers(direct_ls)
+        bounded = bounded_arithmetic(direct_ls, entry)
         wrapper = f'''void {name}(spu_context* ctx) {{
     ms_audio_worker_capture(ctx, 0x{entry:X}, {index});
-    if (ms_audio_worker_mode() >= 3 && ms_audio_worker_scope_safe(ctx)) ms_audio_compact_{entry:X}(ctx);
+    if (ms_audio_worker_mode() >= 5 && ms_audio_worker_scope_safe(ctx)) ms_audio_bounded_{entry:X}(ctx);
+    else if (ms_audio_worker_mode() >= 4 && ms_audio_worker_scope_safe(ctx)) ms_audio_direct_ls_{entry:X}(ctx);
+    else if (ms_audio_worker_mode() >= 3 && ms_audio_worker_scope_safe(ctx)) ms_audio_compact_{entry:X}(ctx);
     else if (ms_audio_worker_mode() >= 2 && ms_audio_worker_scope_safe(ctx)) ms_audio_scoped_{entry:X}(ctx);
     else if (ms_audio_worker_mode()) ms_audio_merged_{entry:X}(ctx);
     else ms_audio_reference_{entry:X}(ctx);
 }}'''
-        source = source.replace(old_body, reference + '\n' + optimized + '\n' + scoped + '\n' + compact + '\n' + wrapper, 1)
+        source = source.replace(old_body, reference + '\n' + optimized + '\n' + scoped + '\n' + compact + '\n' + direct_ls + '\n' + bounded + '\n' + wrapper, 1)
         additions.append(f'{entry:05X}-{groups[entry]:05X}')
     if lifter.unsupported:
         raise SystemExit('Unsupported instructions in merged audio loops.')
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text('#include "spu_audio_worker.h"\n' + source)
+    # App launchers apply environment settings after C constructors. Re-read
+    # these settings once at game boot, before any guest/audio worker starts.
+    configure = '''#ifndef MOTORSTORM_AUDIO_WORKER_TEST
+void port_audio_worker_configure(void) {
+    ms_audio_worker_init();
+    fprintf(stderr, "[audio-worker] configured mode=%d\\n", ms_audio_worker_mode());
+}
+#endif
+'''
+    output.write_text('#include "spu_audio_worker.h"\n' + configure + source)
     print('Generated checked audio loop groups: ' + ', '.join(additions))
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--generate', type=Path, required=True)
-    generate(parser.parse_args().generate)
+    parser.add_argument('--benchmark', action='store_true', help='Namespace the isolated developer replay')
+    args = parser.parse_args()
+    generate(args.generate)
+    if args.benchmark:
+        header = args.generate.with_suffix('.h')
+        header.write_text((INPUT / 'spu_recomp.h').read_text().replace(IMAGE, 'benchmark_' + IMAGE))
+        source = args.generate.read_text().replace(IMAGE, 'benchmark_' + IMAGE)
+        args.generate.write_text(source.replace('#include "spu_recomp.h"', f'#include "{header.name}"'))

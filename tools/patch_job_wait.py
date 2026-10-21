@@ -29,6 +29,11 @@ void func_00CF7358(ppu_context* ctx) {
                         0xCF7358, t0, ps3_ft_now());
 }
 """
+OLD_WRAPPER = WRAPPER
+WRAPPER = WRAPPER.replace('    profiled_job_wait_impl(ctx);', '''    const uint64_t passive_start = ps3_metric_begin();
+    profiled_job_wait_impl(ctx);
+    ps3_wait_record(PW_JOB_TOTAL, passive_start, 0);''')
+PASSIVE_INCLUDE = '#include "ps3emu/passive_waits.h"\n'
 
 
 def patch(source):
@@ -40,7 +45,7 @@ def patch(source):
             raise ValueError("Unrecognized existing wait hook")
         original = block.replace(IMPLEMENTATION, SIGNATURE, 1)
         original = original.replace(COUNTER, "", 1).replace(WAIT, BACKEDGE, 1)
-        if WRAPPER + block not in source or INCLUDE not in source:
+        if not any(w + block in source for w in (WRAPPER, OLD_WRAPPER)) or INCLUDE not in source:
             raise ValueError("Incomplete wait wrapper")
         already_patched = True
     else:
@@ -53,11 +58,13 @@ def patch(source):
     if hashlib.sha256(original.encode()).hexdigest() != ORIGINAL_SHA256:
         raise ValueError("Generated wait function changed; review before patching")
     if already_patched:
-        return source
+        result = source.replace(OLD_WRAPPER + block, WRAPPER + block, 1)
+        return result if PASSIVE_INCLUDE in result else PASSIVE_INCLUDE + result
     block = original.replace(SIGNATURE, IMPLEMENTATION + "\n" + COUNTER.rstrip("\n"), 1)
     block = block.replace(BACKEDGE, WAIT, 1)
     result = source[:start] + WRAPPER + block + source[end:]
-    return result if INCLUDE in result else INCLUDE + result
+    if INCLUDE not in result: result = INCLUDE + result
+    return result if PASSIVE_INCLUDE in result else PASSIVE_INCLUDE + result
 
 
 def main():

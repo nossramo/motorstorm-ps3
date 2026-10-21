@@ -39,7 +39,13 @@ subprocess.run([sys.executable, str(ROOT / 'vendor/ps3recomp/tools/lift_jobmods.
                 '--register', str(registration)], check=True)
 for path in (ROOT / 'port/spu').glob('jobmod_*/*.[ch]'):
     path.write_text(path.read_text().replace('../../runtime/spu/', ''))
-source = registration.read_text().replace('#include <stdint.h>', '#include <stdint.h>\n#include <stdlib.h>')
+source = registration.read_text().replace('#include <stdint.h>', '#include <stdint.h>\n#include <stdlib.h>\n#include <stdio.h>')
 source = source.replace('void port_jobmods_register_all(void)\n{',
-                        'void port_jobmods_register_all(void)\n{\n    if (!getenv("MOTORSTORM_NATIVE_JOBS")) return;')
+                        'void port_jobmods_register_all(void)\n{\n'
+                        '    /* App launch settings arrive after constructors. Retry at game boot,\n'
+                        '     * but register only once when a CLI already enabled the constructor. */\n'
+                        '    static int registered;\n'
+                        '    if (registered || !getenv("MOTORSTORM_NATIVE_JOBS")) return;\n'
+                        '    registered = 1;\n'
+                        '    fprintf(stderr, "[native-jobs] registering 10 compiled WWS modules\\n");')
 registration.write_text(source)

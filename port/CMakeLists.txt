@@ -77,6 +77,15 @@ message(STATUS "Lifted sources:  ${RECOMP_SOURCE_COUNT} file(s)")
 add_subdirectory("${PS3RECOMP_DIR}" "${CMAKE_BINARY_DIR}/ps3recomp_sdk"
                  EXCLUDE_FROM_ALL)
 
+# Emit the runtime's zero-initialized C globals as ordinary definitions.
+# Darwin's linker over-aligns large common blocks to 32 KB and then warns
+# when clamping them to a 16 KB segment. Explicit BSS definitions preserve
+# each variable's declared alignment without that common-block heuristic.
+if(APPLE AND CMAKE_C_COMPILER_ID MATCHES "Clang")
+    target_compile_options(ps3recomp_runtime PRIVATE
+        "$<$<COMPILE_LANGUAGE:C>:-fno-common>")
+endif()
+
 # Offline RPCS3 frame comparison. This target does not link the lifted game.
 if(APPLE)
     add_executable(motorstorm_rsx_replay EXCLUDE_FROM_ALL ../tools/rsx_replay.c)
@@ -202,6 +211,34 @@ if(MOTORSTORM_CULL_SCOPE)
     list(APPEND SPU_SOURCES "${CULL_SPECIALIZED}")
 endif()
 
+# Exact arithmetic segments measured on captured inputs on A18 Pro. The
+# runtime mask can still select the original path for gameplay comparisons.
+# Existing culling specialization is retained as input.
+option(MOTORSTORM_JOB_ARITHMETIC "Build measured WWS arithmetic specializations" OFF)
+if(MOTORSTORM_JOB_ARITHMETIC)
+    if(NOT APPLE OR NOT CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
+        message(FATAL_ERROR "Job arithmetic scopes require Apple ARM64")
+    endif()
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    foreach(module IN ITEMS jobmod_e5d3c4d056fe_e12E10 jobmod_be896a6374ba_e12230)
+        set(JOB_ORIGINAL "${SPU_DIR}/${module}/spu_recomp.c")
+        if(module STREQUAL "jobmod_be896a6374ba_e12230" AND MOTORSTORM_CULL_SCOPE)
+            set(JOB_ORIGINAL "${CULL_SPECIALIZED}")
+        endif()
+        set(JOB_SPECIALIZED "${CMAKE_CURRENT_BINARY_DIR}/${module}_scopes.c")
+        add_custom_command(OUTPUT "${JOB_SPECIALIZED}"
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../tools/specialize_job_arithmetic.py"
+                --input "${JOB_ORIGINAL}" --generate "${JOB_SPECIALIZED}"
+            DEPENDS "${JOB_ORIGINAL}" "${CMAKE_CURRENT_SOURCE_DIR}/../tools/specialize_job_arithmetic.py"
+                "${CMAKE_CURRENT_SOURCE_DIR}/spu_job_scope.h" "${CMAKE_CURRENT_SOURCE_DIR}/spu_float_scope.h"
+                "${SPU_DIR}/jobmod_e5d3c4d056fe_e12E10/spu_recomp.c"
+                "${SPU_DIR}/jobmod_be896a6374ba_e12230/spu_recomp.c"
+            VERBATIM)
+        list(REMOVE_ITEM SPU_SOURCES "${JOB_ORIGINAL}")
+        list(APPEND SPU_SOURCES "${JOB_SPECIALIZED}")
+    endforeach()
+endif()
+
 # Preserve the lift on disk; the generated copy adds an env-gated host wait
 # at one signature-checked semaphore delay. Disabled by default at runtime.
 set(SEMAPHORE_IMAGE "spu_e4633a5354beb2ec6e89ced78ef31ef3076c119b62ac8e7b0302a1f0b540e559")
@@ -231,6 +268,7 @@ if(AUDIO_WORKER_ORIGINAL IN_LIST SPU_SOURCES AND CMAKE_SYSTEM_PROCESSOR MATCHES 
         DEPENDS "${AUDIO_WORKER_ORIGINAL}" "${SPU_DIR}/${AUDIO_WORKER_IMAGE}/code.bin"
             "${SPU_DIR}/${AUDIO_WORKER_IMAGE}/functions.json"
             "${CMAKE_CURRENT_SOURCE_DIR}/../tools/specialize_audio_worker.py"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../tools/specialize_audio_bounds.py"
             "${PS3RECOMP_DIR}/tools/spu_lifter.py" "${PS3RECOMP_DIR}/tools/spu_disasm.py"
         VERBATIM)
     list(REMOVE_ITEM SPU_SOURCES "${AUDIO_WORKER_ORIGINAL}")
@@ -248,6 +286,62 @@ add_library(${PROJECT_NAME} STATIC
     ${RECOMP_SOURCES}
     ${SPU_SOURCES}
 )
+
+option(MOTORSTORM_JOB_BENCHMARK "Include developer-only replay of captured CPU inputs" OFF)
+if(MOTORSTORM_JOB_BENCHMARK)
+    if(NOT APPLE OR NOT CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
+        message(FATAL_ERROR "Job arithmetic replay requires Apple ARM64")
+    endif()
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    set(JOB_TEST_INCLUDE "${CMAKE_CURRENT_BINARY_DIR}/job_arithmetic.inc")
+    add_custom_command(OUTPUT "${JOB_TEST_INCLUDE}"
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../tools/specialize_job_arithmetic.py"
+            --test-source "${JOB_TEST_INCLUDE}"
+        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../tools/specialize_job_arithmetic.py"
+            "${SPU_DIR}/jobmod_e5d3c4d056fe_e12E10/spu_recomp.c"
+            "${SPU_DIR}/jobmod_be896a6374ba_e12230/spu_recomp.c"
+        VERBATIM)
+    target_sources(${PROJECT_NAME} PRIVATE tests/test_job_arithmetic.c "${JOB_TEST_INCLUDE}")
+    set_source_files_properties(tests/test_job_arithmetic.c PROPERTIES
+        OBJECT_DEPENDS "${JOB_TEST_INCLUDE}"
+        INCLUDE_DIRECTORIES "${CMAKE_CURRENT_BINARY_DIR};${PS3RECOMP_DIR}/runtime/spu"
+        COMPILE_DEFINITIONS MOTORSTORM_JOB_BENCHMARK=1
+        COMPILE_OPTIONS "-O2;-UNDEBUG;-ffp-contract=off")
+    set_property(SOURCE main.cpp APPEND PROPERTY COMPILE_DEFINITIONS MOTORSTORM_HAS_JOB_BENCHMARK=1)
+endif()
+
+option(MOTORSTORM_AUDIO_BENCHMARK "Include isolated developer audio replay" OFF)
+if(MOTORSTORM_AUDIO_BENCHMARK)
+    if(NOT AUDIO_WORKER_SPECIALIZED)
+        message(FATAL_ERROR "Audio replay requires the checked ARM64 audio worker")
+    endif()
+    set(AUDIO_REPLAY_SOURCE "${CMAKE_CURRENT_BINARY_DIR}/audio_worker_benchmark.c")
+    set(AUDIO_REPLAY_TEST "${CMAKE_CURRENT_SOURCE_DIR}/../tests/audio_worker_replay.c")
+    add_custom_command(OUTPUT "${AUDIO_REPLAY_SOURCE}"
+        BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/audio_worker_benchmark.h"
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../tools/specialize_audio_worker.py"
+            --generate "${AUDIO_REPLAY_SOURCE}" --benchmark
+        DEPENDS "${AUDIO_WORKER_SPECIALIZED}" "${CMAKE_CURRENT_SOURCE_DIR}/../tools/specialize_audio_worker.py"
+        VERBATIM)
+    target_sources(${PROJECT_NAME} PRIVATE "${AUDIO_REPLAY_TEST}" "${AUDIO_REPLAY_SOURCE}")
+    set_source_files_properties("${AUDIO_REPLAY_TEST}" "${AUDIO_REPLAY_SOURCE}" PROPERTIES
+        INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR};${PS3RECOMP_DIR}/runtime/spu;${SPU_DIR}/${AUDIO_WORKER_IMAGE}"
+        COMPILE_DEFINITIONS "MOTORSTORM_AUDIO_WORKER_TEST=1;MOTORSTORM_AUDIO_BENCHMARK=1"
+        COMPILE_OPTIONS "-O2;-UNDEBUG;-ffp-contract=off;-include;${CMAKE_CURRENT_SOURCE_DIR}/../tests/audio_worker_namespace.h")
+    set_property(SOURCE main.cpp APPEND PROPERTY COMPILE_DEFINITIONS MOTORSTORM_HAS_AUDIO_BENCHMARK=1)
+endif()
+
+# Native-job registration has an environment gate. App launchers load that
+# environment after constructors, so also initialize it at game boot. Scope
+# the definition to main.cpp to avoid rebuilding every generated game unit.
+if("${SPU_DIR}/jobmods_register.c" IN_LIST SPU_SOURCES)
+    set_property(SOURCE main.cpp APPEND PROPERTY
+        COMPILE_DEFINITIONS MOTORSTORM_HAS_NATIVE_JOBS=1)
+endif()
+if(AUDIO_WORKER_SPECIALIZED)
+    set_property(SOURCE main.cpp APPEND PROPERTY
+        COMPILE_DEFINITIONS MOTORSTORM_HAS_AUDIO_WORKER=1)
+endif()
 
 # The lifted SPU sources use bare #include "spu_context.h". Scope that include
 # directory (and their flags) to those TUs alone: adding it to the whole target
@@ -280,6 +374,15 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
     endforeach()
 endif()
 
+# Keep the arithmetic specialization's include paths and flags local.
+if(MOTORSTORM_JOB_ARITHMETIC)
+    foreach(module IN ITEMS jobmod_e5d3c4d056fe_e12E10 jobmod_be896a6374ba_e12230)
+        set_property(SOURCE "${CMAKE_CURRENT_BINARY_DIR}/${module}_scopes.c" APPEND PROPERTY
+            INCLUDE_DIRECTORIES "${SPU_DIR}/${module}")
+        set_property(SOURCE "${CMAKE_CURRENT_BINARY_DIR}/${module}_scopes.c" APPEND PROPERTY
+            COMPILE_OPTIONS "-ffp-contract=off")
+    endforeach()
+endif()
 # The checked audio worker also uses shared, exact ARM64 arithmetic helpers.
 if(AUDIO_WORKER_SPECIALIZED)
     set_property(SOURCE "${AUDIO_WORKER_SPECIALIZED}" APPEND PROPERTY
@@ -396,11 +499,17 @@ endif()
 # sources and other units intact, and preserve all normal floating semantics.
 option(MOTORSTORM_NEON_VMX "Exact ARM64 SIMD VMX multiply-add in sampled hot PPU units" OFF)
 option(MOTORSTORM_NEON_ARITHMETIC "Experimental exact SIMD add/subtract/negative FMA in the same PPU units" OFF)
+set(MOTORSTORM_NEON_VMX_UNITS "002;057;075;076;082" CACHE STRING
+    "Generated PPU units selected by VMX caller profiles (three-digit IDs)")
 if(MOTORSTORM_NEON_VMX)
     if(NOT APPLE OR NOT CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
         message(FATAL_ERROR "The VMX specialization requires Apple ARM64")
     endif()
-    foreach(unit 002 057 075 076 082)
+    foreach(unit IN LISTS MOTORSTORM_NEON_VMX_UNITS)
+        if(NOT unit MATCHES "^[0-9][0-9][0-9]$" OR
+           NOT EXISTS "${RECOMP_DIR}/ppu_recomp_${unit}.cpp")
+            message(FATAL_ERROR "Invalid VMX profile unit: ${unit}")
+        endif()
         set_property(SOURCE "${RECOMP_DIR}/ppu_recomp_${unit}.cpp" APPEND PROPERTY
             COMPILE_OPTIONS "-include;${CMAKE_CURRENT_SOURCE_DIR}/ppu_vmx_neon.h")
         if(MOTORSTORM_NEON_ARITHMETIC)
@@ -408,6 +517,19 @@ if(MOTORSTORM_NEON_VMX)
                 COMPILE_DEFINITIONS MOTORSTORM_NEON_ARITHMETIC=1)
         endif()
     endforeach()
+endif()
+
+option(MOTORSTORM_VMX_BENCHMARK "Include isolated developer VMX equivalence/CPU test" OFF)
+if(MOTORSTORM_VMX_BENCHMARK)
+    if(NOT APPLE OR NOT CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
+        message(FATAL_ERROR "VMX benchmark requires Apple ARM64")
+    endif()
+    target_sources(${PROJECT_NAME} PRIVATE tests/test_ppu_vmx_neon.c)
+    set_source_files_properties(tests/test_ppu_vmx_neon.c PROPERTIES
+        INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR};${PS3RECOMP_DIR}/runtime/ppu"
+        COMPILE_DEFINITIONS MOTORSTORM_VMX_BENCHMARK=1
+        COMPILE_OPTIONS "-O2;-UNDEBUG;-ffp-contract=off")
+    set_property(SOURCE main.cpp APPEND PROPERTY COMPILE_DEFINITIONS MOTORSTORM_HAS_VMX_BENCHMARK=1)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -420,7 +542,12 @@ add_executable(motorstorm_runner cli_main.cpp)
 target_link_libraries(motorstorm_runner PRIVATE
     "$<LINK_LIBRARY:WHOLE_ARCHIVE,${PROJECT_NAME}>")
 set_target_properties(motorstorm_runner PROPERTIES OUTPUT_NAME MotorStormRecomp)
-install(TARGETS motorstorm_runner RUNTIME DESTINATION bin)
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    # Only a link-dependency description for Xcode on iOS; UIKit owns main.
+    set_target_properties(motorstorm_runner PROPERTIES EXCLUDE_FROM_ALL TRUE)
+else()
+    install(TARGETS motorstorm_runner RUNTIME DESTINATION bin)
+endif()
 
 if(PS3RECOMP_BUILD_TESTS AND APPLE AND SEMAPHORE_SPECIALIZED)
     enable_testing()

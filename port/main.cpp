@@ -38,6 +38,7 @@
  * names over pthreads and mmap, so the call sites below are written once. */
 #include "win32_compat.h"
 #include "apple_game_qos.h"
+#include "ps3emu/passive_threads.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -48,7 +49,55 @@
 #include <thread>
 #ifdef __APPLE__
 #include <CoreFoundation/CoreFoundation.h>
+#include <TargetConditionals.h>
 #endif
+
+/* Developer-only component replay. Normal launches do not call this and
+ * do not load fixtures. Keep the CMake option off in ordinary builds. */
+#ifdef MOTORSTORM_HAS_JOB_BENCHMARK
+extern "C" int motorstorm_job_benchmark_main(int, char**);
+#endif
+extern "C" int motorstorm_job_benchmark(const char* inputs, const char* report)
+{
+#ifdef MOTORSTORM_HAS_JOB_BENCHMARK
+    char name[] = "job-benchmark";
+    char* args[] = {name, const_cast<char*>(inputs), const_cast<char*>(report)};
+    return motorstorm_job_benchmark_main(3, args);
+#else
+    (void)inputs; (void)report;
+    return -1;
+#endif
+}
+
+#ifdef MOTORSTORM_HAS_AUDIO_BENCHMARK
+extern "C" int motorstorm_audio_benchmark_main(int, char**);
+#endif
+extern "C" int motorstorm_audio_benchmark(const char* inputs, const char* report)
+{
+#ifdef MOTORSTORM_HAS_AUDIO_BENCHMARK
+    char name[] = "audio-benchmark";
+    char* args[] = {name, const_cast<char*>(inputs), const_cast<char*>(report)};
+    return motorstorm_audio_benchmark_main(3, args);
+#else
+    (void)inputs; (void)report;
+    return -1;
+#endif
+}
+
+#ifdef MOTORSTORM_HAS_VMX_BENCHMARK
+extern "C" int motorstorm_vmx_benchmark_main(int, char**);
+#endif
+extern "C" int motorstorm_vmx_benchmark(const char* report)
+{
+#ifdef MOTORSTORM_HAS_VMX_BENCHMARK
+    char name[] = "vmx-benchmark";
+    char* args[] = {name, const_cast<char*>(report)};
+    return motorstorm_vmx_benchmark_main(2, args);
+#else
+    (void)report;
+    return -1;
+#endif
+}
 
 #ifdef _WIN32
 /* timeBeginPeriod: <windows.h> arrives with WIN32_LEAN_AND_MEAN set, which
@@ -75,6 +124,12 @@ int      ppu_run(uint32_t entry_opd, uint32_t stack_top);
  * into guest RAM and register their exports. stubs.cpp has the empty version
  * a game with no lifted PRX wants. */
 void     ps3_load_prx_modules(void);
+#ifdef MOTORSTORM_HAS_NATIVE_JOBS
+void     port_jobmods_register_all(void);
+#endif
+#ifdef MOTORSTORM_HAS_AUDIO_WORKER
+void     port_audio_worker_configure(void);
+#endif
 
 extern const char* ppu_vfs_root;              /* host dir the PS3 mount points map into */
 
@@ -177,13 +232,28 @@ static volatile LONG g_frames_presented = 0;
 static bool g_independent_vblank = false; /* set before creating any threads */
 static constexpr int64_t vblank_period_ns = 16683333;
 
+#if TARGET_OS_IPHONE
+static std::atomic<bool> ios_active{true};
+extern "C" void motorstorm_set_active(int active) {
+    ios_active.store(active != 0, std::memory_order_release);
+}
+#endif
+
 static DWORD WINAPI produce_vblank(LPVOID)
 {
+    ps3_metrics_thread_role(PC_VBLANK);
     ps3_apple_game_qos("vblank clock", 1);
     using clock = std::chrono::steady_clock;
     constexpr auto period = std::chrono::nanoseconds(vblank_period_ns);
     auto next = clock::now();
     for (;;) {
+#if TARGET_OS_IPHONE
+        if (!ios_active.load(std::memory_order_acquire)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            next = clock::now();
+            continue;
+        }
+#endif
         std::this_thread::sleep_until(next);
         const auto now = clock::now();
         unsigned fired = 0;
@@ -204,6 +274,7 @@ static uint32_t g_gcm_callbacks_stack;
 static void notify_gcm_callbacks(void) { SetEvent(g_gcm_callbacks_event); }
 static DWORD WINAPI dispatch_gcm_callbacks(LPVOID)
 {
+    ps3_metrics_thread_role(PC_CALLBACK);
     ppu_set_callback_stack_top(g_gcm_callbacks_stack);
     for (;;) {
         /* The 1 ms bound also covers a notification claimed while another
@@ -236,6 +307,7 @@ static void present_guest_frame(void)
 
 static DWORD WINAPI frame_clock(LPVOID)
 {
+    ps3_metrics_thread_role(PC_RENDER);
     ps3_apple_game_qos("render", 1);
     const char* title = getenv("PS3_TITLE");
     if (!title || !*title) title = "ps3recomp";
@@ -268,6 +340,13 @@ static DWORD WINAPI frame_clock(LPVOID)
     int64_t next_tick = tick_now();
 
     for (;;) {
+#if TARGET_OS_IPHONE
+        if (!ios_active.load(std::memory_order_acquire)) {
+            Sleep(20);
+            next_tick = tick_now();
+            continue;
+        }
+#endif
         motorstorm_gpu_sync_service();
         /* Same idle ceiling as before, but do not sleep through pending work.
          * The upstream boot harness already waits on this event; the project
@@ -408,6 +487,7 @@ static int guest_result;
 
 static DWORD WINAPI run_guest(LPVOID)
 {
+    ps3_metrics_thread_role(PC_MAIN);
     ps3_apple_game_qos("main game", 1);
     guest_result = ppu_run(guest_entry, STACK_TOP);
     guest_finished.store(true, std::memory_order_release);
@@ -416,12 +496,28 @@ static DWORD WINAPI run_guest(LPVOID)
 
 extern "C" int motorstorm_main(int argc, char** argv)
 {
-    setvbuf(stdout, NULL, _IONBF, 0);
-    setvbuf(stderr, NULL, _IONBF, 0);
+#if TARGET_OS_IPHONE
+    ps3_metrics_thread_role(PC_MAIN);
+#endif
+    // The iOS offline logger buffers/caps console output off the render/audio
+    // threads. Other launchers retain their immediate diagnostic output.
+    if (!getenv("MOTORSTORM_BUFFERED_LOG")) {
+        setvbuf(stdout, NULL, _IONBF, 0);
+        setvbuf(stderr, NULL, _IONBF, 0);
+    }
     if (argc < 2) {
         printf("usage: %s <PPU ELF>\n", argv[0]);
         return 2;
     }
+#ifdef MOTORSTORM_HAS_NATIVE_JOBS
+    // UIKit/AppKit launchers load their environment after static constructors.
+    // Register the existing native WWS jobs now, before any guest worker starts.
+    // The generated initializer is idempotent for CLI launches that ran it early.
+    port_jobmods_register_all();
+#endif
+#ifdef MOTORSTORM_HAS_AUDIO_WORKER
+    port_audio_worker_configure();
+#endif
     if (const char* e = getenv("MOTORSTORM_VBLANK_THREAD"); e && !strcmp(e, "1")) {
         const char* counted = getenv("GCM_VBLANK_COUNTED");
         if (!counted || strcmp(counted, "1")) {
@@ -483,7 +579,7 @@ extern "C" int motorstorm_main(int argc, char** argv)
            entry, STACK_TOP);
 
     int rc;
-#ifdef __APPLE__
+#if defined(__APPLE__) && !TARGET_OS_IPHONE
     // Cocoa window creation and event pumping dispatch synchronously to the
     // main queue. Keep it serviced while the guest executes on its own stack.
     guest_entry = entry;
@@ -496,6 +592,10 @@ extern "C" int motorstorm_main(int argc, char** argv)
         CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.01, false);
     rc = guest_result;
 #else
+    // The iOS host already calls this entry on a dedicated native thread while
+    // UIApplicationMain services UIKit/Metal callbacks on the main thread.
+    // Match the scheduling policy of the macOS run_guest entry above.
+    ps3_apple_game_qos("main game", 1);
     rc = ppu_run(entry, STACK_TOP);
 #endif
     printf("\n[boot] ppu_run returned %d (entry function unwound)\n", rc);

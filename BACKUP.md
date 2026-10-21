@@ -10,7 +10,8 @@ Git LFS is not required.
 - `port/`: authored runner, platform adapters, native optimization helpers,
   CMake build configuration and tests.
 - `MotorStorm/`: the Xcode project, macOS app entry point and app icons. The
-  macOS target links the game runtime; iOS still has its SwiftUI starter.
+  macOS and iOS entries link the shared game runtime. iOS also preserves its
+  touch controls, dependency manifest and reproducible cross-build scripts.
 - `tools/` and `tests/`: source generation, launch, capture, analysis and
   verification tools.
 - `patches/ps3recomp-local.patch`: tracked changes **and new source files** from

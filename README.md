@@ -11,8 +11,8 @@ intermediate states as well as the current fixes.
 
 Open `MotorStorm/MotorStorm.xcodeproj`, select the **MotorStorm** scheme and
 **My Mac**, then press **Command-R**. Stop with Xcode's stop button before
-starting a separate Terminal build. iOS integration is being developed
-separately and is not included in this macOS checkpoint.
+starting a separate Terminal build. The **MotorStorm iOS** scheme builds a
+separate UIKit app from the iOS development tree; see the iOS setup below.
 
 **macOS is isolated from iOS work.** `port/macos-baseline.json` pins its engine
 to commit `04910a9c6667d3e0ac3d9d9b0443f75d28608c26`, the saved macOS Xcode
@@ -29,10 +29,10 @@ its bundle environment if the old runtime's static constructor skipped it.
 This preserves the earlier Terminal launch behavior without pulling iOS
 startup or diagnostic code into the pinned engine.
 
-The working-tree `port/`, `vendor/ps3recomp`, generated sources and
-`patches/ps3recomp-local.patch` are reserved for separate iOS development.
-That work must use its own `build/ios-game/` output and must not consume or
-modify the macOS snapshot. `tools/build_port.sh` and the normal Terminal play
+The current `port/`, `vendor/ps3recomp`, generated sources and
+`patches/ps3recomp-local.patch` remain the iOS development tree. The iOS build
+continues using `tools/build_xcode_runtime.py` and `build/ios-game/`. It does not
+consume the macOS snapshot. `tools/build_port.sh` and the normal Terminal play
 launchers now use the pinned macOS runtime too. Verify its source integrity
 with `python3 tools/build_macos_runtime.py --check`.
 
@@ -84,6 +84,818 @@ registration checks passed with ASan/UBSan. A full race is still required to
 reconfirm gameplay after the isolation. Of the 44 reported compiler warnings,
 43 also appeared in the clean pinned baseline; the iOS passive-metrics warning
 does not belong to that baseline. Local evidence: `logs/macos-isolation-01/`.
+
+## iOS development build
+
+The **MotorStorm iOS** scheme uses the same ahead-of-time compiled game/SPU
+sources and Metal renderer, with a UIKit-owned display, touch controls and
+static iOS builds of SDL2, FFmpeg, glslang and SPIRV-Cross. This does not remove
+the remaining SPU interpreter fallback or RSX command translation. The internal
+rendering resolution remains 1280×720. Deployment target: iOS 18, ARM64.
+
+After restoring/generating the local game sources as described in `BACKUP.md`,
+build the pinned dependencies once:
+
+```sh
+python3 tools/build_ios_dependencies.py --sdk iphoneos
+```
+
+Select **MotorStorm iOS**, a connected iPhone/iPad and your signing team in
+Xcode, then Command-R. The build phase produces an optimized iOS engine in
+`build/ios-game/iphoneos`; it does not link the Mac/Homebrew libraries. Simulator
+dependencies are separate (`--sdk iphonesimulator`); simulator gameplay has not
+been validated. CMake, Ninja and a full Xcode installation are prerequisites.
+
+Copy the local `game` directory into the app's Documents directory, preserving
+`game/PS3_GAME/USRDIR/EBOOT.elf` and the accompanying game files. Files sharing
+is enabled, or use **Choose game folder** to grant access to an existing folder.
+Game data stays outside the app executable and outside Git. The initial local
+copy is approximately 16 GB. Press **Start game** once the files are ready.
+Touch arrows navigate menus and drive; ✓ confirms, **Ⅱ / Back** pauses or goes
+back, **BOOST** boosts, **H-BRAKE** is the handbrake, and **Camera** changes view.
+
+Saves live in Documents/gamedata; shader and temporary caches live in the app's
+Caches directory. Offline diagnostics go to dated sessions under
+Documents/logs/performance (see below). Deleting the app deletes its local data, including
+saves. The engine gates frame/vblank work and releases held touch controls when
+the scene becomes inactive. Background/resume behavior still needs device tests.
+
+The iOS target requests extended virtual addressing for the sparse guest address
+space and an increased memory limit. These do not reserve equivalent physical
+RAM or guarantee the game fits the device's memory budget. Device gameplay,
+memory use and sustained 30 FPS must be measured before claiming iOS readiness.
+
+Device validation (21 October 2026): Debug app with Release engine builds and
+development-signs for iPhone 16 Pro Max (iOS 27.0.1); both memory entitlements
+are present. All 87 game files were copied to its Documents/game directory, and
+the startup check verifies their sizes before enabling play. Native Metal
+startup, menu rendering, touch confirmation, race/vehicle selection and 48 kHz
+stereo CoreAudio initialization have been observed. Initial menu windows were
+mostly near 60 FPS; this is not a race-performance result. The macOS scheme
+also still builds after these shared changes. Local device logs are under
+`logs/ios-device-01/`.
+The first race startup then showed a 55-second presentation stall, followed by
+mostly 3–6 FPS in subsequent one-second windows, with additional stalls. The
+player independently reports near-1-FPS gameplay and severely disrupted audio.
+This saved run was launched through `devicectl` without an attached Xcode
+debugger. The shared engine is Release (`-O3`, specialized SPU sources at `-O2`),
+and the log confirms the GPU vertex conversion path is active. First-use shader
+work and device screen viewing were present; this is not a controlled benchmark
+or a CPU/GPU bottleneck attribution. No audio-rate/producer probe was enabled.
+Gameplay is not yet validated as playable on iOS. The user requested stopping
+the device test; the running MotorStorm process was terminated and its absence
+verified. No sustained 30 FPS or finished iOS port is claimed.
+
+An offline audit found that the iOS inline PPU entry omitted the main-game QoS
+setup used by the macOS guest thread. It now uses the same `PS3_GAMEPLAY_QOS`
+policy. Its performance impact is unmeasured; this is not a claimed fix for the
+race slowdown. The attempted trace in ignored `logs/ios-performance-02/` was
+invalid: the app was already running before the launch request, so the required
+environment variables were not applied. It provides no valid CPU/GPU breakdown.
+The standalone logger below removes the need for special launch variables.
+
+### Offline iPhone diagnostics
+
+The iOS app automatically starts lightweight diagnostics when **Start game** is
+pressed, including when launched directly from its icon while disconnected from
+the Mac. No Xcode debugger or Device Hub screen viewing is needed. After a test,
+reconnect the phone and copy only the diagnostics:
+
+```sh
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+python3 tools/collect_ios_diagnostics.py --device <device-UDID> --out logs/ios-offline-01
+```
+
+Use a fresh output directory for each retrieval. The helper does not launch or
+stop the game; `--report-only --out logs/ios-offline-01` re-reads an existing copy.
+Its summary includes menus and loading as well as gameplay. Inspect the dated
+one-second rows to distinguish these phases before reporting race performance.
+
+Each session records presentation/guest FPS, frame intervals, process CPU,
+physical memory footprint, thermal state, completed Metal command-buffer times,
+Metal encoding and existing waits, shader/pipeline creation, and audio output
+queue/silence indicators. GPU times overlap CPU work and are not total device
+GPU utilization. Empty audio queues indicate possible starvation, not an exact
+count of audible glitches; silent blocks may be intentional.
+
+Sampling runs once per second on a utility queue, with buffered writes every
+five seconds. It adds no GPU waits or texture readbacks and records no raw video,
+audio or game-memory dumps. Five owned session directories are retained, each
+with three circular 1 MiB sample files. Console output is buffered and disabled
+after a flush observes 2 MiB; it can exceed that threshold between checks.
+The last five seconds can be lost on abrupt termination. Files are local only.
+
+The logger is designed for small overhead, not zero overhead. Its own sampling
+CPU time is recorded, but this excludes other instrumentation; total on-device
+cost has not yet been measured. Host tests under AddressSanitizer and
+UndefinedBehaviorSanitizer cover concurrent counters, timer sampling, valid
+JSON, rotation, retention and console capping (`sh tools/test_offline_diagnostics.sh`).
+Both iOS and macOS targets build successfully. The first player-driven,
+untethered iPhone run was retrieved into ignored `logs/ios-offline-01/`: 176
+complete sample rows, no partial JSON rows. The estimated race interval
+(sample ends 63–134 seconds; boundaries inferred, not explicitly marked)
+averages 3.61 guest FPS and 493% process CPU. Tracked GPU execution averages
+24.35 ms per guest frame versus 277.37 ms elapsed per guest frame, with only
+0.335 ms explicit GPU waiting. GPU work overlaps CPU; these are not additive.
+Audio submission averages 131.47 blocks/s versus 187.5 required at 48 kHz,
+with 1,657 empty-queue observations and a maximum 194 ms submission gap.
+Thermal state becomes serious at about 86 seconds. The initial slowdown
+already occurs before that change. The user ended in menu/background, so
+the later all-silent tail is excluded from race/audio conclusions.
+The recording establishes a CPU-side bottleneck and audio starvation, but
+does not yet separate CPU time among game logic, SPURS jobs and audio DSP.
+Logger sampling itself averages 0.106 ms CPU per race sample; this is not
+a measurement of all instrumentation overhead. Detailed evidence, phase
+limits and source-code leads are saved in `logs/ios-offline-01/phase-analysis.json`.
+
+Audio-session activation now runs on the engine thread before SDL opens audio,
+instead of blocking UIKit's main thread. This addresses the reported activation
+warning, not the unmeasured cause of sustained audio disruption during races.
+
+The next logger revision (schema 2) attributes kernel CPU time to main game,
+other PPU, Havok, PPU audio/streaming, SPURS workers/coordinators, SPU audio,
+other asynchronous SPU tasks, audio output, render, vblank and callback threads.
+Registration happens at thread entry; the utility timer reads CPU clocks once
+per second. TLS cleanup retains the CPU of short-lived jobs between samples.
+Tests cover 160 exited C threads, slot reuse, a live thread and cross-language
+state sharing with the Objective-C++ logger. Dropped registrations and clock
+errors are recorded rather than silently interpreted as zero CPU.
+
+Audio output also records work/lock wall time, requested and actual sleep time,
+maximum sleep overshoot, and counts of overshoots above 5/20 ms. These distinguish
+slow production from late wakeups without altering priority, buffering, audio
+samples or graphics. Role totals exclude unregistered system/helper threads;
+Metal encoding is a subset of render CPU, and SPU roles include both compiled
+work and interpreter fallback. Scheduling delay and timer coalescing both
+contribute to sleep overshoot.
+
+The schema-2 untethered recording is in `logs/ios-offline-02/`. Its inferred
+60-second race interval averages 3.53 guest FPS and 483% process CPU. SPURS
+workers account for 62.6% of process CPU, SPU audio for 16.5%, and the render
+thread for 6.0%. Role clocks cover 98.9% of process CPU with no clock errors or
+dropped registrations. These clocks do not distinguish computation from
+spinning. The phone reports serious thermal state from its first sample, so
+this is not a cold-device comparison. The fully silent tail is excluded.
+
+Audio output uses only 0.16% of one core, but its average requested sleep of
+2.92 ms becomes 7.60 ms in practice. There are 519 sleep overruns above 20 ms
+and a 338 ms maximum submission gap. Output reaches 130.0 blocks/s instead of
+187.5. This makes output scheduling a concrete problem as well as SPU CPU cost;
+it does not establish an error in the music files or mixing coefficients.
+GPU work is 29.1 ms per guest frame versus 283 ms elapsed between guest frames;
+the GPU is not the sole explanation for the current slowdown.
+
+### iPhone scheduling candidate — 21 October 2026
+
+`port/ios/runtime-options.json` overrides the shared launch settings only when
+building iOS. It enables the existing `SPU_LOCKLINE_HOST=1` implementation and
+the new `PS3_AUDIO_OUTPUT_QOS=1` option. The latter uses the same opt-in
+`PS3_GAMEPLAY_QOS` helper as the render thread, requesting interactive QoS once
+at audio-feeder entry. It does not change the DSP producer, sample rate, guest
+notifications, buffer size, sleeps, shaders or resolution. macOS launch defaults
+are unchanged. Setting either option to `0` and rebuilding permits isolated
+comparisons. The offline metadata records the actual selected options.
+
+The runtime previously used a tight atomic-exchange loop for the shared
+PPU/SPU reservation lock. The alternative uses `os_unfair_lock`, preserving the
+protected guest operations while allowing blocked waiters and owner-aware
+scheduling. This follows Apple's [Apple silicon guidance](https://developer.apple.com/documentation/apple-silicon/tuning-your-code-s-performance-for-apple-silicon/)
+and [game-job scheduling guidance](https://developer.apple.com/videos/play/tech-talks/110147/).
+The macOS comparison earlier in this document did not show a gameplay win;
+the iPhone's different scheduling/thermal conditions justify testing it there,
+not claiming that its SPURS CPU total proves lock contention.
+
+Research cross-checked the following alternatives:
+
+- [RPCS3 SPU scheduling](https://github.com/RPCS3/rpcs3/blob/master/rpcs3/Emu/Cell/SPUThread.cpp)
+  uses state-aware waits and SPURS concurrency control; [PR 16185](https://github.com/RPCS3/rpcs3/pull/16185)
+  fixes redundant waits in that control. Those structures differ from our AOT
+  runtime. Copying its thread limit or reducing virtual SPU lanes can strand
+  producer/consumer work; neither is applied here.
+- [ps3recomp](https://github.com/sp00nznet/ps3recomp) upstream revision
+  `a6d76c895f77eb30b90a806c830544e61821b77f` still uses the POSIX atomic spinlock
+  in `spu_coherency.c`. The reviewed SPURS/audio changes do not provide a ready
+  iPhone performance fix. The runtime stays pinned instead of merging a broad
+  upstream update during this experiment.
+- [SDL2's CoreAudio backend](https://github.com/libsdl-org/SDL/blob/5d249570393f7a37e037abf22cd6012a4cc56a71/src/audio/coreaudio/SDL_coreaudio.m)
+  already prioritizes its own queue thread. Our separate feeder was not covered
+  by that call. Replacing SDL or FFmpeg does not directly address its late wakeups.
+- [Apple audio workgroups](https://developer.apple.com/documentation/audiotoolbox/adding-asynchronous-real-time-threads-to-audio-workgroups)
+  describe real-time cooperating threads with explicit deadlines. The existing
+  guest mixer can take locks and enqueue SDL audio; making that entire path a
+  real-time callback needs a separate audit. Ordinary QoS is the bounded first
+  change. [Accelerate](https://developer.apple.com/accelerate/) may help identified
+  DSP kernels later, but its arithmetic is not automatically equivalent to SPU
+  arithmetic; the existing ARM64/NEON specializations remain in place.
+- Apple's [sustained-execution entitlement](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.developer.sustained-execution)
+  limits burst performance for steadier long sessions on supported devices.
+  It does not supply extra performance or override thermal protection. The
+  current signed profile has no such entitlement. It is deferred until the
+  scheduling candidate is measured, so lower burst clocks do not obscure that
+  comparison. The app already identifies itself as a game.
+
+Both Apple targets build. Reservation/coherence and peer checks pass in both
+lock modes, as do the semaphore wake-race/differential cases, audio ring/output
+tests and offline-logger sanitizer tests. A six-writer synthetic test uses
+31–36 CPU ms with the native lock versus 559–644 ms with the spinlock; this is
+deliberate contention on the Mac, **not measured iPhone/gameplay improvement**.
+Evidence and downloaded source fingerprints are under ignored
+`logs/ios-efficiency-research/`.
+
+The 150-second macOS smoke run with both options enabled reaches a live race
+on the first track with a motorcycle. Its final image shows the track, rider
+and HUD at race time 01:02.50. The last 60 periodic guest-FPS readings average
+29.92; the last 12 audio readings report 187.4–187.6 blocks/s and zero silent
+blocks. This is a stationary-rider regression check, not an A/B performance
+measurement or an auditory review. The bounded harness stopped the process.
+The signed iOS candidate was successfully installed on the connected iPhone,
+preserving the app's data. The phone remains passcode-locked, so this candidate
+has not been launched or measured there. `candidate.json` records the binary
+and source hashes, selected options, build results and validation limits.
+
+The subsequent phone session `20261021T100659Z` confirms both options are active.
+The conservatively selected 90-sample race interval (sample endpoints 75–164 s)
+still averages only 3.37 FPS, 297 ms per guest frame and 468.6% process CPU.
+SPURS workers account for 304.6% core CPU (65.0% of process CPU), and the SPU
+audio worker 90.1% (19.2%). Completed GPU work averages 25.9 ms per guest frame,
+Metal encoding uses 5.76 ms CPU per frame, and no GPU errors are recorded.
+These overlapping measurements are not additive frame latency. The role clocks
+do not distinguish useful SPU computation, interpreter fallback and busy waits.
+
+Host audio delivery now maintains 187.51 blocks/s with no empty-queue
+observations during that interval, versus 130.04 blocks/s and 1,260 empty-queue
+observations in the earlier 60-second race selection. Maximum submission gap
+is 12.18 ms versus 337.60 ms. However, 19.5% of the new race's mixed blocks are
+fully silent, rising to 27.4% in the final selected 15 samples. The user's
+report of broken audio therefore remains unresolved despite timely host
+delivery. Silence is not an exact dropout count and no raw audio was captured;
+late production of PCM is a lead, not yet a measured inner-routine diagnosis.
+The selected menu interval delivers 187.47 blocks/s with zero empty queues;
+22 silent blocks occur within one sample. That cannot establish the precise
+cause of the reported menu crackle.
+
+The phone starts at nominal thermal state and reports fair during the race,
+versus serious throughout the earlier run; scene, trajectory and shader-cache
+conditions also differ. Do not treat the small FPS difference as an A/B gain
+or attribute the thermal difference to this patch. Low Power Mode is off.
+The first ten race samples average 5.70 FPS and the final selected fifteen
+2.74 FPS. Next profiling must identify hot routines/waits inside the SPURS and
+audio workers before changing their implementation. A longer thermal test is
+premature while the initial gameplay remains this slow. Evidence:
+`logs/ios-offline-03/phase-analysis.json` and the matching session directory.
+No sustained 30 FPS, reduced heat or fixed iPhone audio is claimed.
+
+### Native WWS job startup fix — 21 October 2026
+
+A 20-second Time Profiler recording on the physical iPhone identifies a
+specific startup defect. Of 95,685 ms of weighted running CPU samples in the
+MotorStorm process, `spu_interp_run_until` contains 62,229 ms (65.0%), and
+`spu_step` alone accounts for 43,581 ms self time (45.5%). These are summed
+CPU samples across threads, not wall-clock frame latency. The six SPURS
+workers predominantly interpret instructions instead of calling the compiled
+WWS job bodies already linked into the binary.
+
+`port_jobmods_register_all()` was called only by a static constructor. Its
+`MOTORSTORM_NATIVE_JOBS` environment gate ran before UIKit read
+`MotorStormLaunch.json` in **Start game**, so all ten compiled job modules
+were skipped. AppKit loads its settings late too; the command-line launcher
+supplies them before process startup and did not encounter this defect.
+The shared game entry now invokes registration after launch settings are
+available and before guest workers start. The generated initializer is
+idempotent, retaining constructor registration for existing CLI launches.
+The source generator carries the fix so regenerating ignored game sources
+preserves it. No shader, resolution, physics or audio algorithm is changed.
+
+`python3 tools/test_native_job_startup.py` runs the actual generated registry
+with stub job bodies under ASan/UBSan. It verifies disabled registration,
+early constructor registration, late app registration, and repeated calls:
+all ten modules/signatures register exactly once when enabled. Both Xcode
+schemes build successfully. The iOS binary UUID is
+`399F8678-48E1-3E29-AB06-48366A14CCAB`; it has been installed, preserving game
+data. The subsequent physical-device race confirms registration and execution
+of the compiled jobs; see the measured results below.
+
+Evidence is in `logs/ios-device-profile-01/`: the trace, exported samples,
+`hot-functions.json`, build/test logs and `native-job-fix-candidate.json`.
+The trace records all processes because Instruments refused direct process
+attachment; analysis filters only MotorStorm PID 99242. Device system-library
+mapping warnings affect symbolication of some system frames; the captured
+MotorStorm UUID matches the pre-fix executable and only 123 of 95,685 samples
+lack stacks. No Device Hub mirroring or debugger was used. Thermal state,
+scene and instrumentation must be accounted for in the next comparison.
+
+The post-fix Time Profiler capture (`logs/ios-device-profile-02/`) selects PID
+99382 and the matching new binary UUID. It contains 87,419 ms of weighted CPU
+samples over approximately 21.1 seconds. Only 15 ms (0.017%) include
+`spu_interp_run_until`, versus 65.0% before the fix; compiled WWS job bodies
+now appear in 20,307 ms of samples. The startup log records all ten modules
+and subsequent signature matches. Raw app addresses were resolved against
+the matching executable's text symbols, accounting for its loaded address;
+system addresses remain unresolved where Instruments supplied no name.
+485 samples have no stack. The native-job execution change is confirmed, not
+inferred just from an enabled environment variable.
+
+For a longer gameplay comparison, offline sessions `20261021T100659Z` and
+`20261021T103904Z` both provide 60 one-second samples with endpoints 80–139 s,
+active physics and thermal state **fair** throughout. They use the requested
+first track/motorcycle route, but driving and camera positions are not
+deterministic. The new interval overlaps Instruments sampling, so this is a
+measured before/after observation rather than a controlled performance ratio:
+
+- Guest FPS rises from **3.42 to 10.53** (about 3.1×); average time per guest
+  frame falls from **292.7 to 95.0 ms**. This remains well short of 30 FPS.
+- Process CPU falls from **475.6% to 419.3%** (100% is one core). SPURS worker
+  CPU falls from **310.3% to 117.5%**, while physics, rendering and other tasks
+  do more work per second as more frames advance.
+- Completed GPU work averages **20.48 ms per guest frame**, encoding CPU
+  **4.97 ms**, and explicit GPU-wait wall time **0.79 ms**. These overlap other
+  work; they are not additive frame latency or total GPU utilization. There
+  are no GPU errors. Internal resolution remains **1280×720**.
+- Audio output delivers **187.42 blocks/s**, close to its 187.5 target, but
+  **36.0%** of mixed blocks are fully silent (previous interval: 17.5%). Two
+  empty-queue observations and one 51.6 ms maximum submission gap also occur.
+  Output cadence alone does not establish good audio; it is still unresolved.
+- The largest observed present interval is **816.7 ms**. Early race samples
+  average 14.2 FPS and the final ten average 9.7 FPS. Sustained performance,
+  reduced heat and stable frame pacing have not been established.
+
+The next CPU investigation has concrete targets: the audio SPU thread consumes
+approximately **91% of one core** during the trace, and physics workers spend
+4,637 ms of weighted samples inside `cellSyncMutexLock` (5.3% of process CPU,
+including its children). Other visible costs include MFC context lookup and
+SPU dispatch. Native WWS computation is still substantial. These are measured
+cost centers, not proof that any one of them alone determines the frame's
+critical path. Do not remove synchronization or reduce audio/visual quality to
+hide the remaining problem. The saved trace can guide the next focused change
+without asking the player to repeat the same profiling run.
+
+`logs/ios-device-profile-02/comparison.json` contains the selected gameplay
+windows, timings, audio counters and comparison limits. Phone diagnostics are
+preserved in `logs/ios-offline-05/`. No second code change was made during this
+measurement, and no stable 30 FPS or corrected race audio is claimed.
+
+### iPhone audio: checked local-store access and private registers
+
+The player confirms that audio after the WWS startup fix is somewhat better
+but still distorted. In the saved iPhone trace, the compact audio loops at
+`0x98D8` and `0x5238` account for 3,925 and 3,122 ms of self CPU samples,
+roughly 36% of the 19,345 ms sampled audio thread. This motivates a bounded
+memory-access optimization of the four already-specialized audio loops.
+
+`MOTORSTORM_AUDIO_MERGE=4` retains mode 3's exact arithmetic, but checks the
+existing diagnostic/image/policy guards once on entry and uses direct NEON
+local-store loads/stores within that scope. Quadword alignment, 256 KiB
+address wrapping and big-endian lane order are preserved. A private register
+array prevents local-store accesses from aliasing the emulated register file,
+letting the compiler keep more intermediates in native registers. All guest
+registers are published before calls, returns and trampoline transfers, and
+reloaded after calls; host FPCR is restored at those boundaries. Diagnostic
+modes retain the original accessors. No voices, sample rate, arithmetic
+accuracy, output buffers or graphics settings are reduced.
+
+The expanded `tools/test_audio_worker.sh` compares all registers, local-store
+bytes, PC/status and host FPCR against the original lift for all 32 captured
+inputs, 1,000 replays each. It also tests every local-store byte alignment,
+wrapped high addresses, scope guards and eight million arithmetic lanes.
+All checks pass normally and under ASan/UBSan. On the Mac, rotating the mode
+order and measuring thread CPU gives mode 3 → mode 4 savings of **11.7%,
+12.2%, 13.5% and 21.2%** for entries 0x5238, 0x5670, 0x5848 and 0x98D8.
+These are component results, not iPhone FPS or whole-audio speedups.
+
+The iOS profile selects mode 4; the macOS default stays at mode 3. Shared
+startup now re-reads the audio configuration after the app applies its launch
+environment and before guest workers start. Previously its constructor read
+settings too early for UIKit/AppKit overrides, just as the WWS registry did.
+A focused startup check confirms late mode 4 selection, repeated configuration
+and rollback to mode 3. The native log records the selected mode explicitly.
+
+Both Xcode targets build. The first simultaneous macOS build encountered
+Xcode's shared build-database lock; it passed after iOS completed. The iOS
+candidate UUID `5D3B5339-D255-3789-B733-EB1262602F5D` has been installed with
+existing game data preserved. The subsequent phone measurement confirms mode
+4 execution and improved PCM availability in the observed race; see below.
+Evidence and the exact candidate identity are in `logs/ios-audio-direct-ls-01/`.
+No claim is made that this bounded optimization alone resolves the remaining
+audio distortion or achieves 30 FPS.
+
+The player-driven retest is preserved in `logs/ios-offline-06/` and
+`logs/ios-device-profile-03/`. The initial Instruments attempt disconnected
+after 1.075 s and is excluded. One retry completed a 21.207 s capture; analysis
+filters MotorStorm PID 99786 and verifies the new executable UUID. Startup
+records `[audio-worker] configured mode=4`, and sampled native symbols include
+`ms_audio_direct_ls_5238` and `ms_audio_direct_ls_98D8`. SPU interpretation
+remains negligible at 34 of 85,571 ms of weighted running CPU samples (0.04%).
+
+Selecting the same 60 session-second sample endpoints (80–139 s), with active
+physics and thermal state **fair** throughout both sessions, gives mode 3 → 4:
+
+- Guest FPS: **10.53 → 11.83**; average guest-frame time **95.0 → 84.5 ms**.
+- Process CPU: **419.3% → 421.2%**. This does not show reduced overall CPU
+  load or heat. Audio-thread CPU is **90.0% → 88.5%** of one core.
+- Entirely silent mixed blocks: **36.0% → 7.12%**, at **187.51 blocks/s**
+  output cadence in the new window. Four empty-queue observations and a
+  73.91 ms maximum submission gap remain; the audio is not proven flawless.
+- Completed GPU work: **17.55 ms/frame**, Metal encoding CPU **3.61 ms/frame**,
+  explicit GPU-wait wall time **1.08 ms/frame**, with no GPU errors. These
+  overlapping figures are not additive frame latency or GPU utilization.
+
+The new race begins 26 seconds earlier in its session, so those windows are
+not identical race progress. A second comparison aligned to race age (new
+54–113 s against old 80–139 s) yields **12.42 FPS** and **8.19%** silent blocks,
+but its early new samples are thermally nominal while the old samples are
+fair. Different driving/camera/workload and sampling intervals prevent a
+precise causal speedup or audio-quality percentage claim.
+
+The conservative 19-second interior of the completed new trace (sample
+endpoints 106–124 s) has **11.99 FPS, zero silent blocks out of 3,564, zero
+empty-queue observations**, and audio CPU **83.2%** of one core. This confirms
+a healthy output interval, not that the whole race sounds correct. Across
+all 95 selected gameplay seconds (53–147 s), the new run averages **12.01 FPS**
+and **5.49%** silent blocks. The session still observes a present interval up
+to **816.7 ms**. Longer sustained play, audible quality and a stable 30 FPS
+remain unresolved; overall CPU work is still substantial. The saved trace
+now exposes native job computation and dispatch/synchronization costs rather
+than widespread SPU interpretation. Exact windows and limits are recorded in
+`logs/ios-device-profile-03/comparison.json`.
+
+### iPhone native job arithmetic: captured-input replay
+
+The same saved CPU trace identifies native WWS job arithmetic as a remaining
+cost. `tools/specialize_job_arithmetic.py` checks the hashes of 11 measured
+functions and extracts eight pure register-arithmetic segments. Loads, stores,
+branches, guest calls and runtime callbacks are never included in the rounding
+scope. ARM64 NEON operations share one round-toward-zero scope per segment;
+exceptional lanes retain the integer SPU reference implementation. Integer
+comparison and interpolation retain the original bit-level results. Unusual
+caller rounding modes use the original segment, and host FPCR is restored.
+
+A bounded macOS capture supplied 32 real register snapshots for each segment
+from The Grizzly race. The developer-only iPhone replay ran those 256 inputs
+without running the game, a debugger or screen mirroring. On iPhone 16 Pro Max,
+cases 0, 4, 5, 6 and 7 used **8.78%, 29.09%, 13.40%, 41.08% and 7.29% less
+thread CPU time**, respectively. Cases 1, 2 and 3 were slower and are excluded
+from normal code generation. Both paths include the same register reset and
+checksum overhead; six trials alternate their order. The phone reported
+nominal thermal state before and after this short test. This is not a sustained
+thermal test or a gameplay FPS measurement.
+
+All eight candidates passed 30,000 full-context comparisons each, including
+four caller rounding modes, and all captured inputs matched in those modes.
+Four million arbitrary interpolation/comparison lanes passed too. The same
+checks pass under ASan/UBSan on the Mac. Run `sh tools/test_job_arithmetic.sh`
+for synthetic inputs or append a local snapshot directory for captured inputs.
+Generated game bodies and captured registers stay in ignored build/log folders.
+
+The iOS build enables `MOTORSTORM_JOB_ARITHMETIC` and selects the five winners
+with `MOTORSTORM_JOB_SCOPES=0xf1`. An environment override of `0` restores the
+reference paths for comparison. The actual mask is recorded in offline session
+metadata. macOS keeps its existing launch defaults. Xcode builds exclude the
+component replay unless `MOTORSTORM_BUILD_JOB_BENCHMARK=1` is explicitly set;
+that developer build accepts `--job-arithmetic-benchmark` and reads only local
+`Documents/logs/job-inputs` snapshots, writing results beside them.
+
+Evidence is in `logs/ios-job-scopes-01/iphone-benchmark.txt` and
+`iphone-benchmark-status.json`, with source hashes, generation checks and build
+logs in the same directory. The subsequent session `20261021T120525Z` confirms
+mask `0xf1` and audio mode 4. Its 50 gameplay samples ending at session seconds
+80–129 average **10.70 FPS / 93.46 ms**, compared with **11.96 FPS / 83.62 ms**
+in the previous run's same session-age window. Both windows are thermally fair,
+but driving/camera/workload differ (completed GPU work is 21.26 versus 17.34
+ms/frame). This does **not** establish a whole-game improvement or a controlled
+regression from the arithmetic change. The later interval with no physics work
+is excluded. The player's menu experience is now good; race speed and audible
+glitches remain unresolved.
+
+The new window uses 444.8% process CPU, including 92.7% of one core on SPU
+audio, 134.1% on SPURS workers, 62.9% on other SPU tasks, and 52.2% on physics.
+Host audio output maintains 187.51 blocks/s with no empty-queue observations
+and a 12.16 ms maximum submission gap, but 18.53% of mixed blocks are entirely
+silent. Silence is not an exact audible-glitch count. The remaining CPU audio
+producer is a concrete optimization target; GPU time alone does not explain
+the 93 ms average frame interval. Source data and comparison limits are in
+`logs/ios-offline-07/` and `logs/ios-job-scopes-01/gameplay-comparison.json`.
+No 30 FPS or sustained thermal success is claimed.
+
+### iPhone audio: checked bounds for arithmetic groups
+
+`MOTORSTORM_AUDIO_MERGE=5` adds one dynamic magnitude check for each of eight
+pure arithmetic groups in the four already-checked audio loops. Every live
+input must have magnitude at most 65,536; the generator propagates conservative
+integer exponent bounds and accepts a group only if every intermediate is at
+most 2^125. That proves the repeated extended-range/overflow checks redundant
+inside that path. Inputs outside the bound execute mode 4's original exact
+helpers. Operation order, fused operations, RTZ, denormal handling, positive
+zero, all LS accesses and host/guest boundaries remain unchanged. This is not
+fast-math, a codec change, fewer voices, or a sample-rate reduction.
+
+`tools/test_audio_bounds.sh` checks all eight actual groups against the previous
+helpers on 30,000 contexts each, including threshold values, ordinary audio
+ranges and arbitrary bits. `tools/test_audio_worker.sh` now replays all six
+modes on 32 captured whole-worker contexts, 1,000 repetitions each, comparing
+registers, local store, PC/status and FPCR. These checks pass, including the
+whole-worker replay under ASan/UBSan. Out-of-range cases retain the exact path.
+
+The isolated iPhone 16 Pro Max replay also passes all 32 contexts and measures
+mode 4 → 5 thread-CPU savings of **41.96%, 41.59%, 40.82%, and 22.53%** for
+entries 0x5238, 0x5670, 0x5848 and 0x98D8 respectively. Modes rotate order and
+the context reset is outside each measured interval. The phone reported
+thermal state **serious** at both endpoints. An earlier incomplete attempt
+stopped after 23 fixtures without a completion record; it is excluded and its
+termination cause is not established. These are component CPU measurements,
+not gameplay FPS, audible quality, reduced heat or sustained 30 FPS.
+
+iOS selects mode 5; macOS retains mode 3. The developer-only replay is compiled
+only with `MOTORSTORM_BUILD_AUDIO_BENCHMARK=1` and launched with
+`--audio-worker-benchmark`. Its test runtime symbols are namespaced separately
+from the real engine; it runs without starting the game, reads captured inputs
+under `Documents/logs/audio-inputs` and writes its report beside them. Normal
+Xcode builds explicitly exclude the replay. Evidence, exact binary identity
+and comparison limits are preserved in `logs/ios-audio-bounds-01/`.
+
+The subsequent offline gameplay session at 12:30:37 UTC confirms mode 5,
+job scopes `0xf1`, and internal 1280×720. Its 50 one-second samples ending
+at session seconds 70–119 average **10.16 FPS / 98.44 ms**, with process CPU
+**435.70%** (100% is one core). Audio production uses 91.43%, SPURS workers
+130.37%, asynchronous SPU tasks 59.63%, physics 51.30%, and rendering 49.00%.
+Completed GPU work averages 22.20 ms per guest frame, Metal encoding 5.16 ms
+CPU, and explicit GPU waits 1.01 ms wall time; these overlap and are not an
+additive frame breakdown. No GPU errors were recorded. The host receives
+187.52 audio blocks/s with no observed empty queue at submission, but 19.12%
+of submitted blocks contain only zero samples. This is not an exact count of
+audible glitches or proof that all silence is unintended.
+
+The phone reports thermal state **serious from the first sample**, versus
+fair in the preceding run. In the shared session-age window 80–119, mode 4
+records 10.18 FPS and mode 5 records 9.75 FPS. Driving/camera conditions and
+race age differ, so this establishes neither a causal regression nor an
+improvement. The overall 27.71 FPS session mean includes menus and must not
+be used as gameplay performance. Samples from 122 seconds onward have no
+physics or asynchronous SPU work and are excluded from race analysis.
+Evidence is in `logs/ios-offline-08/gameplay-analysis.json`. A current
+function-level CPU profile and bounded-path hit rates are the next useful
+evidence; component replay savings have not yet translated into a
+demonstrated whole-game gain.
+
+The next CPU sample (`logs/ios-device-profile-04/`) ended after **1.439 s**
+when Instruments disconnected. A single retry timed out. It confirms execution
+of the native audio and job paths and identifies dispatch helpers among the
+active functions, but is too short for a representative CPU breakdown. Offline
+logging continued: samples ending at session seconds 80–119 average 9.68 FPS,
+120–139 average 11.70 FPS, and 140–156 average 15.88 FPS. These all use the same
+previous binary, report thermal state serious, and have different driving
+conditions; the later rise is not an A/B result for a new optimization.
+
+iOS now enables `SPU_LEAN_DISPATCH=1` alongside the existing fast-dispatch
+mode. This avoids diagnostic history writes on each nested SPU call while
+retaining the exact depth limit and halt behavior. Explicit dispatch tracing
+disables lean mode. Outside lean mode, history is thread-local rather than a
+shared unsynchronized ring. The registered stack-reset entry check also now
+precedes the Darwin TLS lookup: ordinary calls need no TLS access, while a
+possible reset still checks the armed state and resolved function identity.
+Guest instructions, synchronization, graphics and audio arithmetic are unchanged.
+
+The dispatch test passes 2,048 context comparisons and 256 depth-limit cases;
+the actual lifted-thread runtime test passes 97 checks with fast and lean modes
+enabled, including stack-reset and thread lifecycle behavior. The iOS build
+succeeds. A host microbenchmark compares the current diagnostic and lean depth
+guards only; it does not measure total gameplay speed or the previous shared
+ring implementation. Candidate UUID `69A615F1-86D8-3B17-8B34-B9FE4F389C6D` is
+installed on the iPhone. Evidence and hashes
+are in `logs/ios-dispatch-lean-01/`. macOS does not enable lean mode by default.
+
+The subsequent offline session at 13:18:18 UTC confirms lean dispatch active.
+Samples ending at session seconds 70–186, after sustained physics/asynchronous
+work starts, average **11.94 FPS / 83.74 ms** and **419.37% process CPU**. Successive
+windows 70–99, 100–129, 130–159, and 160–186 average 11.40, 11.90, 12.03, and
+12.49 FPS. This supports a modest rise during play, but not a transition to
+smooth 30 FPS after 20–30 seconds: later stalls still reach 233–254 ms. There
+is no explicit race-start marker; countdown/intro may be included. Samples
+from 188 seconds onward have no physics/asynchronous CPU work and are excluded.
+
+Across that gameplay selection shader and pipeline construction total only
+50.00 ms and 11.16 ms respectively, and the worst stalls contain neither.
+Completed GPU work averages 19.81 ms per guest frame, Metal encoding 3.91 ms
+CPU, and explicit GPU waits 1.01 ms wall time; these overlap. CPU roles account
+for SPURS workers 135.02%, asynchronous tasks 57.11%, audio production 89.13%,
+physics 45.14%, and rendering 39.91%. About 47.83 tracked threads start each
+second (4.00 per guest frame); the async runtime creates real detached threads
+for these tasks. Their lifecycle cost is not separated from job computation.
+
+The audio queue is never observed empty at submission; 1.95% of submitted
+blocks are silent, which is not a direct measure of audible distortion. No GPU
+errors occur. Thermal state starts nominal, becomes fair at about 52 seconds,
+and serious at about 112 seconds (roughly 43 seconds after sustained physics
+starts). Clock rates are not recorded. The previous run started serious, and
+driving conditions differ, so this is not a controlled improvement estimate
+for lean dispatch. Full selections and limits are preserved in
+`logs/ios-offline-09/gameplay-analysis.json`. Reusable async workers and the
+job computations themselves are the next useful CPU profiling targets.
+
+iOS now opts into `SPU_ASYNC_REUSE=1` for the exact returning task-manager ELF
+fingerprint `707757506cd35275` / registered image 507917221. The POSIX runtime
+caches at most four idle host threads. A busy cache falls back immediately to
+the existing detached-thread path, so a waiting task cannot occupy a queue
+slot needed by its producer. Idle workers block on a condition variable and
+retire after five seconds. The 256 MiB virtual stack reservation, fresh SPU
+contexts, local-store loading/persistence, guest synchronization and task-exit
+bookkeeping are retained. Audio and other image fingerprints are excluded;
+macOS remains opted out. The retained stack reservation is virtual address
+space, not 256 MiB of resident memory per idle thread.
+
+Thread reuse restores the fresh-thread floating-point environment and the
+submitter's signal mask, and only reuses workers for the same submitting QoS.
+Darwin ARM64's actual pthread startup resets the FP environment; a small
+reference experiment and differential tests caught this, so reused threads
+restore their original startup FPCR/FPSR instead of carrying a prior task's
+state. The audited task does not change its thread QoS. Its existing execution
+driver resets halt/trampoline/IRQ state and unregisters reservations/MFC
+engines before the stack is reused.
+
+`sh tools/test_async_reuse.sh` checks exactly-once execution, FP/signal state,
+saturated workers whose producer must still run, thread-creation failure, idle
+expiry and restart. `TEST_SOURCE=runtime/spu/tests/test_async_reuse_runtime.c
+sh tools/test_spu.sh` also runs the existing 97 runtime checks and 4,000 real
+SPU context lifecycles, including normal return, halt, LS writeback and
+reservation/MFC cleanup. Both suites pass under ASan/UBSan. In the final Mac
+context-lifecycle microbenchmark, detached dispatch creates 1,000 threads per
+1,000 tasks; reuse creates 9 and reuses 991. Process CPU measures 71.78–145.73 ms
+detached versus 40.65–44.21 ms reused. This isolates artificial context
+lifecycles, not real guest computation. It does not imply a similar percentage
+FPS gain; at roughly 48 tasks/s the absolute measured host saving is small.
+
+Offline schema 3 adds async dispatch, reuse, creation/failure counts and
+submission CPU/wall time. Those timings cover thread creation/handoff only,
+not guest work or thread retirement; launch options are recorded as before.
+Evidence is in `logs/ios-async-reuse-01/`. The subsequent disconnected iPhone
+trial is collected under `logs/ios-offline-10/`. Its selected 88-second racing
+window averages **13.92 FPS / 71.83 ms**, at **420% process CPU** (about 4.2
+fully occupied cores). All 4,900 async dispatches reuse workers, with zero new
+threads or launch failures. Submission/handoff costs only 0.176 ms of CPU per
+second; this excludes job execution and worker retirement. Thread reuse works,
+but the remaining guest work is still too expensive for 30 FPS.
+
+Completed GPU work averages 20.69 ms per guest frame, Metal encoding 3.65 ms
+of CPU, and explicit GPU waits 1.40 ms wall time. These overlap other work and
+are **not additive frame phases**. SPURS workers use 137.8% CPU, async SPU tasks
+53.1%, and SPU audio 84.1%: together roughly 65% of process CPU. Role clocks
+cannot distinguish computation from spinning. No GPU or audio submission errors
+occur, but that does not establish audible correctness. Thermal state reaches
+`serious` about 37 seconds after sustained physics begins; clock throttling and
+temperature are not measured. The previous observation was 11.94 FPS, but route,
+camera and thermal history differ, so this is not a controlled gain estimate.
+Selection boundaries, transition samples and limitations are retained in
+`logs/ios-offline-10/gameplay-analysis.json`.
+
+### iOS ticket waits and reservation stripes — 21 October 2026
+
+Offline schema 4 adds completed wall-time waits by thread role: full WWS
+barrier calls, nested host pauses with wake reasons, GPU-read requests including
+queue delay, flip-command enqueue time, and contended `cellSyncMutexLock`.
+These intervals overlap CPU work and one another. In particular, `job_pause`
+must not be added to `job_total`, and `flip_api` is **not** the entire guest
+presentation dependency. WWS first/last-lane completion attribution and the
+full CPU flip wait remain unmeasured.
+
+iOS enables `CELL_SYNC_MUTEX_PARK=1`: ticket order and big-endian guest words
+are preserved, but a contended waiter sleeps after 64 polls. HLE unlocks and
+successful SPU line commits notify a shared host dispatcher; a 250 µs bounded
+fallback covers other writers. The existing WWS observer remains connected.
+`SPU_LOCKLINE_STRIPES=64` divides coherent transactions and reservation-holder
+lists by 128-byte guest line. Multi-line writes and moving reservations take
+all affected stripes in ascending order. Legacy whole-runtime exclusion and
+context retirement still take every stripe. Both options are off by default
+outside the iOS configuration; no graphics, audio-quality or QoS option changes.
+
+In the user-confirmed stationary first-track/motorcycle trial, the baseline
+window averages **15.71 guest FPS / 410.3% CPU**, and the changed build
+**19.95 guest FPS / 357.5% CPU**. Approximate summed CPU cost falls from
+261.2 to 179.2 ms per guest frame. Main WWS wait falls from 259.4 to
+180.4 ms/s; combined Havok ticket wait falls from 338.9 to 61.4 ms/s.
+GPU-read wait rises from 17.0 to 106.2 ms/s, so removing one dependency exposes
+another. These are overlapping wall intervals, not additive frame stages.
+No GPU submission errors, audio submission errors or empty audio-queue
+observations occur in the selected candidate window; this does not establish
+audible correctness.
+
+This is one before/after observation, **not a controlled ABBA result**. The
+baseline is `fair`; the candidate moves from `fair` to `serious`. Camera/vehicle
+are user-confirmed, but opposing vehicles and elapsed race time differ. Frame
+counts are estimated from sampled guest FPS. The improvement supports retaining
+the candidate for further testing, not claiming a precise causal percentage,
+stable 30 FPS, or solved thermal behavior.
+
+Two baseline Instruments attempts failed while the phone was reported offline.
+After reconnect/install, an all-process candidate recording started but ended
+after 1.244 seconds with `Device disconnected`; usable game Running samples span
+only 0.89 seconds. `tools/analyze_ios_time_profile.py` analyzes this fragment
+with the UUID-matched saved executable (`--app-binary`) and reports actual
+P-core category milliseconds. It now rejects missing core labels and warns on
+short captures. There is **no valid current before/after P-core saving estimate**.
+Full traces and WWS lane skew are still needed before changing worker placement.
+
+Evidence and exact windows are under `logs/ios-cpu-placement-02/`. Candidate
+UUID is `7580A6A4-F4F9-31D0-9BC8-9D1A401FACAD`. The 97 SPU runtime checks,
+195 PPU-coherence and 70 peer-SPU checks pass with stripes. The new
+`sh tools/test_sync_placement.sh` checks ticket rollover, HLE/SPU wakeups,
+timeout fallback, six ticket writers, six actual MFC writers migrating between
+stripes, and independent-line progress. All four park/stripe combinations pass
+ASan/UBSan. Runtime changes are preserved in `patches/ps3recomp-local.patch`.
+
+### iOS VMX arithmetic candidate — 21 October 2026
+
+The main thread still samples in scalar `vmx_vmaddfp`/`vaddfp` helpers. The
+iPhone comparison build applies the existing bit-exact NEON add/subtract/FMA helpers
+to 22 generated PPU units selected from the full historical trace and the
+short current lock-candidate trace. This expands the earlier five-unit,
+FMA-only scope; the macOS configuration is unchanged. The time-profile
+analyzer now preserves VMX caller names and P/E milliseconds, because the
+same static helper appears in many different units.
+
+Candidate UUID `C0E16956-3CFC-3C05-95D2-CC1995165C3C` was installed and its
+isolated test run on the iPhone. All 38.4 million tested lanes match the
+reference, including four rounding modes, NJ flushing, exceptional values
+and destination/source aliases. Alternating-order component timings show
+median CPU costs of 8.22 → 3.01 ns/vector for FMA, 8.58 → 2.98 for add,
+8.24 → 3.05 for subtract, and 8.76 → 3.12 for negative FMA. This is
+**2.7–2.9× in isolated helpers, not a gameplay FPS improvement**. The phone
+was nominal thermal before and after. The benchmark uses `-O2`; generated
+PPU units use `-O3`. Mac C and C++ differential tests also pass at the
+corresponding optimization levels. Core placement was not recorded in this
+component run, so these timings are not measured P-core savings.
+
+Evidence is under `logs/ios-vmx-01/`. The normal launch has no test overhead;
+`MOTORSTORM_BUILD_VMX_BENCHMARK=1` includes the developer-only
+`--vmx-benchmark` entry. `MOTORSTORM_BUILD_IOS_VMX=1` enables this comparison;
+the default (or `=0`) retains the previous five-unit/FMA-only configuration
+until matched gameplay validates the change. Offline session metadata records
+`build_options` as well as runtime options.
+
+The subsequent user-confirmed stationary window measures **13.00 guest FPS /
+405.4% CPU**, with every sample in serious thermal state. This is worse than
+the earlier 19.95 FPS mixed fair/serious observation; it does **not** validate
+a gameplay improvement. CPU cost is 311.9 summed ms/estimated guest frame,
+GPU completed time 19.3 ms/frame, main WWS wall wait 277.9 ms/s, main GPU-read
+wall wait 36.7 ms/s. The window has no shader compilation, GPU submission
+errors, audio submission errors or empty-queue observations. Heat and race
+timing differ; neither a CPU gain nor a regression can be causally quantified
+without the same-scene, cooled A/B comparison. Both executable variants are
+being retained for that comparison.
+
+A separate full Instruments capture now succeeds: 21.30 s of Running samples,
+actual process PID 1611, matching candidate UUID. The game occupies 1.91 P
+cores and 1.77 E cores. Audio accounts for **43.0% of its P-core time**; audio
+dispatch alone costs 2,184 P-ms / 21.30 s, followed by 1,262 P-ms in MFC/channel
+handling. Main guest-memory helpers cost 1,637 P-ms; remaining out-of-line VMX
+helpers are 169 P-ms. Inlined arithmetic is attributed to guest callers, so
+the small helper total is not a measurement of all VMX work or saved time.
+This is a current full bottleneck profile, **not a matched before/after
+P-core saving estimate**. FPS was recorded before Instruments attached.
+
+### iOS optimization research and bounded experiment — 21 October 2026
+
+[Apple's CPU scheduling guidance](https://developer.apple.com/videos/play/tech-talks/110147/)
+supports persistent workers, batching small jobs, explicit wakeups and avoiding
+busy waits. Several of these mechanisms already exist here. Jolt's
+[thread-pool implementation](https://github.com/jrouwe/JoltPhysics/blob/master/Jolt/Core/JobSystemThreadPool.cpp)
+queues dependency-ready jobs and sleeps idle workers. Its bounded scheduling
+cannot be applied blindly to guest tasks that block waiting for another task.
+
+[RPCS3's SPU LLVM recompiler](https://github.com/RPCS3/rpcs3/blob/master/rpcs3/Emu/Cell/SPULLVMRecompiler.cpp)
+tracks register values across blocks and eliminates redundant state stores,
+respecting barriers and side effects. A local experiment applies only the
+register-locality idea to eight audited arithmetic segments. It passes whole
+context/FPCR comparisons for synthetic inputs and captured game registers across
+four rounding modes. On Mac ARM64, six segments improve by 4–9%, while two
+regress, one by 21%. This is a small isolated computation test, **not iPhone
+gameplay validation**, and is not promoted. Results and generated local-only
+inputs are under `logs/ios-register-blocks-01/`.
+
+Comparable projects offer methods rather than transferable FPS guarantees.
+[GoW2 Recomp](https://github.com/andrebrumdev/gow2-recomp) uses PS3 ahead-of-time
+ARM64 recompilation and Metal, but labels iOS experimental; its reported iPhone
+14 trial has p50 33 FPS and p5 21 FPS, not a stable 30 FPS result.
+[NFSMW iOS's technical notes](https://github.com/bep1s69/nfsmw-ios/blob/main/docs/TECHNICAL.md)
+describe event-driven waits, presentation pacing and reducing per-draw work;
+their 60 FPS result is on an M4 iPad and a different console/game. Its technical
+notes were reviewed, not every associated implementation patch.
+
+Apple's [Sustained Execution entitlement](https://developer.apple.com/documentation/BundleResources/Entitlements/com.apple.developer.sustained-execution)
+constrains execution to sustainable levels to reduce later performance shifts.
+It is absent from this app and merits a separately signed, controlled trial;
+it cannot supply the missing throughput or guarantee a cool phone.
+
+The next measurement should separate useful native SPU computation from active
+waits on the current build, then target the highest-cost complete workload.
+Use captured inputs to check output equivalence, repeat the same scene on the
+iPhone for before/after frame and CPU cost, and finally test sustained play and
+thermal state. An older function profile is a lead, not proof of the current
+critical path. Neither thread reuse nor the small register experiment establishes
+that 30 FPS is achievable yet.
+
+Dependency revisions are pinned in `port/ios/dependencies.json`. Downloaded
+source, libraries and generated game code are ignored. Retain the dependencies'
+licenses and source/relink materials if distributing a build; the current static
+FFmpeg configuration enables no GPL/nonfree components.
 
 ## Audio repair — 20 October 2026
 

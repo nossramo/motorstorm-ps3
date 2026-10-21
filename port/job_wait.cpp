@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <mutex>
 #include "ps3emu/ps3_ftrace.h"
+#include "ps3emu/passive_waits.h"
 
 extern "C" uint32_t vm_read32(uint64_t);
 extern "C" uint16_t vm_read16(uint64_t);
@@ -53,6 +54,7 @@ extern "C" void motorstorm_job_wait_pause(uint32_t object, uint32_t base,
                                            uint32_t target) {
     if (!enabled || base > UINT32_MAX - 0x20u || object > UINT32_MAX - 8u) return;
     const uint64_t trace_start = PS3_FT_ON() ? ps3_ft_now() : 0;
+    const uint64_t passive_start = ps3_metric_begin();
     std::unique_lock lock(wait_mutex);
     unsigned first = slots, second = slots;
     for (unsigned i = 0; i < slots; ++i) {
@@ -60,7 +62,10 @@ extern "C" void motorstorm_job_wait_pause(uint32_t object, uint32_t base,
         if (first == slots) first = i;
         else { second = i; break; }
     }
-    if (second == slots) return; // Capacity exhaustion retains the original spin.
+    if (second == slots) {
+        ps3_wait_record(PW_JOB_PAUSE, passive_start, 3);
+        return; // Capacity exhaustion retains the original spin.
+    }
     watched[first].store(uint64_t((base + 0x12) & ~127u) + 1, std::memory_order_release);
     watched[second].store(uint64_t((base + 0x1f) & ~127u) + 1, std::memory_order_release);
     // Only suspend after rechecking all seven counters with the watch armed.
@@ -72,6 +77,7 @@ extern "C" void motorstorm_job_wait_pause(uint32_t object, uint32_t base,
                  std::cv_status::timeout ? 2 : 1;
     watched[first].store(0, std::memory_order_release);
     watched[second].store(0, std::memory_order_release);
+    ps3_wait_record(PW_JOB_PAUSE, passive_start, reason);
     // Port-local kind 24: who=base, a=0 complete / 1 notified / 2 fallback,
     // b=target. It is nested within the existing kind-20 CPU/wall interval.
     if (trace_start) ps3_ft_span(24, base, reason, target, trace_start, ps3_ft_now());
