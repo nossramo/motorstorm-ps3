@@ -1,6 +1,6 @@
 //
 //  ContentView.swift
-//  MotorStorm
+//  MotorStorm iOS
 //
 //  Created by Guðmundur Ómarsson on 20.10.2026.
 //

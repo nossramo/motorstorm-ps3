@@ -414,7 +414,7 @@ static DWORD WINAPI run_guest(LPVOID)
     return 0;
 }
 
-int main(int argc, char** argv)
+extern "C" int motorstorm_main(int argc, char** argv)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);

@@ -9,8 +9,8 @@ Git LFS is not required.
 
 - `port/`: authored runner, platform adapters, native optimization helpers,
   CMake build configuration and tests.
-- `MotorStorm/`: the new Xcode project and SwiftUI starter sources. It is not
-  yet connected to the game runtime.
+- `MotorStorm/`: the Xcode project, macOS app entry point and app icons. The
+  macOS target links the game runtime; iOS still has its SwiftUI starter.
 - `tools/` and `tests/`: source generation, launch, capture, analysis and
   verification tools.
 - `patches/ps3recomp-local.patch`: tracked changes **and new source files** from
@@ -81,8 +81,11 @@ reconstructed byte-for-byte without modifying the live generated source.
 A complete fresh regeneration/build/gameplay run from this backup has not
 been performed. The historical `tools/repair_havok_switch.py` is retained as
 an integration repair; the generic discovery fix is already in the runtime
-patch. The working game build still uses CMake/Ninja; the new Xcode project
-currently contains the default SwiftUI screen.
+patch. After restoring the local prerequisites, the Xcode **MotorStorm** scheme
+builds the shared CMake/Ninja archive and runs the macOS game directly. The
+generated link response and launch resource are local build output, not backup
+content. `port/macos-launch.json` preserves the shared launch defaults. Use
+Xcode's normal Derived Data location outside iCloud Drive for app products.
 
 ## Updating the backup
 

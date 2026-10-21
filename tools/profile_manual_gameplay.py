@@ -38,7 +38,8 @@ def main():
         running = []
         for line in processes.stdout.splitlines():
             fields = line.strip().split(None, 1)
-            if len(fields) == 2 and Path(fields[1]).name == 'MotorStormRecomp':
+            if len(fields) == 2 and (Path(fields[1]).name == 'MotorStormRecomp' or
+                    fields[1].endswith('/MotorStorm.app/Contents/MacOS/MotorStorm')):
                 running.append(fields[0])
         if running:
             parser.error('MotorStorm is still running (PID ' + ', '.join(running) +

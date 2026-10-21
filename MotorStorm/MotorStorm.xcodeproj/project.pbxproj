@@ -8,6 +8,7 @@
 
 /* Begin PBXFileReference section */
 		3298AF7C3087D8C400791A30 /* MotorStorm.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = MotorStorm.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		3298AF8E3087E0CD00791A30 /* MotorStorm iOS.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "MotorStorm iOS.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -16,10 +17,20 @@
 			path = MotorStorm;
 			sourceTree = "<group>";
 		};
+		3298AF8F3087E0CD00791A30 /* MotorStorm iOS */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = "MotorStorm iOS";
+			sourceTree = "<group>";
+		};
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
 		3298AF793087D8C400791A30 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			files = (
+			);
+		};
+		3298AF8B3087E0CD00791A30 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			files = (
 			);
@@ -31,6 +42,7 @@
 			isa = PBXGroup;
 			children = (
 				3298AF7E3087D8C400791A30 /* MotorStorm */,
+				3298AF8F3087E0CD00791A30 /* MotorStorm iOS */,
 				3298AF7D3087D8C400791A30 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -39,6 +51,7 @@
 			isa = PBXGroup;
 			children = (
 				3298AF7C3087D8C400791A30 /* MotorStorm.app */,
+				3298AF8E3087E0CD00791A30 /* MotorStorm iOS.app */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -50,6 +63,7 @@
 			isa = PBXNativeTarget;
 			buildConfigurationList = 3298AF873087D8C500791A30 /* Build configuration list for PBXNativeTarget "MotorStorm" */;
 			buildPhases = (
+				A71C00013090000000000001 /* Build native runtime */,
 				3298AF783087D8C400791A30 /* Sources */,
 				3298AF793087D8C400791A30 /* Frameworks */,
 				3298AF7A3087D8C400791A30 /* Resources */,
@@ -64,6 +78,24 @@
 			productReference = 3298AF7C3087D8C400791A30 /* MotorStorm.app */;
 			productType = "com.apple.product-type.application";
 		};
+		3298AF8D3087E0CD00791A30 /* MotorStorm iOS */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 3298AF963087E0CE00791A30 /* Build configuration list for PBXNativeTarget "MotorStorm iOS" */;
+			buildPhases = (
+				3298AF8A3087E0CD00791A30 /* Sources */,
+				3298AF8B3087E0CD00791A30 /* Frameworks */,
+				3298AF8C3087E0CD00791A30 /* Resources */,
+			);
+			buildRules = (
+			);
+			fileSystemSynchronizedGroups = (
+				3298AF8F3087E0CD00791A30 /* MotorStorm iOS */,
+			);
+			name = "MotorStorm iOS";
+			productName = "MotorStorm iOS";
+			productReference = 3298AF8E3087E0CD00791A30 /* MotorStorm iOS.app */;
+			productType = "com.apple.product-type.application";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -75,6 +107,9 @@
 				LastUpgradeCheck = 2710;
 				TargetAttributes = {
 					3298AF7B3087D8C400791A30 = {
+						CreatedOnToolsVersion = 27.1;
+					};
+					3298AF8D3087E0CD00791A30 = {
 						CreatedOnToolsVersion = 27.1;
 					};
 				};
@@ -94,6 +129,7 @@
 			projectRoot = "";
 			targets = (
 				3298AF7B3087D8C400791A30 /* MotorStorm */,
+				3298AF8D3087E0CD00791A30 /* MotorStorm iOS */,
 			);
 		};
 /* End PBXProject section */
@@ -104,10 +140,38 @@
 			files = (
 			);
 		};
+		3298AF8C3087E0CD00791A30 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			files = (
+			);
+		};
 /* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		A71C00013090000000000001 /* Build native runtime */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = ();
+			inputPaths = ();
+			name = "Build native runtime";
+			outputPaths = (
+				"$(PROJECT_DIR)/../build/game/xcode-link.rsp",
+				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/MotorStormLaunch.json",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -eu\nexport PATH=\"/opt/homebrew/bin:/usr/local/bin:$PATH\"\npython3 \"$PROJECT_DIR/../tools/build_xcode_runtime.py\"\n";
+		};
+/* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		3298AF783087D8C400791A30 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			files = (
+			);
+		};
+		3298AF8A3087E0CD00791A30 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			files = (
 			);
@@ -238,24 +302,33 @@
 		3298AF883087D8C500791A30 /* Debug configuration for PBXNativeTarget "MotorStorm" */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ARCHS = arm64;
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = NO;
+				CODE_SIGN_ENTITLEMENTS = MotorStorm.entitlements;
+				CODE_SIGN_IDENTITY = "-";
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				ENABLE_DEBUG_DYLIB = NO;
+				OTHER_LDFLAGS = ("$(inherited)", "@$(PROJECT_DIR)/../build/game/xcode-link.rsp");
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = 582W8UF3UX;
-				ENABLE_APP_SANDBOX = YES;
+				ENABLE_APP_SANDBOX = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
-				ENABLE_PREVIEWS = YES;
+				ENABLE_PREVIEWS = NO;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = MotorStorm;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.games";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.lithium.motorstorm.MotorStorm;
+				PRODUCT_BUNDLE_IDENTIFIER = com.lithium.motorstorm;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
@@ -270,24 +343,33 @@
 		3298AF893087D8C500791A30 /* Release configuration for PBXNativeTarget "MotorStorm" */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ARCHS = arm64;
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = NO;
+				CODE_SIGN_ENTITLEMENTS = MotorStorm.entitlements;
+				CODE_SIGN_IDENTITY = "-";
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				ENABLE_DEBUG_DYLIB = NO;
+				OTHER_LDFLAGS = ("$(inherited)", "@$(PROJECT_DIR)/../build/game/xcode-link.rsp");
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = 582W8UF3UX;
-				ENABLE_APP_SANDBOX = YES;
+				ENABLE_APP_SANDBOX = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
-				ENABLE_PREVIEWS = YES;
+				ENABLE_PREVIEWS = NO;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = MotorStorm;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.games";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.lithium.motorstorm.MotorStorm;
+				PRODUCT_BUNDLE_IDENTIFIER = com.lithium.motorstorm;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
@@ -296,6 +378,87 @@
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+		3298AF973087E0CE00791A30 /* Debug configuration for PBXNativeTarget "MotorStorm iOS" */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 582W8UF3UX;
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = MotorStorm;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.games";
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations = "UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown";
+				IPHONEOS_DEPLOYMENT_TARGET = 27.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.lithium.motorstorm;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
+				SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD = NO;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		3298AF983087E0CE00791A30 /* Release configuration for PBXNativeTarget "MotorStorm iOS" */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 582W8UF3UX;
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = MotorStorm;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.games";
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations = "UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown";
+				IPHONEOS_DEPLOYMENT_TARGET = 27.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.lithium.motorstorm;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
+				SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD = NO;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				VALIDATE_PRODUCT = YES;
 			};
 			name = Release;
 		};
@@ -315,6 +478,14 @@
 			buildConfigurations = (
 				3298AF883087D8C500791A30 /* Debug configuration for PBXNativeTarget "MotorStorm" */,
 				3298AF893087D8C500791A30 /* Release configuration for PBXNativeTarget "MotorStorm" */,
+			);
+			defaultConfigurationName = Release;
+		};
+		3298AF963087E0CE00791A30 /* Build configuration list for PBXNativeTarget "MotorStorm iOS" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				3298AF973087E0CE00791A30 /* Debug configuration for PBXNativeTarget "MotorStorm iOS" */,
+				3298AF983087E0CE00791A30 /* Release configuration for PBXNativeTarget "MotorStorm iOS" */,
 			);
 			defaultConfigurationName = Release;
 		};

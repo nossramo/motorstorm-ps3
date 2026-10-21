@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.20)
+cmake_minimum_required(VERSION 3.24)
 project(MotorStormRecomp
     VERSION 0.1.0
     LANGUAGES C CXX
@@ -237,7 +237,7 @@ if(AUDIO_WORKER_ORIGINAL IN_LIST SPU_SOURCES AND CMAKE_SYSTEM_PROCESSOR MATCHES 
     list(APPEND SPU_SOURCES "${AUDIO_WORKER_SPECIALIZED}")
 endif()
 
-add_executable(${PROJECT_NAME}
+add_library(${PROJECT_NAME} STATIC
     main.cpp
     gpu_read_sync.cpp
     job_wait.cpp
@@ -413,7 +413,14 @@ endif()
 # ---------------------------------------------------------------------------
 # Install
 # ---------------------------------------------------------------------------
-install(TARGETS ${PROJECT_NAME} RUNTIME DESTINATION bin)
+# Keep the standalone runner and Xcode app on the same compiled game objects.
+# Whole-archive is required: generated SPU registries install themselves from
+# constructors, so ordinary archive extraction would silently omit them.
+add_executable(motorstorm_runner cli_main.cpp)
+target_link_libraries(motorstorm_runner PRIVATE
+    "$<LINK_LIBRARY:WHOLE_ARCHIVE,${PROJECT_NAME}>")
+set_target_properties(motorstorm_runner PROPERTIES OUTPUT_NAME MotorStormRecomp)
+install(TARGETS motorstorm_runner RUNTIME DESTINATION bin)
 
 if(PS3RECOMP_BUILD_TESTS AND APPLE AND SEMAPHORE_SPECIALIZED)
     enable_testing()

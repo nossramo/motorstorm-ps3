@@ -7,5 +7,7 @@ if [ -f game/PS3_GAME/USRDIR/EBOOT.elf ] && [ -d port/spu ]; then
 fi
 cmake -S port -B build/game -G Ninja \
   -DPS3RECOMP_DIR="$PWD/vendor/ps3recomp" -DCMAKE_BUILD_TYPE=Release \
-  -DPS3RECOMP_FFMPEG_RUNTIME=ON
+  -DCMAKE_OSX_ARCHITECTURES=arm64 \
+  -DPS3RECOMP_FFMPEG_RUNTIME=ON \
+  -DMOTORSTORM_CULL_SCOPE=ON -DMOTORSTORM_NEON_VMX=ON
 cmake --build build/game -j "${BUILD_JOBS:-4}"

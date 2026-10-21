@@ -1,8 +1,50 @@
 # MotorStorm macOS port investigation
 
 Target: MotorStorm BCES00006, `APP_VER=03.10`, Apple Silicon macOS first.
-This is a work in progress, not a playable port. Boot, menus and one playable
-track are separate milestones and must be demonstrated with the actual game.
+The macOS research build now boots, reaches menus, and plays races with sound.
+The player has completed a race and confirmed returning to the menu. Recent
+60-second runs averaged about 29.5 FPS; this is not a claim of complete game
+compatibility or iOS readiness. Historical investigations below describe the
+intermediate states as well as the current fixes.
+
+## Run from Xcode (macOS)
+
+Open `MotorStorm/MotorStorm.xcodeproj`, select the **MotorStorm** scheme and
+**My Mac**, then press **Command-R**. Stop with Xcode's stop button before
+starting a separate Terminal build. The **MotorStorm iOS** target remains a
+starter and does not yet run the game.
+
+The macOS app links the existing native runtime into its own process; it does
+not launch a second game executable. Xcode builds the small Objective-C++ app
+entry point; a build phase asks CMake/Ninja to update the shared game archive
+and obtains its exact link dependencies through CMake's File API. The Terminal
+runner still works. Both use the same optimized game objects, even when the
+app scheme is Debug, to preserve the tested arithmetic and gameplay speed.
+The native culling and VMX build specializations are explicitly enabled by
+`tools/build_port.sh`. A first build can take several minutes; later builds
+reuse unchanged objects. Requires CMake 3.24 or newer.
+
+`port/macos-launch.json` is the shared play profile for the Xcode app and
+`tools/play-experimental.command`. Xcode scheme environment overrides may be
+used for profiling. Game data, installed data/saves and shader caches remain
+in the existing local `game/`, `gamedata/` and `logs/` folders. A generated
+resource records the local project path; rebuild after moving the project.
+The app contains no bundled PS3 assets. This is a local development app and
+still requires the installed Homebrew libraries listed below. It is not a
+self-contained distribution build. Runtime messages appear in Xcode's console.
+
+Use Xcode's default Derived Data location under `~/Library/Developer/Xcode`.
+Building the `.app` inside an iCloud-synced Documents folder can cause code
+signing to reject Finder metadata added by the file provider. Local ad-hoc
+signing is selected for macOS; an Apple Developer subscription is not required.
+The iOS target's signing settings are independent.
+
+Validation: the macOS scheme builds successfully and Command-R launches the
+native runtime under Xcode, with Metal presentation and CoreAudio initialized.
+The existing linker warning about reducing `__DATA,__common` alignment from
+32 KB to 16 KB is non-fatal. All 24 common symbols in the linked static
+archives request at most 16-byte alignment; the resulting section preserves
+that requirement. A full race has not yet been repeated through this app target.
 
 ## Audio repair — 20 October 2026
 
