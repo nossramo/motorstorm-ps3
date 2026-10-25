@@ -131,6 +131,7 @@ endif()
 # Detailed per-draw timing is a deliberate diagnostic build, not a normal
 # gameplay measurement. Keep its clocks and atomics out of default iOS builds.
 option(MOTORSTORM_RSX_PHASE_ACCOUNT "Detailed iOS per-draw phase diagnostics" OFF)
+option(MOTORSTORM_IOS_DIAGNOSTICS "Offline iOS performance recording and FPS tracking" OFF)
 if(CMAKE_SYSTEM_NAME STREQUAL "iOS" AND MOTORSTORM_RSX_PHASE_ACCOUNT)
     set_property(SOURCE "${PS3RECOMP_DIR}/libs/video/rsx_draw_engine.c"
         TARGET_DIRECTORY ps3recomp_runtime
@@ -690,6 +691,15 @@ endif()
 # link error, it is a "no rule to make" for a file nothing can consume.
 if(WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/app.rc")
     target_sources(${PROJECT_NAME} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/app.rc")
+endif()
+
+# The app and runtime must agree: a normal iOS app has no offline recorder and
+# no passive metric/thread/wait counters. The immutable macOS snapshot is separate.
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    foreach(metric_target IN ITEMS ${PROJECT_NAME} ps3recomp_runtime)
+        target_compile_definitions(${metric_target} PRIVATE
+            PS3_PASSIVE_METRICS=$<BOOL:${MOTORSTORM_IOS_DIAGNOSTICS}>)
+    endforeach()
 endif()
 
 target_include_directories(${PROJECT_NAME} PRIVATE

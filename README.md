@@ -291,13 +291,20 @@ every 1024th call); it is off in normal launches. Replay them with
 measurements. These private game fixtures are not committed or exported with
 the ordinary diagnostics ZIP.
 
-On iOS, copy the `game` folder into the app's Documents directory, or use
-**Choose game folder**, then press **Start game**.
+On iOS, opening the app shows the supplied centered logo on black and starts
+MotorStorm automatically. The system launch storyboard is plain black; the logo
+belongs to the app's landscape controller, exactly like the former menu buttons.
+This avoids the upside-down system launch snapshot observed on Duo, without
+rotating the image or adding a launch delay. The logo remains until the first drawable is actually
+presented. The start screen has no title, buttons or FPS overlay. File validation
+runs off the UI thread; existing local folders and saved folder bookmarks still
+work. If game files are missing, an error dialog offers folder selection or a
+retry. There is no file picker or confirmation on a normal successful launch.
 
 ### iOS performance diagnostics
 
-Connected-device testing can launch straight into the game with the explicit
-`--start-game` argument. Normal launches still show the setup screen. The helper
+Normal and connected-device launches both start automatically; the old
+`--start-game` argument is no longer required. The helper
 `tools/ios_device_control.py --device <UDID> --out logs/<run> launch` enables the
 existing `PAD_FILE` controller in the app's Documents directory. Use the same
 device/output options with `pad 0x4000` to confirm in menus,
@@ -346,8 +353,8 @@ retained heap snapshot path without an extra wait.
 Set `RSX_METAL_DIRECT_VERTEX_SNAPSHOT` to `"0"` in
 `port/ios/runtime-options.json` and rebuild/restart for the original path.
 Only the iOS profile enables it. Session metadata records the switch; native
-logs report cumulative direct/heap draws, avoided copy bytes, pool capacity
-and exhaustion every 15 seconds. Run `sh tools/test_vertex_packed.sh` and
+diagnostic builds report cumulative direct/heap draws, avoided copy bytes, pool
+capacity and exhaustion every 15 seconds. Run `sh tools/test_vertex_packed.sh` and
 `sh tools/test_metal_vertex_snapshot.sh` for CPU/GPU equivalence, delayed GPU
 consumers, submission boundaries and fallback tests. This follows Apple's
 [shared-resource guidance](https://developer.apple.com/library/archive/documentation/3DDrawing/Conceptual/MTLBestPracticesGuide/ResourceOptions.html)
@@ -355,32 +362,34 @@ and [resource lifetime/copy guidance](https://developer.apple.com/videos/play/te
 Removing the copy is verified by these tests; sustained iPhone FPS and energy
 savings require matched gameplay measurements.
 
-After a test race, close and reopen the app, then tap **Share diagnostics**
-on the start screen. AirDrop the small `MotorStorm-diagnostics.zip` file to
-your Mac, or save it in Files. It contains the last five retained sessions;
-game files and saves are excluded. The temporary export is removed after
-sharing or cancellation. No cable or full app-container download is needed.
+Normal iOS builds compile out the offline recorder, ZIP exporter, FPS tracking,
+passive CPU/GPU/audio/wait counters and thread-clock registry. They create no
+performance sessions or native log files. WWS capture/statistics and periodic
+Metal snapshot/cache logging are also omitted from normal builds. Functional
+game counters, synchronization, error handling and shader caches remain intact.
+Dormant SDK debugging hooks still exist; their presence is not proof that they
+run, and this cleanup is not a measured FPS improvement.
 
-Import the shared ZIP and generate summaries:
+For an explicit recording build, set the iOS target's
+`MOTORSTORM_BUILD_IOS_DIAGNOSTICS=1`, rebuild and launch without a debugger.
+This restores offline recording and underlying FPS samples, without a share
+button or an on-screen FPS label. Copy recorded sessions with
+`tools/ios_device_control.py --device <UDID> --out logs/<run> collect`.
+Existing diagnostics ZIPs can still be imported with `tools/collect_ios_diagnostics.py`.
+The normal app cannot enable this recording through a launch argument.
 
-```sh
-python3 tools/collect_ios_diagnostics.py --archive ~/Downloads/MotorStorm-diagnostics.zip --out logs/ios-device-new
-```
+Run `sh tools/test_ios_play_build.sh` to verify compile-time removal and
+`sh tools/test_offline_diagnostics.sh` for the opt-in recorder/exporter. WWS
+replays accept `--play-build` to verify the kernels without capture/statistics.
+The iOS build records `build_options.offline_diagnostics` in its launch resource.
 
-Use a fresh output directory. Aggregate summaries include menus and pauses;
-use the one-second samples to select actual driving before comparing FPS.
-Each new session records its build options and executable UUID, which can
-be compared with `xcrun dwarfdump --uuid` on the corresponding Xcode app binary.
+Coarse recording remains separate from expensive per-draw/SPU probes. Add
+`MOTORSTORM_BUILD_IOS_DETAILED_DIAGNOSTICS=1` only for a specific investigation.
+Recorded aggregate samples include menus and pauses; select actual driving
+before comparing FPS. Logger CPU time excludes instrumentation on other threads.
 
-Normal iOS builds retain coarse FPS/CPU/thermal/wait counters, but disable
-per-draw RSX phase timing and SPU job-chain sampling. Those detailed probes
-can be restored for a specific investigation by building with
-`MOTORSTORM_BUILD_IOS_DETAILED_DIAGNOSTICS=1`. The mode is recorded with each
-session. Logger CPU time measures only the logger thread, not all probe costs;
-even the coarse counters are not guaranteed to have zero overhead.
-
-For renderer-only diagnosis, build the iOS target with
-`MOTORSTORM_BUILD_IOS_RENDER_DIAGNOSTICS=1`. This enables the existing
+For renderer-only diagnosis, add
+`MOTORSTORM_BUILD_IOS_RENDER_DIAGNOSTICS=1` to the recording build. This enables the existing
 renderer wall-time counters and draw/byte counts in every offline sample,
 without enabling SPU local-store observers or job-chain sampling. Metadata
 records `render_phase_diagnostics`. Leave the option unset for normal builds.

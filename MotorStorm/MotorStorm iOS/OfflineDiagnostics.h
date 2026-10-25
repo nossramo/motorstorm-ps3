@@ -1,5 +1,11 @@
 #import <Foundation/Foundation.h>
 
+#ifndef MOTORSTORM_IOS_DIAGNOSTICS
+#define MOTORSTORM_IOS_DIAGNOSTICS 0
+#endif
+
+#if MOTORSTORM_IOS_DIAGNOSTICS
+
 NS_ASSUME_NONNULL_BEGIN
 
 // Start once before guest threads. Returns nil if diagnostics cannot start.
@@ -18,3 +24,9 @@ void MSDiagnosticsExport(NSURL *documents,
     void (^completion)(NSURL * _Nullable archive, NSError * _Nullable error));
 
 NS_ASSUME_NONNULL_END
+#else
+// No argument evaluation, Objective-C objects, timers or file work in play builds.
+#define MSDiagnosticsSetActive(...) ((void)0)
+#define MSDiagnosticsEvent(...) ((void)0)
+#define MSDiagnosticsFinish(...) ((void)0)
+#endif

@@ -50,6 +50,7 @@ def main():
     # Exact table-based SHUFB; =0 rebuilds the previous helper for comparison.
     shufb_neon = os.environ.get('MOTORSTORM_BUILD_IOS_SPU_SHUFB_NEON') != '0'
     detailed_diagnostics = os.environ.get('MOTORSTORM_BUILD_IOS_DETAILED_DIAGNOSTICS') == '1'
+    offline_diagnostics = os.environ.get('MOTORSTORM_BUILD_IOS_DIAGNOSTICS') == '1'
     # Isolate renderer wall-time accounting from the costly SPU local-store
     # observers and job-chain sampling in the full diagnostic build.
     render_diagnostics = (detailed_diagnostics or
@@ -98,6 +99,7 @@ def main():
                 f'-DCMAKE_OSX_SYSROOT={sdk}', '-DCMAKE_OSX_ARCHITECTURES=arm64',
                 '-DCMAKE_OSX_DEPLOYMENT_TARGET=18.0', '-DCMAKE_BUILD_TYPE=Release',
                 '-DMOTORSTORM_IOS_THINLTO=' + ('ON' if thin_lto else 'OFF'),
+                '-DMOTORSTORM_IOS_DIAGNOSTICS=' + ('ON' if offline_diagnostics else 'OFF'),
                 f'-DCMAKE_PREFIX_PATH={prefix}', f'-DCMAKE_FIND_ROOT_PATH={prefix}',
                 '-DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY', '-DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY',
                 '-DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY', '-DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER',
@@ -165,6 +167,8 @@ def main():
             # iPhone-specific scheduling policy; keep the validated macOS
             # defaults independent. These are also recorded in offline logs.
             values.update(json.loads((root / 'port/ios/runtime-options.json').read_text()))
+            if offline_diagnostics:
+                values['PS3RECOMP_METAL_FPS'] = '1'
             if detailed_diagnostics:
                 values['MOTORSTORM_JOB_CHAIN'] = '1'
             for key in ('PS3RECOMP_FFMPEG_AVCODEC', 'PS3RECOMP_FFMPEG_AVUTIL', 'PS3RECOMP_MSL_CACHE'):
@@ -189,6 +193,7 @@ def main():
                                         'spu_job_merge': job_merge,
                                         'audio_filter_native': audio_filter}}
             config['build_options']['ppu_locals'] = ppu_locals
+            config['build_options']['offline_diagnostics'] = offline_diagnostics
             config['build_options']['native_geometry'] = native_geometry
         else:
             config = {'root': str(root), 'environment': environment(root)}

@@ -1,4 +1,11 @@
 #include "wws_native_chain.h"
+#include "ps3emu/passive_metrics.h"
+
+#if PS3_PASSIVE_METRICS
+#define WWS_DIAGNOSTIC(...) __VA_ARGS__
+#else
+#define WWS_DIAGNOSTIC(...)
+#endif
 #include "spu_thread_rtz.h"
 #include "spu_job_scope.h"
 #include "native_geometry.h"
@@ -9,6 +16,7 @@
 
 void ms_wws_chain_capture(const spu_context* ctx, unsigned entry)
 {
+#if PS3_PASSIVE_METRICS
     static atomic_int enabled = -1;
     static atomic_uint calls[2], saved[2];
     unsigned kind=entry==0xDCBC;
@@ -44,6 +52,9 @@ void ms_wws_chain_capture(const spu_context* ctx, unsigned entry)
         if (out) { if (fwrite(f, sizeof(*f), 1, out) != 1) perror("WWS capture"); fclose(out); }
     }
     free(f);
+#else
+    (void)ctx; (void)entry;
+#endif
 }
 
 /* Values retain the SPU format, including extended finite exponents. These
@@ -305,26 +316,28 @@ static int chain_enabled(unsigned mask) {
 
 int ms_wws_chain_try(spu_context* ctx) {
     if(!chain_enabled(1))return 0;
-    static SPU_THREAD_LOCAL uint64_t calls,accepted,objects,guard_rejects,layout_rejects;
-    ++calls;int result=0;
+    WWS_DIAGNOSTIC(static SPU_THREAD_LOCAL uint64_t calls,accepted,objects,guard_rejects,layout_rejects;)
+    WWS_DIAGNOSTIC(++calls;)int result=0;
     /* Only the checked caller's void subroutine is replaced. A pending IRQ,
      * diagnostic dispatch or unsupported stack always takes the original.
      * Channel/DMA operations remain outside this arithmetic phase. Runtime
      * steps count host transfers, not guest cycles, and need no emulation. */
     unsigned sp=ctx->gpr[1]._u32[0];
     if(!ms_geometry_safe(ctx)||ctx->status!=SPU_STATUS_RUNNING||ctx->irq_saved||
-       sp<0x3B060||sp>SPU_LS_SIZE-336||(sp&15))++guard_rejects;
+       sp<0x3B060||sp>SPU_LS_SIZE-336||(sp&15)){ WWS_DIAGNOSTIC(++guard_rejects;) }
     else {
         unsigned ret=word(ctx->ls,sp+320);
-        if(ret!=0x9820&&ret!=0xAEF4&&ret!=0xAF98&&ret!=0xB028&&ret!=0xB0A0)++guard_rejects;
+        if(ret!=0x9820&&ret!=0xAEF4&&ret!=0xAF98&&ret!=0xB028&&ret!=0xB0A0){ WWS_DIAGNOSTIC(++guard_rejects;) }
         else if((result=ms_wws_classify_batch(ctx->ls,ctx->gpr[83]._u32[0]))) {
-            ++accepted;objects+=ctx->gpr[83]._u32[0];
-        } else ++layout_rejects;
+            WWS_DIAGNOSTIC(++accepted;objects+=ctx->gpr[83]._u32[0];)
+        } else { WWS_DIAGNOSTIC(++layout_rejects;) }
     }
+#if PS3_PASSIVE_METRICS
     if(calls==1||!(calls&8191))fprintf(stderr,
         "[wws-chain] calls=%llu accepted=%llu objects=%llu guard=%llu layout=%llu\n",
         (unsigned long long)calls,(unsigned long long)accepted,(unsigned long long)objects,
         (unsigned long long)guard_rejects,(unsigned long long)layout_rejects);
+#endif
     return result;
 }
 
@@ -468,21 +481,23 @@ int ms_wws_select_occluders(uint8_t* p,unsigned count,unsigned* selected) {
 }
 int ms_wws_sort_try(spu_context* ctx) {
     if(!chain_enabled(2))return 0;
-    static SPU_THREAD_LOCAL uint64_t calls,accepted,objects,guard_rejects,layout_rejects,selected_batches;
-    ++calls;int result=0;unsigned n=ctx->gpr[18]._u32[0],sp=ctx->gpr[1]._u32[0];
+    WWS_DIAGNOSTIC(static SPU_THREAD_LOCAL uint64_t calls,accepted,objects,guard_rejects,layout_rejects,selected_batches;)
+    WWS_DIAGNOSTIC(++calls;)int result=0;unsigned n=ctx->gpr[18]._u32[0],sp=ctx->gpr[1]._u32[0];
     if(!ms_geometry_safe(ctx)||ctx->status!=SPU_STATUS_RUNNING||ctx->irq_saved||
        sp<0x3B200||sp>SPU_LS_SIZE-32||(sp&15)||ctx->gpr[87]._u32[0]!=0x26CC0||
-       word(ctx->ls,0x16AA0)!=n)++guard_rejects;
+       word(ctx->ls,0x16AA0)!=n){ WWS_DIAGNOSTIC(++guard_rejects;) }
     else if((result=ms_wws_sort_occluders(ctx->ls,n))) {
-        ctx->gpr[87]=spu_ila(0x26CC0);++accepted;objects+=n;
+        ctx->gpr[87]=spu_ila(0x26CC0);WWS_DIAGNOSTIC(++accepted;objects+=n;)
         unsigned selected;
         if(chain_enabled(4)&&ms_wws_select_occluders(ctx->ls,n,&selected)) {
-            ctx->gpr[10]=spu_il((int)selected);result=2;++selected_batches;
+            ctx->gpr[10]=spu_il((int)selected);result=2;WWS_DIAGNOSTIC(++selected_batches;)
         }
-    } else ++layout_rejects;
+    } else { WWS_DIAGNOSTIC(++layout_rejects;) }
+#if PS3_PASSIVE_METRICS
     if(calls==1||!(calls&8191))fprintf(stderr,
         "[wws-sort] calls=%llu accepted=%llu objects=%llu guard=%llu layout=%llu selected=%llu\n",
         (unsigned long long)calls,(unsigned long long)accepted,(unsigned long long)objects,
         (unsigned long long)guard_rejects,(unsigned long long)layout_rejects,(unsigned long long)selected_batches);
+#endif
     return result;
 }
