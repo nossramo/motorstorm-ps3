@@ -175,8 +175,10 @@ Validate with `python3 tools/test_spu_pipeline.py`,
 local store, exit target, interrupts and four rounding modes. These are
 correctness tests; only an actual matched race establishes an FPS benefit.
 The local checkpoint `build/ios-spu-pipeline-20261025-01/` preserves the prior
-sources and signed app. Its `restore-baseline.py` verifies later edits before
-restoring with `--apply`; neither switch changes the macOS baseline.
+sources. Its `restore-baseline.py` verifies later edits before restoring with
+`--apply`; neither switch changes the macOS baseline. The older signed apps
+are now compressed under `output/releases/ios-duo-20261025/historical-apps/`;
+`cleanup-manifest.json` maps each original app path to its verified archive.
 
 The iOS whole-batch WWS experiment is selected by the packaged default
 `MOTORSTORM_WWS_CHAIN=7`. Launch with `MOTORSTORM_WWS_CHAIN=0` to retain the
@@ -255,7 +257,9 @@ attach, although devicectl confirmed the same live app PID and uninterrupted
 session; do not present the parked profile as a driving profile.
 
 The local checkpoint `build/ios-wws-native-chain-20261025-01/` contains the
-pre-experiment sources, hashes and signed app. Its `restore-baseline.py` first
+pre-experiment sources and hashes. Signed apps are in the historical archive
+described above; the exact Duo-tested app also has its own `approved-app.tar.gz`.
+The checkpoint's `restore-baseline.py` first
 verifies every affected path; `--apply` restores only this experiment and
 refuses to overwrite subsequent edits. The launch switch restores the old
 route without rebuilding or reinstalling. The macOS baseline is unchanged.
