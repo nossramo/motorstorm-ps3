@@ -11,12 +11,10 @@
 extern "C" int motorstorm_main(int, char **);
 extern "C" void motorstorm_set_active(int);
 extern "C" int rsx_metal_backend_attach_layer(void *);
+extern "C" void rsx_metal_backend_on_first_presented(void (^handler)(void));
 extern "C" void rsx_metal_touch_key(unsigned, int);
 extern "C" void rsx_metal_touch_clear(void);
 extern "C" void SDL_SetMainReady(void);
-extern "C" int motorstorm_job_benchmark(const char*, const char*);
-extern "C" int motorstorm_audio_benchmark(const char*, const char*);
-extern "C" int motorstorm_vmx_benchmark(const char*);
 
 @interface MotorStormMetalView : UIView
 @end
@@ -24,17 +22,39 @@ extern "C" int motorstorm_vmx_benchmark(const char*);
 + (Class)layerClass { return CAMetalLayer.class; }
 @end
 
+static NSDictionary *launchConfiguration(void)
+{
+    NSURL *url = [NSBundle.mainBundle URLForResource:@"MotorStormLaunch" withExtension:@"json"];
+    NSData *data = url ? [NSData dataWithContentsOfURL:url] : nil;
+    id config = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+    return [config isKindOfClass:NSDictionary.class] ? config : nil;
+}
+
+// File validation can touch thousands of files. Keep it off UIKit's thread so
+// the logo is visible and responsive while local/bookmarked storage is checked.
+static NSURL *validatedGameRoot(NSURL *root, NSDictionary *files)
+{
+    if (!root || ![files isKindOfClass:NSDictionary.class] || !files.count) return nil;
+    if ([root.lastPathComponent isEqualToString:@"PS3_GAME"]) root = root.URLByDeletingLastPathComponent;
+    NSFileManager *fm = NSFileManager.defaultManager;
+    if (![fm isReadableFileAtPath:[root URLByAppendingPathComponent:@"PS3_GAME/USRDIR/EBOOT.elf"].path]) return nil;
+    for (NSString *relative in files) {
+        NSDictionary *attributes = [fm attributesOfItemAtPath:[root URLByAppendingPathComponent:relative].path error:nil];
+        if (!attributes || [attributes fileSize] != [files[relative] unsignedLongLongValue]) return nil;
+    }
+    return root;
+}
+
 @interface MotorStormController : UIViewController <UIDocumentPickerDelegate>
 @property(nonatomic, strong) MotorStormMetalView *gameView;
-@property(nonatomic, strong) UIStackView *setup;
-@property(nonatomic, strong) UILabel *status;
-@property(nonatomic, strong) UILabel *fpsLabel;
-@property(nonatomic, strong) UIButton *start;
-@property(nonatomic, strong) UIButton *shareDiagnostics;
+@property(nonatomic, strong) UIImageView *logo;
 @property(nonatomic, strong) UIView *controls;
 @property(nonatomic, strong) NSURL *gameRoot;
 @property(nonatomic, strong) NSURL *scopedURL;
+@property(nonatomic) BOOL attemptedLaunch;
+@property(nonatomic) BOOL launchPending;
 @property(nonatomic) BOOL started;
+@property(nonatomic) BOOL gameRunning;
 - (void)gameReturned:(int)result;
 @end
 
@@ -44,19 +64,17 @@ static void *runGame(void *opaque)
     @autoreleasepool {
         BootArguments *boot = static_cast<BootArguments *>(opaque);
         MotorStormController *controller = (__bridge_transfer MotorStormController *)boot->controller;
-        // Audio activation may block on the audio service. This is the engine
-        // thread, so UIKit remains responsive; finish before SDL opens audio.
         AVAudioSession *audio = AVAudioSession.sharedInstance;
         NSError *audioError = nil;
         BOOL configured = [audio setCategory:AVAudioSessionCategoryPlayback
                                       mode:AVAudioSessionModeDefault options:0 error:&audioError];
         BOOL activated = configured && [audio setActive:YES error:&audioError];
-        fprintf(stderr, "[iOS audio] active=%d main_thread=%d sample_rate=%.0f io_buffer_ms=%.2f\n",
-                activated, NSThread.isMainThread, audio.sampleRate, audio.IOBufferDuration * 1000);
         if (!activated) NSLog(@"MotorStorm audio activation failed: %@", audioError);
+#if MOTORSTORM_IOS_DIAGNOSTICS
         MSDiagnosticsEvent(@"audio_session", @{@"active":@(activated), @"main_thread":@(NSThread.isMainThread),
             @"sample_rate":@(audio.sampleRate), @"io_buffer_ms":@(audio.IOBufferDuration*1000),
             @"error":audioError.localizedDescription ?: @""});
+#endif
         char name[] = "MotorStorm";
         char *args[] = {name, boot->eboot, nullptr};
         int result = motorstorm_main(2, args);
@@ -79,57 +97,10 @@ static void *runGame(void *opaque)
     self.gameView.backgroundColor = UIColor.blackColor;
     self.gameView.userInteractionEnabled = NO;
     [self.view addSubview:self.gameView];
-
-    self.status = [UILabel new];
-    self.status.textColor = UIColor.whiteColor;
-    self.status.numberOfLines = 0;
-    self.status.textAlignment = NSTextAlignmentCenter;
-    UILabel *title = [UILabel new];
-    title.text = @"MotorStorm";
-    title.textColor = UIColor.systemYellowColor;
-    title.font = [UIFont boldSystemFontOfSize:36];
-    title.textAlignment = NSTextAlignmentCenter;
-    self.start = [UIButton buttonWithType:UIButtonTypeSystem];
-    self.start.configuration = [UIButtonConfiguration filledButtonConfiguration];
-    [self.start setTitle:@"Start game" forState:UIControlStateNormal];
-    [self.start addTarget:self action:@selector(startGame) forControlEvents:UIControlEventTouchUpInside];
-    UIButton *choose = [UIButton buttonWithType:UIButtonTypeSystem];
-    choose.configuration = [UIButtonConfiguration borderedButtonConfiguration];
-    [choose setTitle:@"Choose game folder" forState:UIControlStateNormal];
-    [choose addTarget:self action:@selector(chooseGame) forControlEvents:UIControlEventTouchUpInside];
-    self.shareDiagnostics = [UIButton buttonWithType:UIButtonTypeSystem];
-    self.shareDiagnostics.configuration = [UIButtonConfiguration borderedButtonConfiguration];
-    [self.shareDiagnostics setTitle:@"Share diagnostics" forState:UIControlStateNormal];
-    self.shareDiagnostics.accessibilityIdentifier = @"share-diagnostics";
-    [self.shareDiagnostics addTarget:self action:@selector(exportDiagnostics) forControlEvents:UIControlEventTouchUpInside];
-    self.setup = [[UIStackView alloc] initWithArrangedSubviews:@[title, self.status, self.start, choose, self.shareDiagnostics]];
-    self.setup.axis = UILayoutConstraintAxisVertical;
-    self.setup.spacing = 16;
-    self.setup.translatesAutoresizingMaskIntoConstraints = NO;
-    [self.view addSubview:self.setup];
-    [NSLayoutConstraint activateConstraints:@[
-        [self.setup.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
-        [self.setup.centerYAnchor constraintEqualToAnchor:self.view.centerYAnchor],
-        [self.setup.widthAnchor constraintLessThanOrEqualToConstant:540],
-        [self.setup.leadingAnchor constraintGreaterThanOrEqualToAnchor:self.view.safeAreaLayoutGuide.leadingAnchor constant:24],
-        [self.setup.trailingAnchor constraintLessThanOrEqualToAnchor:self.view.safeAreaLayoutGuide.trailingAnchor constant:-24]
-    ]];
-    [self restoreGameFolder];
     self.controls = [UIView new];
     self.controls.hidden = YES;
     self.controls.multipleTouchEnabled = YES;
     [self.view addSubview:self.controls];
-    self.fpsLabel = [UILabel new];
-    self.fpsLabel.hidden = YES;
-    self.fpsLabel.userInteractionEnabled = NO;
-    self.fpsLabel.textAlignment = NSTextAlignmentCenter;
-    self.fpsLabel.textColor = UIColor.whiteColor;
-    self.fpsLabel.font = [UIFont monospacedDigitSystemFontOfSize:28 weight:UIFontWeightBold];
-    self.fpsLabel.backgroundColor = [UIColor.blackColor colorWithAlphaComponent:0.62];
-    self.fpsLabel.layer.cornerRadius = 8;
-    self.fpsLabel.layer.masksToBounds = YES;
-    self.fpsLabel.text = @"— FPS";
-    [self.view addSubview:self.fpsLabel];
     [self addControl:@"◀" key:123];
     [self addControl:@"▶" key:124];
     [self addControl:@"↑" key:126];
@@ -139,38 +110,20 @@ static void *runGame(void *opaque)
     [self addControl:@"✓" key:36];
     [self addControl:@"Ⅱ / Back" key:53];
     [self addControl:@"Camera" key:8];
-    BOOL audioBenchmark=[NSProcessInfo.processInfo.arguments containsObject:@"--audio-worker-benchmark"];
-    BOOL vmxBenchmark=[NSProcessInfo.processInfo.arguments containsObject:@"--vmx-benchmark"];
-    if (vmxBenchmark || audioBenchmark || [NSProcessInfo.processInfo.arguments containsObject:@"--job-arithmetic-benchmark"]) {
-        // Explicit developer launch only; never mixed with a running game.
-        self.setup.userInteractionEnabled = NO;
-        self.status.text = @"Testing saved calculations…";
-        UIApplication.sharedApplication.idleTimerDisabled = YES;
-        NSURL* logs=[[self documents] URLByAppendingPathComponent:@"logs"];
-        [NSFileManager.defaultManager createDirectoryAtURL:logs withIntermediateDirectories:YES attributes:nil error:nil];
-        NSURL* inputs=[logs URLByAppendingPathComponent:audioBenchmark ? @"audio-inputs" : @"job-inputs"];
-        NSString* kind=vmxBenchmark ? @"vmx-benchmark" : (audioBenchmark ? @"audio-benchmark" : @"job-arithmetic");
-        NSURL* report=[logs URLByAppendingPathComponent:[kind stringByAppendingString:@"-result.txt"]];
-        NSInteger before=NSProcessInfo.processInfo.thermalState;
-        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0), ^{
-            int result=vmxBenchmark ? motorstorm_vmx_benchmark(report.fileSystemRepresentation)
-                : (audioBenchmark ? motorstorm_audio_benchmark(inputs.fileSystemRepresentation,report.fileSystemRepresentation)
-                : motorstorm_job_benchmark(inputs.fileSystemRepresentation,report.fileSystemRepresentation));
-            NSDictionary* metadata=@{@"result":@(result),@"thermal_before":@(before),
-                @"thermal_after":@(NSProcessInfo.processInfo.thermalState),
-                @"date":NSDate.date.description,@"game_running":@NO};
-            NSData* data=[NSJSONSerialization dataWithJSONObject:metadata options:NSJSONWritingPrettyPrinted error:nil];
-            [data writeToURL:[logs URLByAppendingPathComponent:[kind stringByAppendingString:@"-status.json"]] atomically:YES];
-            dispatch_async(dispatch_get_main_queue(), ^{
-                self.status.text=result==0 ? @"Test complete. Close and reopen to play." : @"Test failed. Close and reopen to play.";
-                UIApplication.sharedApplication.idleTimerDisabled = NO;
-            });
-        });
-    } else if ([NSProcessInfo.processInfo.arguments containsObject:@"--start-game"]) {
-        // Opt-in device testing. Keep the ordinary setup screen unchanged and
-        // let UIKit finish installing/layouting the view before attaching Metal.
-        dispatch_async(dispatch_get_main_queue(), ^{ [self startGame]; });
-    }
+    self.logo = [[UIImageView alloc] initWithImage:[UIImage imageNamed:@"LaunchLogo"]];
+    self.logo.contentMode = UIViewContentModeScaleAspectFit;
+    self.logo.accessibilityLabel = @"MotorStorm";
+    self.logo.isAccessibilityElement = YES;
+    [self.view addSubview:self.logo];
+}
+- (void)viewDidAppear:(BOOL)animated
+{
+    [super viewDidAppear:animated];
+    if (self.attemptedLaunch) return;
+    self.attemptedLaunch = YES;
+    // The Metal layer now has a window and laid-out bounds. No artificial delay
+    // or developer launch argument is needed for an ordinary app-icon launch.
+    [self locateGameAndStart:nil];
 }
 - (void)addControl:(NSString *)title key:(unsigned)key
 {
@@ -198,6 +151,10 @@ static void *runGame(void *opaque)
     CGSize size = CGSizeMake(1280 * scale, 720 * scale);
     self.gameView.frame = CGRectMake((bounds.size.width-size.width)/2, (bounds.size.height-size.height)/2, size.width, size.height);
     self.controls.frame = bounds;
+    CGFloat width = MIN(bounds.size.width * 0.72, 720.0);
+    CGSize logoSize = self.logo.image.size;
+    CGFloat height = logoSize.width > 0 ? width * logoSize.height / logoSize.width : 0;
+    self.logo.frame = CGRectMake((bounds.size.width-width)/2, (bounds.size.height-height)/2, width, height);
     UIEdgeInsets safe = self.view.safeAreaInsets;
     CGFloat left = safe.left + 12, right = bounds.size.width - safe.right - 12;
     CGFloat bottom = bounds.size.height - safe.bottom - 12;
@@ -214,50 +171,61 @@ static void *runGame(void *opaque)
             case 8: b.frame=CGRectMake(left+112,safe.top+12,88,44); break;
         }
     }
-    self.fpsLabel.frame = CGRectMake((bounds.size.width - 148) / 2, safe.top + 8, 148, 40);
-    [self.view bringSubviewToFront:self.fpsLabel];
 }
 - (NSURL *)documents
 {
-    return [[NSFileManager defaultManager] URLsForDirectory:NSDocumentDirectory inDomains:NSUserDomainMask].firstObject;
+    return [NSFileManager.defaultManager URLsForDirectory:NSDocumentDirectory inDomains:NSUserDomainMask].firstObject;
 }
-- (NSURL *)executableAtRoot:(NSURL *)root
+- (void)showLaunchError:(NSString *)message allowFolder:(BOOL)allowFolder
 {
-    return [root URLByAppendingPathComponent:@"PS3_GAME/USRDIR/EBOOT.elf"];
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Unable to start MotorStorm"
+        message:message preferredStyle:UIAlertControllerStyleAlert];
+    if (allowFolder) {
+        [alert addAction:[UIAlertAction actionWithTitle:@"Choose game folder" style:UIAlertActionStyleDefault
+            handler:^(UIAlertAction *action) { [self chooseGame]; }]];
+        [alert addAction:[UIAlertAction actionWithTitle:@"Try again" style:UIAlertActionStyleDefault
+            handler:^(UIAlertAction *action) { [self locateGameAndStart:nil]; }]];
+    }
+    [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
 }
-- (void)useGameRoot:(NSURL *)root
+- (void)locateGameAndStart:(NSURL *)picked
 {
-    if ([root.lastPathComponent isEqualToString:@"PS3_GAME"]) root = root.URLByDeletingLastPathComponent;
-    BOOL valid = [[NSFileManager defaultManager] isReadableFileAtPath:[self executableAtRoot:root].path];
-    NSData *data = [NSData dataWithContentsOfURL:[NSBundle.mainBundle URLForResource:@"MotorStormLaunch" withExtension:@"json"]];
-    NSDictionary *config = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
-    NSDictionary *files = config[@"files"];
-    if (![files isKindOfClass:NSDictionary.class] || !files.count) valid = NO;
-    if (valid) for (NSString *relative in files) {
-        NSString *path = [root URLByAppendingPathComponent:relative].path;
-        NSDictionary *attributes = [NSFileManager.defaultManager attributesOfItemAtPath:path error:nil];
-        if (!attributes || [attributes fileSize] != [files[relative] unsignedLongLongValue]) {
-            valid = NO; break;
+    if (self.started || self.launchPending) return;
+    self.launchPending = YES;
+    [self.scopedURL stopAccessingSecurityScopedResource]; self.scopedURL = nil;
+    NSURL *documents = [self documents];
+    NSData *bookmark = [NSUserDefaults.standardUserDefaults dataForKey:@"GameFolder"];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @autoreleasepool {
+            NSDictionary *config = launchConfiguration();
+            NSDictionary *files = config[@"files"];
+            NSURL *access = nil;
+            NSURL *root = nil;
+            NSURL *chosen = picked;
+            if (!picked) root = validatedGameRoot([documents URLByAppendingPathComponent:@"game" isDirectory:YES], files);
+            if (!root && !chosen && bookmark) {
+                BOOL stale = NO;
+                chosen = [NSURL URLByResolvingBookmarkData:bookmark options:0 relativeToURL:nil bookmarkDataIsStale:&stale error:nil];
+            }
+            if (!root && chosen) {
+                if ([chosen startAccessingSecurityScopedResource]) access = chosen;
+                root = validatedGameRoot(chosen, files);
+                if (!root) { [access stopAccessingSecurityScopedResource]; access = nil; }
+            }
+            NSData *newBookmark = picked && root ? [picked bookmarkDataWithOptions:0
+                includingResourceValuesForKeys:nil relativeToURL:nil error:nil] : nil;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                self.launchPending = NO;
+                self.scopedURL = access;
+                self.gameRoot = root;
+                if (newBookmark) [NSUserDefaults.standardUserDefaults setObject:newBookmark forKey:@"GameFolder"];
+                if (root) [self startGame];
+                else [self showLaunchError:@"Game files are missing or still copying. Finish copying the game folder into MotorStorm in Files, or choose an existing game folder."
+                    allowFolder:YES];
+            });
         }
-    }
-    self.gameRoot = valid ? root : nil;
-    self.start.enabled = valid;
-    self.status.text = valid ? @"Game files ready. Use the arrows to drive or navigate menus; ✓ confirms a selection."
-        : @"Game files are missing or still copying. Finish copying the game folder into MotorStorm in Files, then reopen the app. You can also choose an existing game folder.";
-}
-- (void)restoreGameFolder
-{
-    NSURL *local = [[self documents] URLByAppendingPathComponent:@"game" isDirectory:YES];
-    [self useGameRoot:local];
-    if (self.gameRoot) return;
-    NSData *bookmark = [[NSUserDefaults standardUserDefaults] dataForKey:@"GameFolder"];
-    if (!bookmark) return;
-    BOOL stale = NO;
-    NSURL *saved = [NSURL URLByResolvingBookmarkData:bookmark options:0 relativeToURL:nil bookmarkDataIsStale:&stale error:nil];
-    if (saved) {
-        if ([saved startAccessingSecurityScopedResource]) self.scopedURL = saved;
-        [self useGameRoot:saved];
-    }
+    });
 }
 - (void)chooseGame
 {
@@ -265,43 +233,10 @@ static void *runGame(void *opaque)
     picker.delegate = self;
     [self presentViewController:picker animated:YES completion:nil];
 }
-- (void)exportDiagnostics
-{
-    if (self.setup.hidden || !self.setup.userInteractionEnabled) return;
-    self.setup.userInteractionEnabled = NO;
-    NSString *previousStatus = self.status.text;
-    self.status.text = @"Preparing recorded sessions…";
-    MSDiagnosticsExport([self documents], ^(NSURL *archive, NSError *error) {
-        self.setup.userInteractionEnabled = YES;
-        self.status.text = previousStatus;
-        if (!archive) {
-            UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Diagnostics"
-                message:error.localizedDescription ?: @"Could not prepare diagnostics."
-                preferredStyle:UIAlertControllerStyleAlert];
-            [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-            [self presentViewController:alert animated:YES completion:nil];
-            return;
-        }
-        UIActivityViewController *share = [[UIActivityViewController alloc] initWithActivityItems:@[archive] applicationActivities:nil];
-        share.popoverPresentationController.sourceView = self.shareDiagnostics;
-        share.popoverPresentationController.sourceRect = self.shareDiagnostics.bounds;
-        share.completionWithItemsHandler = ^(UIActivityType type, BOOL completed, NSArray *items, NSError *shareError) {
-            [NSFileManager.defaultManager removeItemAtURL:archive.URLByDeletingLastPathComponent error:nil];
-        };
-        [self presentViewController:share animated:YES completion:nil];
-    });
-}
 - (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls
 {
     NSURL *url = urls.firstObject;
-    if (!url) return;
-    [self.scopedURL stopAccessingSecurityScopedResource];
-    self.scopedURL = [url startAccessingSecurityScopedResource] ? url : nil;
-    [self useGameRoot:url];
-    if (self.gameRoot) {
-        NSData *bookmark = [url bookmarkDataWithOptions:0 includingResourceValuesForKeys:nil relativeToURL:nil error:nil];
-        if (bookmark) [[NSUserDefaults standardUserDefaults] setObject:bookmark forKey:@"GameFolder"];
-    }
+    [controller dismissViewControllerAnimated:YES completion:^{ if (url) [self locateGameAndStart:url]; }];
 }
 - (void)startGame
 {
@@ -312,56 +247,52 @@ static void *runGame(void *opaque)
     NSDictionary *dirs = @{@"PS3_HDD0_ROOT":[documents URLByAppendingPathComponent:@"gamedata/dev_hdd0"],
                           @"PS3_HDD1_ROOT":[cache URLByAppendingPathComponent:@"dev_hdd1"],
                           @"PS3RECOMP_MSL_CACHE":[cache URLByAppendingPathComponent:@"msl-ios"]};
-    NSData *data = [NSData dataWithContentsOfURL:[NSBundle.mainBundle URLForResource:@"MotorStormLaunch" withExtension:@"json"]];
-    NSDictionary *config = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+    NSDictionary *config = launchConfiguration();
     if (![config[@"environment"] isKindOfClass:NSDictionary.class]) {
-        self.status.text = @"Launch settings are missing. Rebuild the iOS target."; return;
+        [self showLaunchError:@"Launch settings are missing. Reinstall the app." allowFolder:NO]; return;
     }
     for (NSString *key in config[@"environment"]) setenv(key.UTF8String, [config[@"environment"][key] UTF8String], 0);
     for (NSString *key in dirs) {
         NSURL *url = dirs[key]; NSError *error = nil;
         if (![fm createDirectoryAtURL:url withIntermediateDirectories:YES attributes:nil error:&error]) {
-            self.status.text=error.localizedDescription; return;
+            [self showLaunchError:error.localizedDescription allowFolder:NO]; return;
         }
         setenv(key.UTF8String, url.fileSystemRepresentation, 1);
     }
     setenv("PS3_VFS_ROOT", self.gameRoot.fileSystemRepresentation, 1);
-    if (chdir(documents.fileSystemRepresentation) != 0) { self.status.text=@"Cannot open app storage."; return; }
+    if (chdir(documents.fileSystemRepresentation) != 0) {
+        [self showLaunchError:@"Cannot open app storage." allowFolder:NO]; return;
+    }
     SDL_SetMainReady();
     if (rsx_metal_backend_attach_layer((__bridge void *)self.gameView.layer) != 0) {
-        self.status.text=@"Could not attach the Metal display."; return;
+        [self showLaunchError:@"Could not attach the Metal display." allowFolder:NO]; return;
     }
-    NSURL *logs=[documents URLByAppendingPathComponent:@"logs" isDirectory:YES];
-    [fm createDirectoryAtURL:logs withIntermediateDirectories:YES attributes:nil error:nil];
-    self.fpsLabel.hidden = NO;
-    self.fpsLabel.text = @"— FPS";
-    __weak MotorStormController *controller = self;
-    MSDiagnosticsObserveGuestFPS(^(double guestFPS) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            controller.fpsLabel.text = [NSString stringWithFormat:@"%.0f FPS", guestFPS];
-        });
-    });
-    NSURL *offlineLog=MSDiagnosticsStart(documents);
-    NSString *log=[(offlineLog ?: [logs URLByAppendingPathComponent:@"latest.log"]) path];
-    if (freopen(log.fileSystemRepresentation,"a",stdout)) setvbuf(stdout,nullptr,_IOFBF,64*1024);
-    if (freopen(log.fileSystemRepresentation,"a",stderr)) setvbuf(stderr,nullptr,_IOFBF,16*1024);
+#if MOTORSTORM_IOS_DIAGNOSTICS
+    NSURL *offlineLog = MSDiagnosticsStart(documents);
+    const char *log = offlineLog ? offlineLog.fileSystemRepresentation : "/dev/null";
+#else
+    // Normal gameplay has no session logger, sampling timer or growing log file.
+    const char *log = "/dev/null";
+#endif
+    if (freopen(log,"a",stdout)) setvbuf(stdout,nullptr,_IOFBF,64*1024);
+    if (freopen(log,"a",stderr)) setvbuf(stderr,nullptr,_IOFBF,16*1024);
     setenv("MOTORSTORM_BUFFERED_LOG","1",1);
-    NSLog(@"MotorStorm runtime log: %@",log);
     MSDiagnosticsEvent(@"start", @{});
-    const char *diagnostics[] = {"PS3_FTRACE", "AUDIO_RATE", "MOTORSTORM_AUDIO_WORKER_TIMING"};
-    for (const char *key : diagnostics) {
-        const char *value = getenv(key);
-        fprintf(stderr, "[iOS diagnostics] %s=%s\n", key, value ? value : "off");
-    }
     self.started = YES;
-    self.setup.hidden = YES;
-    self.controls.hidden = NO;
+    self.gameRunning = YES;
     UIApplication.sharedApplication.idleTimerDisabled = YES;
-    BootArguments *boot = new BootArguments{strdup([self executableAtRoot:self.gameRoot].fileSystemRepresentation), (__bridge_retained void *)self};
+    __weak MotorStormController *weakSelf = self;
+    rsx_metal_backend_on_first_presented(^{
+        MotorStormController *controller = weakSelf;
+        if (!controller.gameRunning) return;
+        controller.logo.hidden = YES;
+        controller.controls.hidden = NO;
+    });
+    BootArguments *boot = new BootArguments{strdup([self.gameRoot URLByAppendingPathComponent:@"PS3_GAME/USRDIR/EBOOT.elf"].fileSystemRepresentation), (__bridge_retained void *)self};
     pthread_attr_t attr; pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, 16 * 1024 * 1024);
     pthread_t thread;
-    int result=pthread_create(&thread,&attr,runGame,boot);
+    int result = pthread_create(&thread,&attr,runGame,boot);
     pthread_attr_destroy(&attr);
     if (result==0) pthread_detach(thread);
     else { CFBridgingRelease(boot->controller); free(boot->eboot); delete boot; [self gameReturned:result]; }
@@ -369,12 +300,12 @@ static void *runGame(void *opaque)
 - (void)dealloc { [_scopedURL stopAccessingSecurityScopedResource]; }
 - (void)gameReturned:(int)result
 {
-    MSDiagnosticsObserveGuestFPS(nil);
+    self.gameRunning = NO;
     MSDiagnosticsFinish(result);
-    self.fpsLabel.hidden = YES;
-    self.setup.hidden=NO; self.controls.hidden=YES; self.start.enabled=NO;
-    self.status.text=[NSString stringWithFormat:@"Game stopped (%d). Close and reopen MotorStorm to try again. Logs are saved in MotorStorm’s Files folder.",result];
-    UIApplication.sharedApplication.idleTimerDisabled=NO;
+    self.logo.hidden = NO;
+    self.controls.hidden = YES;
+    UIApplication.sharedApplication.idleTimerDisabled = NO;
+    [self showLaunchError:[NSString stringWithFormat:@"Game stopped (%d). Close and reopen MotorStorm to try again.",result] allowFolder:NO];
 }
 @end
 

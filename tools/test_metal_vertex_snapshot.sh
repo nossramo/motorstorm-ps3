@@ -5,7 +5,7 @@ test_dir=$(mktemp -d)
 trap 'rm -rf "$test_dir"' EXIT
 export DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}"
 for test in test_metal_vertex_snapshot test_metal_shared_stage; do
-  xcrun clang -O2 -UNDEBUG -fobjc-arc -ffp-contract=off \
+  xcrun clang -O2 -UNDEBUG -fobjc-arc -ffp-contract=off -DPS3_PASSIVE_METRICS="${TEST_PASSIVE_METRICS:-1}" \
     -Ivendor/ps3recomp/include -Ivendor/ps3recomp/libs/video \
     "vendor/ps3recomp/libs/video/tests/$test.m" \
     vendor/ps3recomp/libs/video/rsx_texture_layout.c \

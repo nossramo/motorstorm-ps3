@@ -1,4 +1,5 @@
 #import "OfflineDiagnostics.h"
+#if MOTORSTORM_IOS_DIAGNOSTICS
 #include "../../vendor/ps3recomp/include/ps3emu/passive_metrics.h"
 #include "../../vendor/ps3recomp/include/ps3emu/passive_threads.h"
 #include "../../vendor/ps3recomp/include/ps3emu/passive_waits.h"
@@ -490,3 +491,6 @@ extern "C" const char* motorstorm_job_chain_dir(void)
     memcpy(path, dir.UTF8String, dir.length + 1);
     return path;
 }
+#else
+extern "C" const char* motorstorm_job_chain_dir(void) { return nullptr; }
+#endif

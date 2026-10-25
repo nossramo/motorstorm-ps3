@@ -33,6 +33,7 @@ def main():
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--sanitize', action='store_true')
     p.add_argument('--thinlto', action='store_true')
+    p.add_argument('--play-build', action='store_true', help='Compile out passive diagnostics as in normal iOS builds')
     p.add_argument('--production-baseline', type=Path,
                    help='Generated iOS native_geometry source, before WWS adapter')
     args = p.parse_args()
@@ -78,6 +79,8 @@ def main():
         cmd[1:1] = ['-g', '-fsanitize=address,undefined']
     if args.thinlto:
         cmd[1:1] = ['-flto=thin']
+    if args.play_build:
+        cmd[1:1] = ['-DPS3_PASSIVE_METRICS=0']
     os.environ.setdefault('DEVELOPER_DIR', '/Applications/Xcode.app/Contents/Developer')
     subprocess.run(list(map(str, cmd)), check=True)
     env = dict(os.environ, MOTORSTORM_JOB_MERGE='1', MOTORSTORM_SPU_PIPELINE='2',
