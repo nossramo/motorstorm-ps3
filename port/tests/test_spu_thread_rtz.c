@@ -44,6 +44,24 @@ static void fill(u128* a, u128* b, u128* c, int cancel) {
     } \
 } while (0)
 
+/* Exercise the wide operation directly, including lanes normally handled by
+ * the single-precision fast path and mixed valid/invalid lane selections. */
+static void check_wide(u128 a, u128 b, u128 c) {
+    const u128 want[] = {spu_fa_ref(a,b), spu_fm_ref(a,b),
+        spu_fma_ref(a,b,c), spu_fms_ref(a,b,c), spu_fnms_ref(a,b,c)};
+    const uint32x4_t sentinel = {0xdeadbeef, 0x01020304, 0xabcdef01, 0x76543210};
+    for (unsigned op = 0; op < 5; ++op) {
+        u128 got = spu__nv_u128(ms_spu_wide_fix(sentinel, vdupq_n_u32(0), a,b,c,op));
+        if (memcmp(&got, &want[op], 16)) {
+            fprintf(stderr, "FAIL wide op=%u\n", op); abort();
+        }
+        const uint32x4_t valid = {~0u, 0, ~0u, 0};
+        got = spu__nv_u128(ms_spu_wide_fix(sentinel, valid, a,b,c,op));
+        const u128 expected = spu__nv_u128(vbslq_u32(valid, sentinel, vld1q_u32(want[op]._u32)));
+        if (memcmp(&got, &expected, 16)) { fprintf(stderr,"FAIL lane selection\n"); abort(); }
+    }
+}
+
 int main(void) {
     const uint64_t host = fpcr();
     const long n = 8000000;
@@ -52,6 +70,29 @@ int main(void) {
     if ((fpcr() & 0xc00000ull) != 0xc00000ull) {
         fprintf(stderr, "FAIL FPCR is not RTZ after enter\n");
         return 1;
+    }
+    const uint32_t edges[] = {0, 0x80000000u, 1, 0x807fffffu, 0x00800000u,
+        0x00800001u, 0x80800000u, 0x3f7fffffu, 0x3f800000u, 0xbf800000u,
+        0x3f800001u, 0x7f7fffffu, 0xff7fffffu, 0x7f800000u, 0xff800000u,
+        0x7fffffffu, 0xffffffffu};
+    for (unsigned x=0; x<sizeof edges/sizeof edges[0]; ++x)
+    for (unsigned y=0; y<sizeof edges/sizeof edges[0]; ++y)
+    for (unsigned z=0; z<sizeof edges/sizeof edges[0]; ++z) {
+        u128 a=spu__nv_u128(vdupq_n_u32(edges[x]));
+        u128 b=spu__nv_u128(vdupq_n_u32(edges[y]));
+        u128 c=spu__nv_u128(vdupq_n_u32(edges[z]));
+        check_wide(a,b,c);
+    }
+    /* Every exponent pair, both signs, tiny opposite addends and cancellation.
+     * These expose rounding at 24-bit boundaries and at Smin/Smax. */
+    for (unsigned ea=0; ea<256; ++ea) for (unsigned eb=0; eb<256; ++eb) {
+        u128 a,b,c;
+        for (unsigned lane=0; lane<4; ++lane) {
+            a._u32[lane]=(ea<<23) | ((lane&1)?0x7fffffu:0) | ((lane&2)?0x80000000u:0);
+            b._u32[lane]=(eb<<23) | ((lane&2)?0x7fffffu:0) | ((lane&1)?0x80000000u:0);
+            c._u32[lane]=a._u32[lane]^0x80000000u;
+        }
+        check_wide(a,b,c);
     }
     for (long i = 0; i < n; i++) {
         u128 a, b, c;
@@ -62,6 +103,7 @@ int main(void) {
         CHECK3(ms_thread_fma, spu_fma_ref, a, b, c);
         CHECK3(ms_thread_fms, spu_fms_ref, a, b, c);
         CHECK3(ms_thread_fnms, spu_fnms_ref, a, b, c);
+        if (!(i & 15)) check_wide(a,b,c);
     }
     ms_spu_exec_leave();
     if ((fpcr() & 0xc00000ull) != 0xc00000ull) {
@@ -74,6 +116,6 @@ int main(void) {
                 (unsigned long long)fpcr(), (unsigned long long)host);
         return 1;
     }
-    printf("PASS %ld vectors x 6 ops, nested enter/leave, host FPCR restored\n", n);
+    printf("PASS %ld vectors x 6 ops, wide edge/exponent/random cases, lane masks, nested enter/leave, host FPCR restored (wide=%d)\n", n, ms_spu_wide_rtz);
     return 0;
 }

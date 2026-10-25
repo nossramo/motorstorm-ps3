@@ -12,7 +12,32 @@
 extern "C" int rsx_metal_passive_frame_sample(ps3_passive_frame *out) {
     *out={30,30,33.333,34,40,0}; return 1;
 }
+extern "C" int ms_rsx_phase_account_enabled(void) { return 0; }
+extern "C" void ms_rsx_phase_take(uint64_t ns[19], uint32_t calls[19],
+    uint64_t *draws, uint64_t *packed, uint64_t *fallback, uint64_t *vertices,
+    uint64_t *packBytes, uint64_t *constBytes, uint64_t *indexBytes)
+{
+    memset(ns,0,19*sizeof(*ns)); memset(calls,0,19*sizeof(*calls));
+    *draws=*packed=*fallback=*vertices=*packBytes=*constBytes=*indexBytes=0;
+}
 extern "C" void offline_test_cpu_worker(int role);
+
+static NSURL *exportDiagnostics(NSURL *documents, BOOL expectSuccess)
+{
+    __block BOOL done=NO;
+    __block NSURL *result=nil;
+    MSDiagnosticsExport(documents, ^(NSURL *archive, NSError *error) {
+        assert(NSThread.isMainThread);
+        if (expectSuccess && error) fprintf(stderr,"Export error: %s\n",error.description.UTF8String);
+        assert(expectSuccess ? (archive && !error) : (!archive && error));
+        result=archive; done=YES;
+    });
+    NSDate *deadline=[NSDate dateWithTimeIntervalSinceNow:15];
+    while (!done && deadline.timeIntervalSinceNow>0)
+        [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
+    assert(done);
+    return result;
+}
 
 int main(int argc,char **argv) {
     assert(argc==2);
@@ -59,8 +84,10 @@ int main(int argc,char **argv) {
     ps3_metrics_enable(0);
     @autoreleasepool {
         NSURL *documents=[NSURL fileURLWithPath:[NSString stringWithUTF8String:argv[1]] isDirectory:YES];
+        int savedStderr=dup(STDERR_FILENO);
         NSFileManager *fm=NSFileManager.defaultManager;
         NSURL *parent=[documents URLByAppendingPathComponent:@"logs/performance"];
+        exportDiagnostics(documents, NO);
         for (int i=0;i<7;i++) {
             NSURL *old=[parent URLByAppendingPathComponent:[NSString stringWithFormat:@"session-old-%d",i]];
             assert([fm createDirectoryAtURL:old withIntermediateDirectories:YES attributes:nil error:nil]);
@@ -117,6 +144,20 @@ int main(int argc,char **argv) {
         unsigned long long before=[[fm attributesOfItemAtPath:native.path error:nil] fileSize];
         fputs("SHOULD_NOT_GROW",stdout); fflush(stdout);
         assert(before==[[fm attributesOfItemAtPath:native.path error:nil] fileSize]);
+        dup2(savedStderr,STDERR_FILENO); close(savedStderr);
+        NSDictionary *metadata=[NSJSONSerialization JSONObjectWithData:
+            [NSData dataWithContentsOfURL:[session URLByAppendingPathComponent:@"session.json"]] options:0 error:nil];
+        assert([[NSUUID alloc] initWithUUIDString:metadata[@"executable_uuid"]]);
+        // Export must include only known diagnostics files, not sibling game
+        // data, unowned sessions, or arbitrary files inside an owned session.
+        [@"not diagnostics" writeToURL:[session URLByAppendingPathComponent:@"secret.dat"]
+                           atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        [fm createDirectoryAtURL:[documents URLByAppendingPathComponent:@"game"]
+     withIntermediateDirectories:YES attributes:nil error:nil];
+        NSURL *archive=exportDiagnostics(documents, YES);
+        assert([fm copyItemAtURL:archive toURL:[documents.URLByDeletingLastPathComponent
+                                               URLByAppendingPathComponent:@"diagnostics.zip"] error:nil]);
+        assert([fm removeItemAtURL:archive.URLByDeletingLastPathComponent error:nil]);
     }
     return 0;
 }

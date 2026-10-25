@@ -1,7 +1,8 @@
 #pragma once
 /* Exact SPU float helpers for a host thread whose FPCR is already
  * round-toward-zero. Ordinary singles use one NEON instruction; rare
- * extended/overflow lanes use the integer SPU implementation. These are
+ * extended/overflow lanes use a wider exact ARM operation, with the integer
+ * SPU implementation retained for comparison. These are
  * not IEEE round-to-nearest approximations.
  *
  * Bind the rounding mode only around lifted/interpreted SPU execution
@@ -15,11 +16,15 @@ extern "C" {
 #endif
 void ms_spu_exec_enter(void);
 void ms_spu_exec_leave(void);
+extern int ms_spu_wide_rtz;
+__attribute__((noinline)) uint32x4_t ms_spu_wide_fix_vector(
+    uint32x4_t result, uint32x4_t valid,
+    uint32x4_t a, uint32x4_t b, uint32x4_t c, unsigned op);
 #ifdef __cplusplus
 }
 #endif
 
-static __attribute__((noinline, cold)) uint32x4_t ms_thread_fix(
+static __attribute__((noinline, cold)) uint32x4_t ms_thread_fix_integer(
     uint32x4_t result, uint32x4_t valid, u128 a, u128 b, u128 c, unsigned op)
 {
     uint32_t r[4], ok[4];
@@ -32,6 +37,23 @@ static __attribute__((noinline, cold)) uint32x4_t ms_thread_fix(
                op == 3 ? spu__fma_lane(a._u32[i], b._u32[i], c._u32[i], 0, 0x80000000u) :
                          spu__fma_lane(a._u32[i], b._u32[i], c._u32[i], 0x80000000u, 0);
     return vld1q_u32(r);
+}
+
+/* Keep the fallback's arguments in NEON registers across the call. Passing
+ * three u128 unions through the C ABI would shuttle them through integer
+ * registers, and a second out-of-line dispatch would add another spill. */
+static inline __attribute__((always_inline)) uint32x4_t ms_spu_wide_fix(
+    uint32x4_t result, uint32x4_t valid, u128 a, u128 b, u128 c, unsigned op)
+{
+    return ms_spu_wide_fix_vector(result, valid, vld1q_u32(a._u32),
+                                 vld1q_u32(b._u32), vld1q_u32(c._u32), op);
+}
+
+static inline __attribute__((always_inline)) uint32x4_t ms_thread_fix(
+    uint32x4_t result, uint32x4_t valid, u128 a, u128 b, u128 c, unsigned op)
+{
+    if (ms_spu_wide_rtz) return ms_spu_wide_fix(result, valid, a, b, c, op);
+    return ms_thread_fix_integer(result, valid, a, b, c, op);
 }
 
 static inline __attribute__((always_inline)) uint32x4_t ms_thread_normalize(uint32x4_t x)

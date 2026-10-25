@@ -28,7 +28,9 @@ extern "C" int motorstorm_vmx_benchmark(const char*);
 @property(nonatomic, strong) MotorStormMetalView *gameView;
 @property(nonatomic, strong) UIStackView *setup;
 @property(nonatomic, strong) UILabel *status;
+@property(nonatomic, strong) UILabel *fpsLabel;
 @property(nonatomic, strong) UIButton *start;
+@property(nonatomic, strong) UIButton *shareDiagnostics;
 @property(nonatomic, strong) UIView *controls;
 @property(nonatomic, strong) NSURL *gameRoot;
 @property(nonatomic, strong) NSURL *scopedURL;
@@ -95,7 +97,12 @@ static void *runGame(void *opaque)
     choose.configuration = [UIButtonConfiguration borderedButtonConfiguration];
     [choose setTitle:@"Choose game folder" forState:UIControlStateNormal];
     [choose addTarget:self action:@selector(chooseGame) forControlEvents:UIControlEventTouchUpInside];
-    self.setup = [[UIStackView alloc] initWithArrangedSubviews:@[title, self.status, self.start, choose]];
+    self.shareDiagnostics = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.shareDiagnostics.configuration = [UIButtonConfiguration borderedButtonConfiguration];
+    [self.shareDiagnostics setTitle:@"Share diagnostics" forState:UIControlStateNormal];
+    self.shareDiagnostics.accessibilityIdentifier = @"share-diagnostics";
+    [self.shareDiagnostics addTarget:self action:@selector(exportDiagnostics) forControlEvents:UIControlEventTouchUpInside];
+    self.setup = [[UIStackView alloc] initWithArrangedSubviews:@[title, self.status, self.start, choose, self.shareDiagnostics]];
     self.setup.axis = UILayoutConstraintAxisVertical;
     self.setup.spacing = 16;
     self.setup.translatesAutoresizingMaskIntoConstraints = NO;
@@ -112,6 +119,17 @@ static void *runGame(void *opaque)
     self.controls.hidden = YES;
     self.controls.multipleTouchEnabled = YES;
     [self.view addSubview:self.controls];
+    self.fpsLabel = [UILabel new];
+    self.fpsLabel.hidden = YES;
+    self.fpsLabel.userInteractionEnabled = NO;
+    self.fpsLabel.textAlignment = NSTextAlignmentCenter;
+    self.fpsLabel.textColor = UIColor.whiteColor;
+    self.fpsLabel.font = [UIFont monospacedDigitSystemFontOfSize:28 weight:UIFontWeightBold];
+    self.fpsLabel.backgroundColor = [UIColor.blackColor colorWithAlphaComponent:0.62];
+    self.fpsLabel.layer.cornerRadius = 8;
+    self.fpsLabel.layer.masksToBounds = YES;
+    self.fpsLabel.text = @"— FPS";
+    [self.view addSubview:self.fpsLabel];
     [self addControl:@"◀" key:123];
     [self addControl:@"▶" key:124];
     [self addControl:@"↑" key:126];
@@ -148,6 +166,10 @@ static void *runGame(void *opaque)
                 UIApplication.sharedApplication.idleTimerDisabled = NO;
             });
         });
+    } else if ([NSProcessInfo.processInfo.arguments containsObject:@"--start-game"]) {
+        // Opt-in device testing. Keep the ordinary setup screen unchanged and
+        // let UIKit finish installing/layouting the view before attaching Metal.
+        dispatch_async(dispatch_get_main_queue(), ^{ [self startGame]; });
     }
 }
 - (void)addControl:(NSString *)title key:(unsigned)key
@@ -192,6 +214,8 @@ static void *runGame(void *opaque)
             case 8: b.frame=CGRectMake(left+112,safe.top+12,88,44); break;
         }
     }
+    self.fpsLabel.frame = CGRectMake((bounds.size.width - 148) / 2, safe.top + 8, 148, 40);
+    [self.view bringSubviewToFront:self.fpsLabel];
 }
 - (NSURL *)documents
 {
@@ -241,6 +265,32 @@ static void *runGame(void *opaque)
     picker.delegate = self;
     [self presentViewController:picker animated:YES completion:nil];
 }
+- (void)exportDiagnostics
+{
+    if (self.setup.hidden || !self.setup.userInteractionEnabled) return;
+    self.setup.userInteractionEnabled = NO;
+    NSString *previousStatus = self.status.text;
+    self.status.text = @"Preparing recorded sessions…";
+    MSDiagnosticsExport([self documents], ^(NSURL *archive, NSError *error) {
+        self.setup.userInteractionEnabled = YES;
+        self.status.text = previousStatus;
+        if (!archive) {
+            UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Diagnostics"
+                message:error.localizedDescription ?: @"Could not prepare diagnostics."
+                preferredStyle:UIAlertControllerStyleAlert];
+            [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+            [self presentViewController:alert animated:YES completion:nil];
+            return;
+        }
+        UIActivityViewController *share = [[UIActivityViewController alloc] initWithActivityItems:@[archive] applicationActivities:nil];
+        share.popoverPresentationController.sourceView = self.shareDiagnostics;
+        share.popoverPresentationController.sourceRect = self.shareDiagnostics.bounds;
+        share.completionWithItemsHandler = ^(UIActivityType type, BOOL completed, NSArray *items, NSError *shareError) {
+            [NSFileManager.defaultManager removeItemAtURL:archive.URLByDeletingLastPathComponent error:nil];
+        };
+        [self presentViewController:share animated:YES completion:nil];
+    });
+}
 - (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls
 {
     NSURL *url = urls.firstObject;
@@ -283,6 +333,14 @@ static void *runGame(void *opaque)
     }
     NSURL *logs=[documents URLByAppendingPathComponent:@"logs" isDirectory:YES];
     [fm createDirectoryAtURL:logs withIntermediateDirectories:YES attributes:nil error:nil];
+    self.fpsLabel.hidden = NO;
+    self.fpsLabel.text = @"— FPS";
+    __weak MotorStormController *controller = self;
+    MSDiagnosticsObserveGuestFPS(^(double guestFPS) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            controller.fpsLabel.text = [NSString stringWithFormat:@"%.0f FPS", guestFPS];
+        });
+    });
     NSURL *offlineLog=MSDiagnosticsStart(documents);
     NSString *log=[(offlineLog ?: [logs URLByAppendingPathComponent:@"latest.log"]) path];
     if (freopen(log.fileSystemRepresentation,"a",stdout)) setvbuf(stdout,nullptr,_IOFBF,64*1024);
@@ -311,7 +369,9 @@ static void *runGame(void *opaque)
 - (void)dealloc { [_scopedURL stopAccessingSecurityScopedResource]; }
 - (void)gameReturned:(int)result
 {
+    MSDiagnosticsObserveGuestFPS(nil);
     MSDiagnosticsFinish(result);
+    self.fpsLabel.hidden = YES;
     self.setup.hidden=NO; self.controls.hidden=YES; self.start.enabled=NO;
     self.status.text=[NSString stringWithFormat:@"Game stopped (%d). Close and reopen MotorStorm to try again. Logs are saved in MotorStorm’s Files folder.",result];
     UIApplication.sharedApplication.idleTimerDisabled=NO;

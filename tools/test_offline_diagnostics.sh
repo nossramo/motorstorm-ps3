@@ -11,4 +11,26 @@ xcrun --sdk macosx clang++ -std=c++20 -O2 -fobjc-arc -framework Foundation \
     'MotorStorm/MotorStorm iOS/OfflineDiagnostics.mm' \
     port/tests/test_offline_diagnostics.mm "$test_dir/cpu-worker.o" -o "$test_dir/offline-test"
 "$test_dir/offline-test" "$test_dir/documents"
-printf '%s\n' 'Offline diagnostics: counters, live/exited C threads, timer, JSON, rotation, retention and console cap passed.'
+python3 tools/collect_ios_diagnostics.py --archive "$test_dir/diagnostics.zip" --out "$test_dir/imported"
+python3 - "$test_dir" <<'PY'
+import json,sys,zipfile
+from pathlib import Path
+sys.path.insert(0,'tools')
+from collect_ios_diagnostics import import_archive
+root=Path(sys.argv[1])
+with zipfile.ZipFile(root/'diagnostics.zip') as archive:
+    names=archive.namelist()
+    assert any(name.endswith('/session.json') for name in names)
+    assert not any('secret.dat' in name or '/game/' in name or 'session-user-folder' in name for name in names)
+report=json.loads((root/'imported/summary.json').read_text())
+assert len(report)==1 and report[0]['executable_uuid']
+with zipfile.ZipFile(root/'unsafe.zip','w') as archive:
+    archive.writestr('../session-escape/session.json','{}')
+try:
+    import_archive(root/'unsafe.zip',root/'unsafe-output')
+    raise AssertionError('Unsafe path accepted')
+except ValueError:
+    pass
+assert not (root/'session-escape').exists()
+PY
+printf '%s\n' 'Offline diagnostics: counters, threads, timer, JSON, rotation, retention, console cap and ZIP export/import passed.'

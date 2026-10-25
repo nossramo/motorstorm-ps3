@@ -2,6 +2,10 @@
  * All unexpected host/channel effects fail: this fixture does not fake DMA. */
 #include "spu_interp.h"
 #include "spu_audio_worker.h"
+#ifdef MOTORSTORM_SPU_PIPELINE_TEST
+#include "spu_audio_pipeline.h"
+unsigned ms_spu_pipeline_test_mask;
+#endif
 #include <assert.h>
 #include <time.h>
 #ifdef MOTORSTORM_AUDIO_BENCHMARK
@@ -72,8 +76,8 @@ static void test_local_store(void) {
     assert(ms_audio_worker_scope_safe(&candidate));
     int* gates[] = {&g_spu_ls_probe,&g_spu_ls_watch_n,&g_spu_smc_watch};
     for (unsigned i=0; i<3; ++i) {
-        *gates[i] = -1; assert(!ms_audio_worker_scope_safe(&candidate));
-        *gates[i] = 1; assert(!ms_audio_worker_scope_safe(&candidate));
+        *gates[i] = -1; assert(ms_audio_worker_scope_safe(&candidate) == !SPU_LS_DIAGNOSTICS);
+        *gates[i] = 1; assert(ms_audio_worker_scope_safe(&candidate) == !SPU_LS_DIAGNOSTICS);
         *gates[i] = 0;
     }
     candidate.policy_mode=1; assert(!ms_audio_worker_scope_safe(&candidate));
@@ -104,12 +108,24 @@ static void test_arithmetic(void) {
 static double execute(spu_context* ctx, int merged) {
     *ctx = input; ctx->ls = ctx->ls_store;
     ms_audio_worker_test_mode = merged; budget = 1000000;
+#ifdef MOTORSTORM_SPU_PIPELINE_TEST
+    ms_spu_pipeline_test_mask = merged == 6 ? 1 : 0;
+    if (merged == 6) ms_audio_worker_test_mode = 5;
+#endif
     g_spu_trampoline_fn = NULL;
     double start = now();
     uint64_t fpcr_before, fpcr_after;
     __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr_before));
+#ifdef MOTORSTORM_SPU_THREAD_RTZ
+    ms_spu_exec_enter();
+    __asm__ volatile("mrs %0, fpcr" : "=r"(expected_fpcr));
+#else
     expected_fpcr = fpcr_before;
+#endif
     functions[ctx->pc / 4](ctx); drain(ctx);
+#ifdef MOTORSTORM_SPU_THREAD_RTZ
+    assert_host_mode(); ms_spu_exec_leave();
+#endif
     __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr_after));
     assert(fpcr_before == fpcr_after);
     return now() - start;
@@ -128,15 +144,28 @@ int main(int argc, char** argv) {
 #endif
     assert(argc > 1);
     test_local_store();
+#ifdef MOTORSTORM_SPU_THREAD_RTZ
+    ms_spu_exec_enter();
+#endif
     test_arithmetic();
+#ifdef MOTORSTORM_SPU_THREAD_RTZ
+    ms_spu_exec_leave();
+#endif
+    /* Normal iOS removes the lazy observer initializers together with their
+     * callbacks. Replay the production wrappers with those gates still -1. */
+#if !SPU_LS_DIAGNOSTICS
+    g_spu_ls_probe = g_spu_ls_watch_n = g_spu_smc_watch = -1;
+#endif
     spu_1136862334bb6208f794040f3a7f26e4991cd6b00eac6229331432566f1535d1_spu_recomp_register();
     for (int file_index = 1; file_index < argc; ++file_index) {
         FILE* file = fopen(argv[file_index], "rb");
         assert(file && fread(&input, sizeof input, 1, file) == 1);
         assert(fgetc(file) == EOF); fclose(file);
         assert(input.image_id == 286484578 && !input.policy_mode);
+        assert(ms_audio_worker_scope_safe(&input));
         assert(input.pc < SPU_LS_SIZE && functions[input.pc / 4]);
         double old_time = 0, new_time = 0, scoped_time = 0, compact_time = 0, direct_ls_time = 0, bounded_time = 0;
+        double pipeline_time = 0;
         const unsigned repeats = 1000;
         for (unsigned repeat = 0; repeat < repeats; ++repeat) {
             old_time += execute(&reference, 0);
@@ -148,13 +177,20 @@ int main(int argc, char** argv) {
             }
             /* Alternate candidate/reference order to reduce thermal and
              * scheduling bias. The clock measures this thread's CPU work. */
-            for (unsigned order = 0; order < 4; ++order) {
-                int mode = 2 + ((repeat + order) % 4);
+            const unsigned variants =
+#ifdef MOTORSTORM_SPU_PIPELINE_TEST
+                5;
+#else
+                4;
+#endif
+            for (unsigned order = 0; order < variants; ++order) {
+                int mode = 2 + ((repeat + order) % variants);
                 double elapsed = execute(&candidate, mode);
                 if (mode == 2) scoped_time += elapsed;
                 else if (mode == 3) compact_time += elapsed;
                 else if (mode == 4) direct_ls_time += elapsed;
-                else bounded_time += elapsed;
+                else if (mode == 5) bounded_time += elapsed;
+                else pipeline_time += elapsed;
                 assert(reference.pc == candidate.pc && reference.status == candidate.status);
                 if (memcmp(reference.gpr, candidate.gpr, sizeof reference.gpr) ||
                     memcmp(reference.ls_store, candidate.ls_store, SPU_LS_SIZE)) {
@@ -165,6 +201,10 @@ int main(int argc, char** argv) {
         printf("PASS %s: all registers/LS/FPCR, original %.4f ms merged %.4f ms scoped %.4f ms compact %.4f ms direct-LS %.4f ms bounded %.4f ms\n",
                argv[file_index], old_time * 1000 / repeats, new_time * 1000 / repeats,
                scoped_time * 1000 / repeats, compact_time * 1000 / repeats, direct_ls_time * 1000 / repeats, bounded_time * 1000 / repeats);
+#ifdef MOTORSTORM_SPU_PIPELINE_TEST
+        printf("PIPELINE %s: bounded %.6f ms native %.6f ms speedup %.3f\n", argv[file_index],
+               bounded_time * 1000 / repeats, pipeline_time * 1000 / repeats, bounded_time / pipeline_time);
+#endif
     }
 #ifdef MOTORSTORM_AUDIO_BENCHMARK
     fclose(audio_report);

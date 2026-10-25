@@ -152,18 +152,17 @@
 		A71C00013090000000000001 /* Build native runtime */ = {
 			isa = PBXShellScriptBuildPhase;
 			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = ();
+			inputPaths = ();
 			name = "Build native runtime";
 			outputPaths = (
 				"$(PROJECT_DIR)/../build/macos-stable/xcode-link.rsp",
 				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/MotorStormLaunch.json",
 			);
+			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = (
-				"set -eu",
-				"export PATH=\"/opt/homebrew/bin:/usr/local/bin:$PATH\"",
-				"python3 \"$PROJECT_DIR/../tools/build_macos_runtime.py\"",
-				"",
-			);
+			shellScript = "set -eu\nexport PATH=\"/opt/homebrew/bin:/usr/local/bin:$PATH\"\npython3 \"$PROJECT_DIR/../tools/build_macos_runtime.py\"\n";
 		};
 		A71C00023090000000000001 /* Build iOS native runtime */ = {
 			isa = PBXShellScriptBuildPhase;
@@ -319,19 +318,20 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ARCHS = arm64;
-				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = NO;
-				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_ENTITLEMENTS = MotorStorm.entitlements;
 				CODE_SIGN_IDENTITY = "-";
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				ENABLE_DEBUG_DYLIB = NO;
+				OTHER_LDFLAGS = ("$(inherited)", "@$(PROJECT_DIR)/../build/macos-stable/xcode-link.rsp");
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
 				ENABLE_APP_SANDBOX = NO;
-				ENABLE_DEBUG_DYLIB = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = NO;
-				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = MotorStorm;
@@ -342,10 +342,6 @@
 					"@executable_path/../Frameworks",
 				);
 				MARKETING_VERSION = 1.0;
-				OTHER_LDFLAGS = (
-					"$(inherited)",
-					"@$(PROJECT_DIR)/../build/macos-stable/xcode-link.rsp",
-				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.motorstorm.port.macos;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
@@ -362,19 +358,20 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ARCHS = arm64;
-				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = NO;
-				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_ENTITLEMENTS = MotorStorm.entitlements;
 				CODE_SIGN_IDENTITY = "-";
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				ENABLE_DEBUG_DYLIB = NO;
+				OTHER_LDFLAGS = ("$(inherited)", "@$(PROJECT_DIR)/../build/macos-stable/xcode-link.rsp");
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
 				ENABLE_APP_SANDBOX = NO;
-				ENABLE_DEBUG_DYLIB = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = NO;
-				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = MotorStorm;
@@ -385,10 +382,6 @@
 					"@executable_path/../Frameworks",
 				);
 				MARKETING_VERSION = 1.0;
-				OTHER_LDFLAGS = (
-					"$(inherited)",
-					"@$(PROJECT_DIR)/../build/macos-stable/xcode-link.rsp",
-				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.motorstorm.port.macos;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
@@ -411,6 +404,7 @@
 				CODE_SIGN_ENTITLEMENTS = "MotorStorm-iOS.entitlements";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 582W8UF3UX;
 				ENABLE_DEBUG_DYLIB = NO;
 				ENABLE_PREVIEWS = NO;
 				ENABLE_USER_SCRIPT_SANDBOXING = NO;
@@ -440,7 +434,7 @@
 					"-framework",
 					UniformTypeIdentifiers,
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.motorstorm.port.ios;
+				PRODUCT_BUNDLE_IDENTIFIER = com.lithium.motorstorm;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = iphoneos;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
@@ -467,6 +461,7 @@
 				CODE_SIGN_ENTITLEMENTS = "MotorStorm-iOS.entitlements";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 582W8UF3UX;
 				ENABLE_DEBUG_DYLIB = NO;
 				ENABLE_PREVIEWS = NO;
 				ENABLE_USER_SCRIPT_SANDBOXING = NO;
@@ -496,7 +491,7 @@
 					"-framework",
 					UniformTypeIdentifiers,
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.motorstorm.port.ios;
+				PRODUCT_BUNDLE_IDENTIFIER = com.lithium.motorstorm;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = iphoneos;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;

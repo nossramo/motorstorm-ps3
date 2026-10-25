@@ -4,8 +4,45 @@ Never launches, stops, mirrors, or attaches a debugger to the game.
 """
 import argparse
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import subprocess
+import zipfile
+
+
+def import_archive(archive, out):
+    """Import only the exporter allowlist; never extract arbitrary ZIP paths."""
+    allowed = {'session.json', 'owner.plist', 'samples-0.jsonl',
+               'samples-1.jsonl', 'samples-2.jsonl', 'native.log'}
+    with zipfile.ZipFile(archive) as source:
+        selected, seen, total = [], set(), 0
+        for info in source.infolist():
+            path = PurePosixPath(info.filename)
+            if info.is_dir() or '__MACOSX' in path.parts:
+                continue
+            if path.is_absolute() or '..' in path.parts or '\\' in info.filename:
+                raise ValueError('Unsafe path in diagnostics archive')
+            if len(path.parts) < 2 or path.name not in allowed:
+                continue
+            session = path.parts[-2]
+            if not session.startswith('session-'):
+                continue
+            mode = info.external_attr >> 16
+            if mode & 0o170000 == 0o120000:
+                raise ValueError('Symlinks are not valid diagnostics files')
+            key = (session, path.name)
+            if key in seen:
+                raise ValueError('Duplicate diagnostics file in archive')
+            seen.add(key)
+            total += info.file_size
+            if info.file_size > 4*1024*1024 or total > 64*1024*1024 or len(selected) >= 40:
+                raise ValueError('Diagnostics archive exceeds the export limits')
+            selected.append((info, key))
+        if not any(name == 'session.json' for _, (_, name) in selected):
+            raise ValueError('No sessions found in diagnostics archive')
+        for info, (session, name) in selected:
+            destination = out / 'performance' / session / name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(source.read(info))
 
 
 def summarize(session):
@@ -35,6 +72,7 @@ def summarize(session):
         diagnostics_schema=metadata.get('schema', 1), cpu_role_metrics_available=bool(role_names),
         runtime_options=metadata.get('runtime_options', {}),
         build_options=metadata.get('build_options', {}),
+        executable_uuid=metadata.get('executable_uuid'),
         async_metrics_available=bool(async_samples),
         async_dispatches=async_count if async_samples else None,
         async_reuse_percent=100*sum(r['async_reused'] for r in async_samples)/async_count if async_count else None,
@@ -81,17 +119,25 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--device', help='Required for a fresh copy; omit with --report-only')
     parser.add_argument('--out', type=Path, required=True)
-    parser.add_argument('--report-only', action='store_true')
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--report-only', action='store_true')
+    mode.add_argument('--archive', type=Path, help='ZIP shared from the iOS app; no device connection needed')
     args = parser.parse_args()
     if not args.report_only:
-        if not args.device:
-            parser.error('--device is required to copy logs')
+        if not args.device and not args.archive:
+            parser.error('--device or --archive is required to copy logs')
         if args.out.exists():
             parser.error('Use a fresh output directory to preserve earlier evidence')
         args.out.mkdir(parents=True)
-        subprocess.run(['xcrun', 'devicectl', 'device', 'copy', 'from', '--device', args.device,
-                        '--source', 'Documents/logs/performance', '--destination', str(args.out / 'performance'),
-                        '--domain-type', 'appDataContainer', '--domain-identifier', 'com.lithium.motorstorm'], check=True)
+        if args.archive:
+            try:
+                import_archive(args.archive, args.out)
+            except (OSError, ValueError, zipfile.BadZipFile) as error:
+                parser.error(str(error))
+        else:
+            subprocess.run(['xcrun', 'devicectl', 'device', 'copy', 'from', '--device', args.device,
+                            '--source', 'Documents/logs/performance', '--destination', str(args.out / 'performance'),
+                            '--domain-type', 'appDataContainer', '--domain-identifier', 'com.lithium.motorstorm'], check=True)
     summaries = []
     for path in sorted((args.out / 'performance').glob('session-*/session.json')):
         report = summarize(path.parent)

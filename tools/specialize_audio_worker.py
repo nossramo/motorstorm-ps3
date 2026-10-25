@@ -129,6 +129,9 @@ def generate(output):
         bounded = bounded_arithmetic(direct_ls, entry)
         wrapper = f'''void {name}(spu_context* ctx) {{
     ms_audio_worker_capture(ctx, 0x{entry:X}, {index});
+    /* Measurement build: return before the sample loop. The caller still
+     * advances, but this task does not spend a core on the mix. */
+    if (ms_audio_skip()) SPU_RET(ctx);
     if (ms_audio_worker_mode() >= 5 && ms_audio_worker_scope_safe(ctx)) ms_audio_bounded_{entry:X}(ctx);
     else if (ms_audio_worker_mode() >= 4 && ms_audio_worker_scope_safe(ctx)) ms_audio_direct_ls_{entry:X}(ctx);
     else if (ms_audio_worker_mode() >= 3 && ms_audio_worker_scope_safe(ctx)) ms_audio_compact_{entry:X}(ctx);
@@ -146,7 +149,7 @@ def generate(output):
     configure = '''#ifndef MOTORSTORM_AUDIO_WORKER_TEST
 void port_audio_worker_configure(void) {
     ms_audio_worker_init();
-    fprintf(stderr, "[audio-worker] configured mode=%d\\n", ms_audio_worker_mode());
+    fprintf(stderr, "[audio-worker] configured mode=%d skip=%d\\n", ms_audio_worker_mode(), ms_audio_skip());
 }
 #endif
 '''

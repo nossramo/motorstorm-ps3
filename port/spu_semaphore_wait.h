@@ -18,8 +18,12 @@ static int motorstorm_spu_semaphore_delay(spu_context* ctx)
         __atomic_store_n(&setting, mode, __ATOMIC_RELAXED);
     }
     if (mode != 2 || ctx->image_id != 507917221 || ctx->pc != 0xAAE8 ||
-        yz_lockstep_enabled() || g_spu_ls_watch_n ||
-        g_spu_ls_probe != 0 || g_spu_smc_watch != 0) return 0;
+        yz_lockstep_enabled()) return 0;
+#if SPU_LS_DIAGNOSTICS
+    /* Disabled probes leave their lazy-init gates at -1. Only a build that
+     * can actually invoke observers needs to reject unknown/active gates. */
+    if (g_spu_ls_watch_n || g_spu_ls_probe || g_spu_smc_watch) return 0;
+#endif
     const uint32_t sp = ctx->gpr[1]._u32[0];
     if ((sp & 15) || sp < 0x30000 || sp > 0x3FFB0 ||
         ctx->gpr[82]._u32[0] != ctx->mfc_lsa ||
@@ -36,6 +40,12 @@ static int motorstorm_spu_semaphore_delay(spu_context* ctx)
     const int reason = spu_coh_wait_reservation(ctx, 100);
     if (reason == 3) return 0;
     ctx->gpr[6] = spu_il(999);
+    static SPU_THREAD_LOCAL int reported;
+    if (!reported) {
+        reported = 1;
+        fprintf(stderr, "[spu-semaphore] native wait active: image=%d pc=%05X ls_diagnostics=%d\n",
+                ctx->image_id, (unsigned)ctx->pc, SPU_LS_DIAGNOSTICS);
+    }
     return reason + 1;
 }
 #endif

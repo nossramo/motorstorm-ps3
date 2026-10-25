@@ -33,6 +33,9 @@ def main():
         subprocess.run([sys.executable, str(root / 'tools/build_macos_runtime.py')], check=True)
         return
     ios = platform != 'macosx'
+    # Separate object/cache tree keeps the known non-LTO archive available for
+    # comparison. =0 selects it without rebuilding every generated game unit.
+    thin_lto = os.environ.get('MOTORSTORM_BUILD_IOS_THINLTO') != '0'
     # iPhone caller samples: historical full trace + current lock-candidate
     # fragment. Bit-exact in the device lane test; =0 selects the previous
     # five-unit/FMA-only configuration for comparison.
@@ -42,6 +45,28 @@ def main():
     float_probe = os.environ.get('MOTORSTORM_BUILD_IOS_SPU_FLOAT_PROBE') == '1'
     # Exact native RTZ SPU floats for the duration of each SPU run.
     thread_rtz = os.environ.get('MOTORSTORM_BUILD_IOS_SPU_THREAD_RTZ') != '0'
+    # Byte-identical NEON local-store accessors. iOS only.
+    ls_neon = os.environ.get('MOTORSTORM_BUILD_IOS_SPU_LS_NEON') != '0'
+    # Exact table-based SHUFB; =0 rebuilds the previous helper for comparison.
+    shufb_neon = os.environ.get('MOTORSTORM_BUILD_IOS_SPU_SHUFB_NEON') != '0'
+    detailed_diagnostics = os.environ.get('MOTORSTORM_BUILD_IOS_DETAILED_DIAGNOSTICS') == '1'
+    # Isolate renderer wall-time accounting from the costly SPU local-store
+    # observers and job-chain sampling in the full diagnostic build.
+    render_diagnostics = (detailed_diagnostics or
+                          os.environ.get('MOTORSTORM_BUILD_IOS_RENDER_DIAGNOSTICS') == '1')
+    # Legacy observer hooks otherwise add loads/branches to every SPU LS128
+    # access even with all run-time probes disabled. Keep an isolated A/B flag.
+    ls_diagnostics = (detailed_diagnostics or
+                      os.environ.get('MOTORSTORM_BUILD_IOS_SPU_LS_DIAGNOSTICS') == '1')
+    # Bounded WWS block fusion; runtime MOTORSTORM_JOB_MERGE=0 retains the
+    # previous bodies in the same binary for controlled device comparisons.
+    job_merge = os.environ.get('MOTORSTORM_BUILD_IOS_JOB_MERGE') != '0'
+    # One bit-exact native audio recurrence; =0 compiles the original overlay.
+    # The candidate also retains its original loop behind a runtime switch.
+    audio_filter = os.environ.get('MOTORSTORM_BUILD_IOS_AUDIO_FILTER') != '0'
+    # Four sampled PPU functions; originals remain selectable at runtime.
+    ppu_locals = os.environ.get('MOTORSTORM_BUILD_IOS_PPU_LOCALS') != '0'
+    native_geometry = os.environ.get('MOTORSTORM_BUILD_IOS_NATIVE_GEOMETRY') != '0'
     # Units holding ~90% of out-of-line store/coherence-check time in the
     # iPhone gameplay trace (logs/ios-vmx-01, main and physics threads).
     store_units = ('083;065;091;082;092;063;075;089;064;060;070;000;055;002;076;056;081;062;069;068'
@@ -52,9 +77,10 @@ def main():
                      'game/PS3_GAME/USRDIR/EBOOT.elf', 'port/spu/spu_workloads.c'):
         if not (root / required).is_file():
             sys.exit(f'error: Missing {required}. Restore the local runtime/game and generate sources as described in BACKUP.md.')
-    build = root / ('build/ios-game/' + platform if ios else 'build/game')
+    platform_build = root / ('build/ios-game/' + platform if ios else 'build/game')
+    build = platform_build / 'thinlto' if thin_lto else platform_build
     build.mkdir(parents=True, exist_ok=True)
-    with (build / '.xcode-build.lock').open('w') as lock:
+    with (platform_build / '.xcode-build.lock').open('w') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         query = build / '.cmake/api/v1/query/client-motorstorm/codemodel-v2'
         query.parent.mkdir(parents=True, exist_ok=True)
@@ -71,6 +97,7 @@ def main():
                 '-DCMAKE_SYSTEM_NAME=iOS', '-DCMAKE_SYSTEM_PROCESSOR=arm64',
                 f'-DCMAKE_OSX_SYSROOT={sdk}', '-DCMAKE_OSX_ARCHITECTURES=arm64',
                 '-DCMAKE_OSX_DEPLOYMENT_TARGET=18.0', '-DCMAKE_BUILD_TYPE=Release',
+                '-DMOTORSTORM_IOS_THINLTO=' + ('ON' if thin_lto else 'OFF'),
                 f'-DCMAKE_PREFIX_PATH={prefix}', f'-DCMAKE_FIND_ROOT_PATH={prefix}',
                 '-DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY', '-DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY',
                 '-DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY', '-DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER',
@@ -83,10 +110,18 @@ def main():
                 f'-DMOTORSTORM_NEON_VMX_UNITS={vmx_units}',
                 '-DMOTORSTORM_NEON_ARITHMETIC=' + ('ON' if ios_vmx else 'OFF'),
                 '-DMOTORSTORM_JOB_ARITHMETIC=ON',
+                '-DMOTORSTORM_JOB_MERGE=' + ('ON' if job_merge else 'OFF'),
+                '-DMOTORSTORM_AUDIO_FILTER_NATIVE=' + ('ON' if audio_filter else 'OFF'),
+                '-DMOTORSTORM_PPU_LOCALS=' + ('ON' if ppu_locals else 'OFF'),
+                '-DMOTORSTORM_NATIVE_GEOMETRY=' + ('ON' if native_geometry else 'OFF'),
                 '-DMOTORSTORM_INLINE_STORES=' + ('ON' if inline_stores else 'OFF'),
                 f'-DMOTORSTORM_INLINE_STORE_UNITS={store_units}',
                 '-DMOTORSTORM_SPU_FLOAT_PROBE=' + ('ON' if float_probe else 'OFF'),
                 '-DMOTORSTORM_SPU_THREAD_RTZ=' + ('ON' if thread_rtz else 'OFF'),
+                '-DMOTORSTORM_SPU_LS_NEON=' + ('ON' if ls_neon else 'OFF'),
+                '-DMOTORSTORM_SPU_LS_DIAGNOSTICS=' + ('ON' if ls_diagnostics else 'OFF'),
+                '-DMOTORSTORM_SPU_SHUFB_NEON=' + ('ON' if shufb_neon else 'OFF'),
+                '-DMOTORSTORM_RSX_PHASE_ACCOUNT=' + ('ON' if render_diagnostics else 'OFF'),
                 '-DMOTORSTORM_VMX_BENCHMARK=' + ('ON' if os.environ.get(
                     'MOTORSTORM_BUILD_VMX_BENCHMARK') == '1' else 'OFF'),
                 '-DMOTORSTORM_AUDIO_BENCHMARK=' + ('ON' if os.environ.get(
@@ -113,15 +148,25 @@ def main():
                 args.append(arg)
         if not any(arg.endswith('/libMotorStormRecomp.a') for arg in args):
             sys.exit('error: CMake did not export the native game archive.')
+        if thin_lto:
+            # The File API loop above exports libraries only. Xcode performs
+            # the real link, so pass ThinLTO there too, and override its Debug
+            # -O0/Release -Os for the LTO backend without changing app sources.
+            cache = build / 'thinlto-cache'
+            cache.mkdir(exist_ok=True)
+            args += ['-flto=thin', '-O2', '-Xlinker', '-cache_path_lto',
+                     '-Xlinker', str(cache)]
         # Clang response-file quoting (paths may contain spaces).
         response = '\n'.join('"' + arg.replace('\\', '\\\\').replace('"', '\\"') + '"' for arg in args) + '\n'
-        write_changed(build / 'xcode-link.rsp', response)
+        write_changed(platform_build / 'xcode-link.rsp', response)
         resources = Path(os.environ['TARGET_BUILD_DIR']) / os.environ['UNLOCALIZED_RESOURCES_FOLDER_PATH']
         if ios:
             values = environment(root)
             # iPhone-specific scheduling policy; keep the validated macOS
             # defaults independent. These are also recorded in offline logs.
             values.update(json.loads((root / 'port/ios/runtime-options.json').read_text()))
+            if detailed_diagnostics:
+                values['MOTORSTORM_JOB_CHAIN'] = '1'
             for key in ('PS3RECOMP_FFMPEG_AVCODEC', 'PS3RECOMP_FFMPEG_AVUTIL', 'PS3RECOMP_MSL_CACHE'):
                 values.pop(key, None)
             values['PS3_TITLE'] = 'MotorStorm'
@@ -130,11 +175,21 @@ def main():
                      for p in sorted(game.rglob('*')) if p.is_file()
                      and not any(part.startswith('.') for part in p.relative_to(game).parts)}
             config = {'environment': values, 'files': files,
-                      'build_options': {'ppu_vmx_units': vmx_units.split(';'),
+                      'build_options': {'thin_lto': thin_lto,
+                                        'ppu_vmx_units': vmx_units.split(';'),
                                         'ppu_vmx_arithmetic': ios_vmx,
                                         'ppu_inline_store_units': store_units.split(';') if store_units else [],
                                         'spu_float_probe': float_probe,
-                                        'spu_thread_rtz': thread_rtz}}
+                                        'spu_thread_rtz': thread_rtz,
+                                        'spu_ls_neon': ls_neon,
+                                        'spu_ls_diagnostics': ls_diagnostics,
+                                        'spu_shufb_neon': shufb_neon,
+                                        'detailed_diagnostics': detailed_diagnostics,
+                                        'render_phase_diagnostics': render_diagnostics,
+                                        'spu_job_merge': job_merge,
+                                        'audio_filter_native': audio_filter}}
+            config['build_options']['ppu_locals'] = ppu_locals
+            config['build_options']['native_geometry'] = native_geometry
         else:
             config = {'root': str(root), 'environment': environment(root)}
         write_changed(resources / 'MotorStormLaunch.json', json.dumps(config, indent=2, ensure_ascii=False) + '\n')

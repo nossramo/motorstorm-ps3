@@ -66,6 +66,48 @@ endif()
 list(LENGTH RECOMP_SOURCES RECOMP_SOURCE_COUNT)
 message(STATUS "Lifted sources:  ${RECOMP_SOURCE_COUNT} file(s)")
 
+# Four sampled functions, with original bodies retained for process-level A/B.
+# The pass writes only into this platform's build tree; RECOMP_DIR is immutable.
+option(MOTORSTORM_PPU_LOCALS "Conservative PPU register-local pilot on iOS" OFF)
+if(MOTORSTORM_PPU_LOCALS)
+    if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+        message(FATAL_ERROR "The PPU locals pilot is iOS-only")
+    endif()
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    set(PPU_LOCALS_UNITS 075 091 092)
+    foreach(unit IN LISTS PPU_LOCALS_UNITS)
+        set(original "${RECOMP_DIR}/ppu_recomp_${unit}.cpp")
+        set(specialized "${CMAKE_CURRENT_BINARY_DIR}/ppu_locals/ppu_recomp_${unit}.cpp")
+        add_custom_command(OUTPUT "${specialized}"
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../tools/specialize_ppu_locals.py"
+                --unit "${unit}" --input "${original}" --output "${specialized}"
+            DEPENDS "${original}" "${CMAKE_CURRENT_SOURCE_DIR}/../tools/specialize_ppu_locals.py"
+                "${CMAKE_CURRENT_SOURCE_DIR}/../tools/third_party/ps3recomp/ppu_nv_dirty.py"
+                "${CMAKE_CURRENT_SOURCE_DIR}/ppu_locals.h"
+            VERBATIM)
+        list(REMOVE_ITEM RECOMP_SOURCES "${original}")
+        list(APPEND RECOMP_SOURCES "${specialized}")
+    endforeach()
+endif()
+
+# iOS scheduling for the measured physics counting-semaphore wait. The
+# immutable macOS source/builder never consumes this generated copy.
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    set(COUNTING_WAIT_ORIGINAL "${RECOMP_DIR}/ppu_recomp_083.cpp")
+    set(COUNTING_WAIT_SOURCE "${CMAKE_CURRENT_BINARY_DIR}/counting_wait/ppu_recomp_083.cpp")
+    add_custom_command(OUTPUT "${COUNTING_WAIT_SOURCE}"
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../tools/specialize_counting_wait.py"
+            --input "${COUNTING_WAIT_ORIGINAL}" --output "${COUNTING_WAIT_SOURCE}"
+        DEPENDS "${COUNTING_WAIT_ORIGINAL}" "${CMAKE_CURRENT_SOURCE_DIR}/ppu_counting_wait.h"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../tools/specialize_counting_wait.py"
+        VERBATIM)
+    list(REMOVE_ITEM RECOMP_SOURCES "${COUNTING_WAIT_ORIGINAL}")
+    list(APPEND RECOMP_SOURCES "${COUNTING_WAIT_SOURCE}")
+    set_property(SOURCE "${COUNTING_WAIT_SOURCE}" APPEND PROPERTY
+        INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR};${RECOMP_DIR}")
+endif()
+
 # ---------------------------------------------------------------------------
 # ps3recomp runtime library
 # ---------------------------------------------------------------------------
@@ -84,6 +126,15 @@ add_subdirectory("${PS3RECOMP_DIR}" "${CMAKE_BINARY_DIR}/ps3recomp_sdk"
 if(APPLE AND CMAKE_C_COMPILER_ID MATCHES "Clang")
     target_compile_options(ps3recomp_runtime PRIVATE
         "$<$<COMPILE_LANGUAGE:C>:-fno-common>")
+endif()
+
+# Detailed per-draw timing is a deliberate diagnostic build, not a normal
+# gameplay measurement. Keep its clocks and atomics out of default iOS builds.
+option(MOTORSTORM_RSX_PHASE_ACCOUNT "Detailed iOS per-draw phase diagnostics" OFF)
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS" AND MOTORSTORM_RSX_PHASE_ACCOUNT)
+    set_property(SOURCE "${PS3RECOMP_DIR}/libs/video/rsx_draw_engine.c"
+        TARGET_DIRECTORY ps3recomp_runtime
+        APPEND PROPERTY COMPILE_DEFINITIONS MOTORSTORM_RSX_PHASE_ACCOUNT=1)
 endif()
 
 # Offline RPCS3 frame comparison. This target does not link the lifted game.
@@ -275,6 +326,110 @@ if(AUDIO_WORKER_ORIGINAL IN_LIST SPU_SOURCES AND CMAKE_SYSTEM_PROCESSOR MATCHES 
     list(APPEND SPU_SOURCES "${AUDIO_WORKER_SPECIALIZED}")
 endif()
 
+# Native block and legacy recurrence for the verified audio DSP filter. Keep generated game code
+# in the iOS build directory and retain its original loop for A/B comparisons.
+option(MOTORSTORM_AUDIO_FILTER_NATIVE "Native MotorStorm audio filter variants on iOS" OFF)
+if(MOTORSTORM_AUDIO_FILTER_NATIVE)
+    if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS" OR NOT CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
+        message(FATAL_ERROR "The native audio filter is an ARM64 iOS experiment")
+    endif()
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    set(AUDIO_FILTER_ORIGINAL "${SPU_DIR}/motorstorm_audio_32770/spu_recomp.c")
+    set(AUDIO_FILTER_SPECIALIZED "${CMAKE_CURRENT_BINARY_DIR}/spu_audio_filter.c")
+    if(NOT AUDIO_FILTER_ORIGINAL IN_LIST SPU_SOURCES)
+        message(FATAL_ERROR "Generate the MotorStorm audio overlays before enabling the native filter")
+    endif()
+    add_custom_command(OUTPUT "${AUDIO_FILTER_SPECIALIZED}"
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../tools/specialize_audio_filter.py"
+            --generate "${AUDIO_FILTER_SPECIALIZED}"
+        DEPENDS "${AUDIO_FILTER_ORIGINAL}" "${CMAKE_CURRENT_SOURCE_DIR}/spu_audio_filter.h"
+            "${CMAKE_CURRENT_SOURCE_DIR}/spu_audio_block.h"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../tools/specialize_audio_filter.py"
+        VERBATIM)
+    list(REMOVE_ITEM SPU_SOURCES "${AUDIO_FILTER_ORIGINAL}")
+    list(APPEND SPU_SOURCES "${AUDIO_FILTER_SPECIALIZED}")
+endif()
+
+# Fuse only the two measured WWS modules, after arithmetic specialization.
+# The immutable macOS baseline never consumes these generated iOS copies.
+option(MOTORSTORM_JOB_MERGE "Fuse bounded WWS blocks in the iOS runtime" OFF)
+if(MOTORSTORM_JOB_MERGE)
+    if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+        message(FATAL_ERROR "WWS block fusion is an iOS-only experiment")
+    endif()
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    foreach(module IN ITEMS jobmod_e5d3c4d056fe_e12E10 jobmod_be896a6374ba_e12230)
+        set(MERGE_INPUT "${SPU_DIR}/${module}/spu_recomp.c")
+        if(MOTORSTORM_JOB_ARITHMETIC)
+            set(MERGE_INPUT "${CMAKE_CURRENT_BINARY_DIR}/${module}_scopes.c")
+        elseif(module STREQUAL "jobmod_be896a6374ba_e12230" AND MOTORSTORM_CULL_SCOPE)
+            set(MERGE_INPUT "${CULL_SPECIALIZED}")
+        endif()
+        set(MERGE_OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/${module}_merged.c")
+        set(MERGE_BEFORE_PIPELINE "${CMAKE_CURRENT_BINARY_DIR}/${module}_merged_baseline.c")
+        add_custom_command(OUTPUT "${MERGE_OUTPUT}"
+            BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/${module}_merged.json"
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../tools/specialize_job_merge.py"
+                --module "${module}" --input "${MERGE_INPUT}" --generate "${MERGE_BEFORE_PIPELINE}"
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../tools/specialize_spu_pipeline.py"
+                --kind jobs --input "${MERGE_BEFORE_PIPELINE}" --generate "${MERGE_OUTPUT}"
+            DEPENDS "${MERGE_INPUT}" "${SPU_DIR}/${module}/spu_recomp.c"
+                "${CMAKE_CURRENT_SOURCE_DIR}/../tools/specialize_job_merge.py"
+                "${CMAKE_CURRENT_SOURCE_DIR}/../tools/specialize_spu_pipeline.py"
+                "${CMAKE_CURRENT_SOURCE_DIR}/spu_audio_pipeline.h"
+                "${CMAKE_CURRENT_SOURCE_DIR}/spu_job_merge.h"
+            VERBATIM)
+        list(REMOVE_ITEM SPU_SOURCES "${MERGE_INPUT}")
+        list(APPEND SPU_SOURCES "${MERGE_OUTPUT}")
+    endforeach()
+endif()
+
+option(MOTORSTORM_NATIVE_GEOMETRY "Native ARM box/plane predicates for iOS" OFF)
+if(MOTORSTORM_NATIVE_GEOMETRY)
+    if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+        message(FATAL_ERROR "Native geometry is an iOS-only experiment")
+    endif()
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    set(GEOMETRY_MODULE "jobmod_be896a6374ba_e12230")
+    set(GEOMETRY_INPUT "${SPU_DIR}/${GEOMETRY_MODULE}/spu_recomp.c")
+    if(MOTORSTORM_JOB_MERGE)
+        set(GEOMETRY_INPUT "${CMAKE_CURRENT_BINARY_DIR}/${GEOMETRY_MODULE}_merged.c")
+    elseif(MOTORSTORM_JOB_ARITHMETIC)
+        set(GEOMETRY_INPUT "${CMAKE_CURRENT_BINARY_DIR}/${GEOMETRY_MODULE}_scopes.c")
+    elseif(MOTORSTORM_CULL_SCOPE)
+        set(GEOMETRY_INPUT "${CULL_SPECIALIZED}")
+    endif()
+    if(NOT GEOMETRY_INPUT IN_LIST SPU_SOURCES)
+        message(FATAL_ERROR "Native geometry input is not in the iOS source list")
+    endif()
+    set(GEOMETRY_OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/native_geometry/${GEOMETRY_MODULE}.c")
+    add_custom_command(OUTPUT "${GEOMETRY_OUTPUT}"
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../tools/specialize_native_geometry.py"
+            --input "${GEOMETRY_INPUT}" --output "${GEOMETRY_OUTPUT}"
+        DEPENDS "${GEOMETRY_INPUT}" "${SPU_DIR}/${GEOMETRY_MODULE}/spu_recomp.c"
+            "${CMAKE_CURRENT_SOURCE_DIR}/native_geometry.h"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../tools/specialize_native_geometry.py"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../tools/specialize_job_merge.py"
+        VERBATIM)
+    list(REMOVE_ITEM SPU_SOURCES "${GEOMETRY_INPUT}")
+    list(APPEND SPU_SOURCES "${GEOMETRY_OUTPUT}")
+endif()
+
+# Whole-batch iOS adapter; baseline remains in the same generated translation
+# unit. No shared runtime sources or pinned macOS build are changed.
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS" AND MOTORSTORM_NATIVE_GEOMETRY)
+    set(WWS_CHAIN_OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/wws_chain/${GEOMETRY_MODULE}.c")
+    add_custom_command(OUTPUT "${WWS_CHAIN_OUTPUT}"
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../tools/specialize_wws_chain.py"
+            --input "${GEOMETRY_OUTPUT}" --output "${WWS_CHAIN_OUTPUT}"
+        DEPENDS "${GEOMETRY_OUTPUT}" "${CMAKE_CURRENT_SOURCE_DIR}/wws_native_chain.h"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../tools/specialize_wws_chain.py"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../tools/specialize_native_geometry.py"
+        VERBATIM)
+    list(REMOVE_ITEM SPU_SOURCES "${GEOMETRY_OUTPUT}")
+    list(APPEND SPU_SOURCES "${WWS_CHAIN_OUTPUT}" "${CMAKE_CURRENT_SOURCE_DIR}/wws_native_chain.c")
+endif()
+
 add_library(${PROJECT_NAME} STATIC
     main.cpp
     gpu_read_sync.cpp
@@ -360,6 +515,27 @@ if(SPU_SOURCES)
     endif()
 endif()
 
+if(MOTORSTORM_JOB_MERGE)
+    foreach(module IN ITEMS jobmod_e5d3c4d056fe_e12E10 jobmod_be896a6374ba_e12230)
+        set_property(SOURCE "${CMAKE_CURRENT_BINARY_DIR}/${module}_merged.c" APPEND PROPERTY
+            INCLUDE_DIRECTORIES "${SPU_DIR}/${module}")
+        set_property(SOURCE "${CMAKE_CURRENT_BINARY_DIR}/${module}_merged.c" APPEND PROPERTY
+            COMPILE_OPTIONS "-ffp-contract=off")
+    endforeach()
+endif()
+
+if(MOTORSTORM_NATIVE_GEOMETRY)
+    set_property(SOURCE "${GEOMETRY_OUTPUT}" APPEND PROPERTY
+        INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR};${SPU_DIR}/${GEOMETRY_MODULE}")
+    set_property(SOURCE "${GEOMETRY_OUTPUT}" APPEND PROPERTY
+        COMPILE_OPTIONS "-ffp-contract=off")
+endif()
+
+if(WWS_CHAIN_OUTPUT)
+    set_property(SOURCE "${WWS_CHAIN_OUTPUT}" APPEND PROPERTY
+        INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR};${SPU_DIR}/${GEOMETRY_MODULE}")
+endif()
+
 # Only the measured audio image and its checked DSP overlays use these exact
 # NEON conversions. Other workloads and the interpreter keep the reference.
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
@@ -375,6 +551,12 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
 endif()
 
 # Keep the arithmetic specialization's include paths and flags local.
+if(AUDIO_FILTER_SPECIALIZED)
+    set_property(SOURCE "${AUDIO_FILTER_SPECIALIZED}" APPEND PROPERTY
+        INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR};${SPU_DIR}/motorstorm_audio_32770")
+    set_property(SOURCE "${AUDIO_FILTER_SPECIALIZED}" APPEND PROPERTY
+        COMPILE_OPTIONS "-include;${CMAKE_CURRENT_SOURCE_DIR}/spu_audio_conversions.h;-ffp-contract=off")
+endif()
 if(MOTORSTORM_JOB_ARITHMETIC)
     foreach(module IN ITEMS jobmod_e5d3c4d056fe_e12E10 jobmod_be896a6374ba_e12230)
         set_property(SOURCE "${CMAKE_CURRENT_BINARY_DIR}/${module}_scopes.c" APPEND PROPERTY
@@ -453,6 +635,56 @@ if(MOTORSTORM_SPU_THREAD_RTZ)
         APPEND PROPERTY COMPILE_OPTIONS "-include;${CMAKE_CURRENT_SOURCE_DIR}/spu_thread_rtz.h;-ffp-contract=off")
 endif()
 
+# Byte-identical NEON local-store loads and stores. Off unless the iOS
+# builder asks for it, so the macOS app keeps the scalar accessors.
+option(MOTORSTORM_SPU_LS_NEON "NEON local-store accessors in SPU code" OFF)
+if(MOTORSTORM_SPU_LS_NEON)
+    if(NOT APPLE OR NOT CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
+        message(FATAL_ERROR "NEON local-store accessors require Apple ARM64")
+    endif()
+    if(SPU_SOURCES)
+        set_property(SOURCE ${SPU_SOURCES} APPEND PROPERTY
+            COMPILE_DEFINITIONS SPU_LS_NEON)
+    endif()
+    set_property(SOURCE "${PS3RECOMP_DIR}/runtime/spu/spu_interp.c"
+        TARGET_DIRECTORY ps3recomp_runtime
+        APPEND PROPERTY COMPILE_DEFINITIONS SPU_LS_NEON)
+endif()
+
+# Remove observer-only LS probes from normal iOS execution. The SDK and other
+# platforms retain their old defaults. Apply the same definition to generated
+# SPU code and runtime helpers, without rebuilding unrelated generated PPU TUs.
+option(MOTORSTORM_SPU_LS_DIAGNOSTICS "Legacy per-access SPU local-store probes" ON)
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    if(MOTORSTORM_SPU_LS_DIAGNOSTICS)
+        set(SPU_LS_DIAGNOSTICS_VALUE 1)
+    else()
+        set(SPU_LS_DIAGNOSTICS_VALUE 0)
+    endif()
+    if(SPU_SOURCES)
+        set_property(SOURCE ${SPU_SOURCES} APPEND PROPERTY
+            COMPILE_DEFINITIONS SPU_LS_DIAGNOSTICS=${SPU_LS_DIAGNOSTICS_VALUE})
+    endif()
+    target_compile_definitions(ps3recomp_runtime PRIVATE
+        SPU_LS_DIAGNOSTICS=${SPU_LS_DIAGNOSTICS_VALUE})
+endif()
+
+# Exact ARM64 table-based SHUFB, scoped to iOS SPU units and its interpreter.
+# The build-time switch keeps the hot helper free of per-instruction branches.
+option(MOTORSTORM_SPU_SHUFB_NEON "Compact exact ARM64 SHUFB lowering for iOS" OFF)
+if(MOTORSTORM_SPU_SHUFB_NEON)
+    if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS" OR NOT CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
+        message(FATAL_ERROR "The compact SHUFB lowering is limited to ARM64 iOS")
+    endif()
+    if(SPU_SOURCES)
+        set_property(SOURCE ${SPU_SOURCES} APPEND PROPERTY
+            COMPILE_OPTIONS "-include;${CMAKE_CURRENT_SOURCE_DIR}/spu_shufb_neon.h")
+    endif()
+    set_property(SOURCE "${PS3RECOMP_DIR}/runtime/spu/spu_interp.c"
+        TARGET_DIRECTORY ps3recomp_runtime APPEND PROPERTY
+        COMPILE_OPTIONS "-include;${CMAKE_CURRENT_SOURCE_DIR}/spu_shufb_neon.h")
+endif()
+
 # app.rc carries the icon, the version block and the manifest, and needs a
 # resource compiler. Listing it as a source on a host that has none is not a
 # link error, it is a "no rule to make" for a file nothing can consume.
@@ -479,6 +711,22 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
 # The runtime is C++, and on Apple also Objective-C. Letting CMake infer the
 # link language from the generated C would leave the C++ standard library out.
 set_target_properties(${PROJECT_NAME} PROPERTIES LINKER_LANGUAGE CXX)
+
+# iOS-only experiment: optimize generated game code together with the runtime
+# at the final app link. Keep per-source arithmetic/aliasing flags intact and
+# leave prebuilt SDL/codec/shader dependencies as ordinary native objects.
+option(MOTORSTORM_IOS_THINLTO "ThinLTO for the iOS game and runtime" OFF)
+if(MOTORSTORM_IOS_THINLTO)
+    if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS" OR
+       NOT CMAKE_C_COMPILER_ID MATCHES "Clang" OR
+       NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        message(FATAL_ERROR "MotorStorm ThinLTO is restricted to Clang iOS builds")
+    endif()
+    foreach(lto_target IN ITEMS ${PROJECT_NAME} ps3recomp_runtime)
+        target_compile_options(${lto_target} PRIVATE -flto=thin)
+        target_link_options(${lto_target} INTERFACE -flto=thin)
+    endforeach()
+endif()
 
 # Windows system import libraries. dbghelp symbolizes crash-handler addresses
 # against the PDB, user32 and gdi32 are what the backend's window and its GDI
@@ -579,6 +827,27 @@ if(MOTORSTORM_INLINE_STORES)
         endif()
         set_property(SOURCE "${RECOMP_DIR}/ppu_recomp_${unit}.cpp" APPEND PROPERTY
             COMPILE_OPTIONS "-include;${CMAKE_CURRENT_SOURCE_DIR}/ppu_store_inline.h")
+    endforeach()
+endif()
+
+# Carry the reviewed per-unit VMX/store options onto the generated iOS copies.
+# The common lifted flags above already apply through RECOMP_SOURCES.
+foreach(unit IN LISTS PPU_LOCALS_UNITS)
+    foreach(property COMPILE_OPTIONS COMPILE_DEFINITIONS)
+        get_source_file_property(value "${RECOMP_DIR}/ppu_recomp_${unit}.cpp" ${property})
+        if(value)
+            set_property(SOURCE "${CMAKE_CURRENT_BINARY_DIR}/ppu_locals/ppu_recomp_${unit}.cpp"
+                APPEND PROPERTY ${property} "${value}")
+        endif()
+    endforeach()
+endforeach()
+
+if(COUNTING_WAIT_SOURCE)
+    foreach(property COMPILE_OPTIONS COMPILE_DEFINITIONS)
+        get_source_file_property(value "${COUNTING_WAIT_ORIGINAL}" ${property})
+        if(value)
+            set_property(SOURCE "${COUNTING_WAIT_SOURCE}" APPEND PROPERTY ${property} "${value}")
+        endif()
     endforeach()
 endif()
 

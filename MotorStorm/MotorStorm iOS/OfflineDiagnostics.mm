@@ -3,14 +3,43 @@
 #include "../../vendor/ps3recomp/include/ps3emu/passive_threads.h"
 #include "../../vendor/ps3recomp/include/ps3emu/passive_waits.h"
 #include <mach/mach.h>
+#include <mach-o/dyld.h>
+#include <mach-o/loader.h>
+#include <string.h>
 #include <sys/stat.h>
 #include <sys/utsname.h>
+#include <cstdint>
 #include <cstdio>
+
+extern "C" {
+void ms_rsx_phase_take(uint64_t ns[19], uint32_t calls[19],
+                       uint64_t* draws, uint64_t* packed, uint64_t* fallback,
+                       uint64_t* vertices, uint64_t* pack_bytes,
+                       uint64_t* const_bytes, uint64_t* index_bytes);
+int ms_rsx_phase_account_enabled(void);
+}
 
 // Three 1 MiB circular sample files per session; retain five sessions.
 // No network, video, audio samples, stack sampling, or GPU readback.
 static const NSUInteger kPartLimit = 1024 * 1024;
 static const NSUInteger kNativeLimit = 2 * 1024 * 1024;
+static void (^s_guestFPS)(double);
+
+static NSString *executableUUID(void)
+{
+    const mach_header *header = _dyld_get_image_header(0);
+    if (!header || header->magic != MH_MAGIC_64) return @"unknown";
+    const uint8_t *cursor = (const uint8_t *)header + sizeof(mach_header_64);
+    const uint8_t *end = cursor + header->sizeofcmds;
+    for (uint32_t i = 0; i < header->ncmds && cursor + sizeof(load_command) <= end; ++i) {
+        const load_command *command = (const load_command *)cursor;
+        if (command->cmdsize < sizeof(load_command) || command->cmdsize > (size_t)(end-cursor)) break;
+        if (command->cmd == LC_UUID && command->cmdsize >= sizeof(uuid_command))
+            return [[NSUUID alloc] initWithUUIDBytes:((const uuid_command *)command)->uuid].UUIDString;
+        cursor += command->cmdsize;
+    }
+    return @"unknown";
+}
 
 static double cpuSeconds(clockid_t clock)
 {
@@ -33,6 +62,7 @@ static double cpuSeconds(clockid_t clock)
 - (void)setActive:(BOOL)active;
 - (void)finish:(int)result;
 - (NSURL *)nativeLog;
+- (void)afterFlush:(dispatch_block_t)block;
 @end
 
 @implementation MSOfflineDiagnostics
@@ -89,10 +119,15 @@ static double cpuSeconds(clockid_t clock)
     NSMutableDictionary *runtimeOptions = [NSMutableDictionary new];
     for (NSString *key in @[@"MOTORSTORM_NATIVE_JOBS", @"MOTORSTORM_AUDIO_MERGE", @"MOTORSTORM_JOB_SCOPES", @"SPU_LOCKLINE_HOST", @"PS3_AUDIO_OUTPUT_QOS", @"PS3_GAMEPLAY_QOS",
                             @"SPURS_TARGETED_WAKE", @"SPU_LEAN_DISPATCH", @"SPU_ASYNC_REUSE", @"MOTORSTORM_SPU_SEMAPHORE_WAIT",
-                            @"CELL_SYNC_MUTEX_PARK", @"SPU_LOCKLINE_STRIPES"]) {
+                            @"CELL_SYNC_MUTEX_PARK", @"SPU_LOCKLINE_STRIPES", @"MOTORSTORM_AUDIO_SKIP",                             @"MOTORSTORM_JOB_BOOST",
+                            @"MOTORSTORM_JOB_CHAIN", @"MOTORSTORM_DMA_REPEAT", @"MOTORSTORM_JOB_MERGE", @"MOTORSTORM_NATIVE_GEOMETRY",
+                            @"RSX_METAL_DIRECT_VERTEX_SNAPSHOT", @"RSX_VERTEX_TOPOLOGY_CACHE",
+                            @"MOTORSTORM_AUDIO_FILTER", @"MOTORSTORM_AUDIO_BLOCK", @"MOTORSTORM_COUNTING_WAIT", @"MOTORSTORM_SPU_PIPELINE",
+                            @"MOTORSTORM_WWS_CHAIN", @"MOTORSTORM_WWS_CAPTURE"]) {
         const char *value = getenv(key.UTF8String);
         runtimeOptions[key] = value ? [NSString stringWithUTF8String:value] : @"unset";
     }
+    runtimeOptions[@"MOTORSTORM_GEOMETRY_CAPTURE"] = getenv("MOTORSTORM_GEOMETRY_CAPTURE") ? @"enabled" : @"off";
     NSData *launchData = [NSData dataWithContentsOfURL:[NSBundle.mainBundle URLForResource:@"MotorStormLaunch" withExtension:@"json"]];
     NSDictionary *launch = launchData ? [NSJSONSerialization JSONObjectWithData:launchData options:0 error:nil] : nil;
     NSDictionary *metadata = @{
@@ -101,6 +136,7 @@ static double cpuSeconds(clockid_t clock)
         @"os":NSProcessInfo.processInfo.operatingSystemVersionString,
         @"version":[NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"test",
         @"build":[NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleVersion"] ?: @"test",
+        @"executable_uuid":executableUUID(),
         @"logical_cpu_count":@(NSProcessInfo.processInfo.processorCount),
         @"runtime_options":runtimeOptions,
         @"build_options":launch[@"build_options"] ?: @{},
@@ -183,6 +219,21 @@ static double cpuSeconds(clockid_t clock)
     }
     ps3_passive_frame frames = {};
     BOOL haveFrames = rsx_metal_passive_frame_sample(&frames) != 0;
+    if (haveFrames && s_guestFPS) s_guestFPS(frames.guest_fps);
+    uint64_t phaseNs[19] = {};
+    uint32_t phaseCalls[19] = {};
+    uint64_t rsxDraws = 0, rsxPacked = 0, rsxFallback = 0, rsxVertices = 0;
+    uint64_t rsxPackBytes = 0, rsxConstBytes = 0, rsxIndexBytes = 0;
+    ms_rsx_phase_take(phaseNs, phaseCalls, &rsxDraws, &rsxPacked, &rsxFallback,
+                      &rsxVertices, &rsxPackBytes, &rsxConstBytes, &rsxIndexBytes);
+    static NSArray<NSString *> *phaseNames = @[
+        @"unused", @"vertex", @"state", @"pipeline", @"textures", @"submit",
+        @"layout", @"index_walk", @"remap", @"fetch_plan", @"pack", @"fetch_one",
+        @"const_index", @"prepare", @"bind", @"draw_copy", @"vertex_hash",
+        @"surface_a", @"surface_b"];
+    NSMutableDictionary *rsxPhase = [NSMutableDictionary new];
+    for (int i = 1; i < 19; i++) if (phaseCalls[i])
+        rsxPhase[phaseNames[i]] = @{@"ms": @(phaseNs[i] / 1e6), @"calls": @(phaseCalls[i])};
     task_vm_info_data_t memory = {};
     mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
     BOOL haveMemory = task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&memory, &count) == KERN_SUCCESS;
@@ -227,6 +278,15 @@ static double cpuSeconds(clockid_t clock)
         @"audio_sleep_overshoot_max_ms":@(v[PM_AUDIO_SLEEP_OVERSHOOT_MAX_NS]/1e6),
         @"audio_sleep_late_5ms":@(v[PM_AUDIO_SLEEP_LATE_5MS]), @"audio_sleep_late_20ms":@(v[PM_AUDIO_SLEEP_LATE_20MS])
     } mutableCopy];
+    row[@"rsx_phase_account"] = @(ms_rsx_phase_account_enabled());
+    row[@"rsx_draws"] = @(rsxDraws);
+    row[@"rsx_packed_draws"] = @(rsxPacked);
+    row[@"rsx_fallback_draws"] = @(rsxFallback);
+    row[@"rsx_vertices"] = @(rsxVertices);
+    row[@"rsx_pack_bytes"] = @(rsxPackBytes);
+    row[@"rsx_const_bytes"] = @(rsxConstBytes);
+    row[@"rsx_index_bytes"] = @(rsxIndexBytes);
+    row[@"rsx_phase"] = rsxPhase;
     [self writeRow:row];
     _lastWall=now; _lastCPU=cpu;
     if (now-_lastFlush >= 5) { [self flush]; _lastFlush=now; }
@@ -257,6 +317,10 @@ static double cpuSeconds(clockid_t clock)
         if (self->_file) { fclose(self->_file); self->_file=nullptr; }
     });
 }
+- (void)afterFlush:(dispatch_block_t)block
+{
+    dispatch_async(_queue, ^{ [self flush]; block(); });
+}
 @end
 
 static MSOfflineDiagnostics *s_diagnostics;
@@ -268,3 +332,161 @@ NSURL *MSDiagnosticsStart(NSURL *documents)
 void MSDiagnosticsSetActive(BOOL active) { [s_diagnostics setActive:active]; }
 void MSDiagnosticsEvent(NSString *name, NSDictionary *details) { [s_diagnostics event:name details:details]; }
 void MSDiagnosticsFinish(int result) { [s_diagnostics finish:result]; }
+void MSDiagnosticsObserveGuestFPS(void (^handler)(double guestFPS)) { s_guestFPS = [handler copy]; }
+
+static NSError *exportError(NSString *message)
+{
+    return [NSError errorWithDomain:@"MotorStormDiagnostics" code:1
+                          userInfo:@{NSLocalizedDescriptionKey:message}];
+}
+
+static void zip16(NSMutableData *data, uint16_t value)
+{
+    const uint8_t bytes[] = {(uint8_t)value, (uint8_t)(value >> 8)};
+    [data appendBytes:bytes length:sizeof bytes];
+}
+static void zip32(NSMutableData *data, uint32_t value)
+{
+    zip16(data, (uint16_t)value); zip16(data, (uint16_t)(value >> 16));
+}
+static uint32_t zipCRC(NSData *data)
+{
+    static uint32_t table[256];
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        for (uint32_t i=0; i<256; ++i) {
+            uint32_t c=i;
+            for (unsigned bit=0; bit<8; ++bit) c=(c>>1)^((c&1)?0xedb88320u:0);
+            table[i]=c;
+        }
+    });
+    uint32_t crc=0xffffffffu;
+    const uint8_t *bytes=(const uint8_t *)data.bytes;
+    for (NSUInteger i=0; i<data.length; ++i) crc=table[(crc^bytes[i])&255]^(crc>>8);
+    return crc^0xffffffffu;
+}
+static BOOL writeDiagnosticsZIP(NSURL *snapshot, NSURL *archive, NSError **error)
+{
+    // Small, bounded stored ZIP: no archive service, game data or compression
+    // dependency. Work runs only on explicit export, never during measurement.
+    NSMutableData *zip=[NSMutableData new], *central=[NSMutableData new];
+    NSDirectoryEnumerator<NSURL *> *files=[NSFileManager.defaultManager
+        enumeratorAtURL:snapshot includingPropertiesForKeys:@[NSURLIsRegularFileKey]
+        options:0 errorHandler:nil];
+    uint16_t count=0;
+    for (NSURL *url in files) {
+        NSNumber *regular=nil; [url getResourceValue:&regular forKey:NSURLIsRegularFileKey error:nil];
+        if (!regular.boolValue) continue;
+        NSString *relative=[url.path substringFromIndex:snapshot.path.length+1];
+        NSData *name=[[@"performance/" stringByAppendingString:relative] dataUsingEncoding:NSUTF8StringEncoding];
+        NSData *data=[NSData dataWithContentsOfURL:url options:NSDataReadingMappedIfSafe error:error];
+        if (!data) return NO;
+        if (++count>40 || name.length>UINT16_MAX || zip.length+data.length>64*1024*1024) {
+            if (error) *error=exportError(@"Diagnostics exceed the export size limit.");
+            return NO;
+        }
+        uint32_t offset=(uint32_t)zip.length, size=(uint32_t)data.length, crc=zipCRC(data);
+        zip32(zip,0x04034b50); zip16(zip,20); zip16(zip,0x800); zip16(zip,0);
+        zip16(zip,0); zip16(zip,33); zip32(zip,crc); zip32(zip,size); zip32(zip,size);
+        zip16(zip,(uint16_t)name.length); zip16(zip,0); [zip appendData:name]; [zip appendData:data];
+        zip32(central,0x02014b50); zip16(central,20); zip16(central,20); zip16(central,0x800);
+        zip16(central,0); zip16(central,0); zip16(central,33); zip32(central,crc);
+        zip32(central,size); zip32(central,size); zip16(central,(uint16_t)name.length);
+        zip16(central,0); zip16(central,0); zip16(central,0); zip16(central,0);
+        zip32(central,0); zip32(central,offset); [central appendData:name];
+    }
+    uint32_t offset=(uint32_t)zip.length;
+    [zip appendData:central];
+    zip32(zip,0x06054b50); zip16(zip,0); zip16(zip,0); zip16(zip,count); zip16(zip,count);
+    zip32(zip,(uint32_t)central.length); zip32(zip,offset); zip16(zip,0);
+    return [zip writeToURL:archive options:NSDataWritingAtomic error:error];
+}
+
+static NSURL *createDiagnosticsArchive(NSURL *documents, NSError **error)
+{
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSURL *exports = [[NSURL fileURLWithPath:NSTemporaryDirectory() isDirectory:YES]
+                     URLByAppendingPathComponent:@"MotorStormDiagnosticsExport" isDirectory:YES];
+    // This directory belongs only to this exporter. Remove a previous share
+    // left behind by an interrupted app launch, keeping temporary storage bounded.
+    if ([fm fileExistsAtPath:exports.path] && ![fm removeItemAtURL:exports error:error]) return nil;
+    NSURL *work = [exports URLByAppendingPathComponent:NSUUID.UUID.UUIDString isDirectory:YES];
+    NSURL *snapshot = [work URLByAppendingPathComponent:@"performance" isDirectory:YES];
+    if (![fm createDirectoryAtURL:snapshot withIntermediateDirectories:YES attributes:nil error:error]) return nil;
+    NSURL *source = [documents URLByAppendingPathComponent:@"logs/performance" isDirectory:YES];
+    NSArray<NSURL *> *entries = [fm contentsOfDirectoryAtURL:source includingPropertiesForKeys:nil options:0 error:nil];
+    entries = [entries sortedArrayUsingComparator:^NSComparisonResult(NSURL *a, NSURL *b) {
+        return [b.lastPathComponent compare:a.lastPathComponent];
+    }];
+    NSUInteger copied = 0;
+    // An explicit allowlist excludes game data, unrelated logs and developer
+    // job dumps, even if they were placed inside a diagnostics session folder.
+    NSArray<NSString *> *names = @[@"session.json", @"owner.plist", @"samples-0.jsonl",
+                                   @"samples-1.jsonl", @"samples-2.jsonl", @"native.log"];
+    for (NSURL *session in entries) {
+        if (copied == 5) break;
+        if (![session.lastPathComponent hasPrefix:@"session-"]) continue;
+        NSDictionary *attributes = [fm attributesOfItemAtPath:session.path error:nil];
+        if (![attributes[NSFileType] isEqual:NSFileTypeDirectory]) continue;
+        NSDictionary *owner = [NSDictionary dictionaryWithContentsOfURL:[session URLByAppendingPathComponent:@"owner.plist"]];
+        if (![owner[@"owner"] isEqual:@"MotorStormOfflineDiagnostics-v1"]) continue;
+        NSURL *metadata = [session URLByAppendingPathComponent:@"session.json"];
+        attributes = [fm attributesOfItemAtPath:metadata.path error:nil];
+        if (![attributes[NSFileType] isEqual:NSFileTypeRegular] || [attributes fileSize] > 1024*1024) continue;
+        NSURL *destination = [snapshot URLByAppendingPathComponent:session.lastPathComponent isDirectory:YES];
+        if (![fm createDirectoryAtURL:destination withIntermediateDirectories:NO attributes:nil error:error]) goto failed;
+        for (NSString *name in names) {
+            NSURL *file = [session URLByAppendingPathComponent:name];
+            attributes = [fm attributesOfItemAtPath:file.path error:nil];
+            if (!attributes) continue;
+            // Do not follow symlinks or include unexpectedly large files.
+            if (![attributes[NSFileType] isEqual:NSFileTypeRegular] || [attributes fileSize] > 4*1024*1024) continue;
+            if (![fm copyItemAtURL:file toURL:[destination URLByAppendingPathComponent:name] error:error]) goto failed;
+        }
+        ++copied;
+    }
+    if (!copied) {
+        if (error) *error = exportError(@"No recorded sessions yet. Play a race, then close and reopen the app to share diagnostics.");
+        goto failed;
+    }
+    {
+        NSURL *archive = [work URLByAppendingPathComponent:@"MotorStorm-diagnostics.zip"];
+        if (!writeDiagnosticsZIP(snapshot, archive, error)) goto failed;
+        [fm removeItemAtURL:snapshot error:nil];
+        return archive;
+    }
+failed:
+    [fm removeItemAtURL:work error:nil];
+    return nil;
+}
+
+void MSDiagnosticsExport(NSURL *documents, void (^completion)(NSURL *, NSError *))
+{
+    dispatch_block_t prepare = ^{
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            NSError *error = nil;
+            NSURL *archive = createDiagnosticsArchive(documents, &error);
+            dispatch_async(dispatch_get_main_queue(), ^{ completion(archive, error); });
+        });
+    };
+    if (s_diagnostics) [s_diagnostics afterFlush:prepare];
+    else prepare();
+}
+
+extern "C" const char* motorstorm_job_chain_dir(void)
+{
+    static char path[1024];
+    if (path[0]) return path;
+    NSArray<NSString *> *docs = NSSearchPathForDirectoriesInDomains(
+        NSDocumentDirectory, NSUserDomainMask, YES);
+    if (docs.count == 0) return NULL;
+    NSString *dir = [docs[0] stringByAppendingPathComponent:@"logs/performance"];
+    if (![NSFileManager.defaultManager createDirectoryAtPath:dir
+                                 withIntermediateDirectories:YES
+                                                  attributes:nil
+                                                       error:nil])
+        return NULL;
+    if (dir.length + 1 > sizeof path) return NULL;
+    memcpy(path, dir.UTF8String, dir.length + 1);
+    return path;
+}

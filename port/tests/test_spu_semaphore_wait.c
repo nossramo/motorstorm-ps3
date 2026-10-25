@@ -17,6 +17,28 @@ int yz_lockstep_enabled(void) { return lockstep; }
 
 static uint32_t seed = 0x267815AF;
 static uint32_t random32(void) { seed ^= seed<<13; seed ^= seed>>17; seed ^= seed<<5; return seed; }
+static void test_observer_guards(void)
+{
+    spu_context initial = {0};
+    initial.image_id=507917221; initial.pc=0xAAE8;
+    initial.gpr[1]._u32[0]=0x30000;
+    initial.gpr[7]=spu_il(1000);
+    initial.gpr[82]._u32[0]=initial.mfc_lsa=0x20000;
+    initial.mfc_size=128;
+    int* gates[] = {&g_spu_ls_probe,&g_spu_ls_watch_n,&g_spu_smc_watch};
+    for (unsigned gate=0; gate<3; ++gate) {
+        for (int value=-1; value<=1; ++value) {
+            *gates[gate]=value;
+            spu_context candidate=initial, expected=initial;
+            int allowed=!SPU_LS_DIAGNOSTICS || value==0;
+            assert(motorstorm_spu_semaphore_delay(&candidate)==allowed);
+            if (allowed) expected.gpr[6]=spu_il(999);
+            assert(!memcmp(&candidate,&expected,sizeof expected));
+            assert(*gates[gate]==value); // Do not initialize or erase observers.
+        }
+        *gates[gate]=0;
+    }
+}
 static void compare_loops(unsigned trial)
 {
     spu_context a = {0}, b;
@@ -83,6 +105,11 @@ static void notify(unsigned ea) {
 int main(void) {
     setenv("MOTORSTORM_SPU_SEMAPHORE_WAIT","1",1);
     g_spu_ls_probe=g_spu_smc_watch=0;
+    test_observer_guards();
+#if !SPU_LS_DIAGNOSTICS
+    // Actual production state: compiled-out initializers leave every gate -1.
+    g_spu_ls_probe=g_spu_ls_watch_n=g_spu_smc_watch=-1;
+#endif
     for(unsigned i=0;i<2000;++i) compare_loops(i);
     task t={0}; reserve(&t,0x1000);
     // Producer wins before waiter: return immediately, preserve existing bits.
