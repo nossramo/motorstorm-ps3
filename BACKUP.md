@@ -139,6 +139,35 @@ This save does not advance `port/macos-baseline.json`, alter the macOS app or
 delete `build/macos-stable/`. Local macOS signing overrides remain uncommitted
 and are preserved in the pre-save source archive.
 
+## iOS automatic launch and diagnostics-free build: 2026-10-26
+
+The tag `ios-autostart-20261026` preserves source commit `18b2ab5`, the signed
+build installed on Gummi (Duo). It starts automatically with the centered logo
+in the same landscape controller as the former menu buttons. The initial
+system launch screen is black to avoid the upside-down snapshot seen on Duo.
+The setup buttons, title, FPS overlay and normal-build performance recording
+are removed. Startup and logo orientation were checked on the device; race FPS
+was not remeasured for this change.
+
+The tag `before-ios-autostart-20261026` preserves `main` immediately before this
+merge. The earlier `ios-duo-20261025` tag and both signed Duo app archives remain
+available. Use a separate checkout of either tag to rebuild without disturbing
+current work. To undo this entire merge on `main` without rewriting history,
+revert its merge commit with `git revert -m 1 <merge-commit>`.
+
+The ignored directory `output/releases/ios-autostart-20261026/` contains
+`app.tar.gz`, `source.tar.gz`, their manifests and `SHA256SUMS`, plus device
+validation evidence and `RESTORE.txt`. The app archive contains the signed
+build; install it over the existing bundle to preserve the phone's game data.
+Only authored source, the supplied startup logo, and Git recovery tags are
+published. App binaries, local evidence, game files and saves remain local.
+
+The macOS baseline remains `04910a9c6667d3e0ac3d9d9b0443f75d28608c26`.
+The shared Xcode project commit changes only the iOS Debug/Release objects;
+existing local macOS signing and project edits stay uncommitted. The baseline
+check verified 1,176 source files, and compiled isolation checks verified all
+362 compile commands and the runtime-C-only alignment fix.
+
 ## Updating the backup
 
 Before committing further runtime changes:
