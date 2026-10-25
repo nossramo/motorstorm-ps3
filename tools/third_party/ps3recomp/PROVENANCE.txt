@@ -1,0 +1,12 @@
+ppu_nv_dirty.py is copied without modification from:
+https://github.com/soyjxck/ps3recomp/blob/018024d483ec0e677a029a924cc3f154df528ff8/tools/ppu_nv_dirty.py
+Git blob: 6698bc45ac53913b2c681fb816de29971bd42f35
+License: MIT (adjacent LICENSE, from the same commit).
+
+MotorStorm calls only rewrite(..., live=False) through
+tools/specialize_ppu_locals.py, with explicit locals and full reloads after
+calls. The module's liveness solver, frame/memory rewrites, flag splitting,
+and ABI-based nonvolatile reload rules are not used. Inputs are four pinned
+function bodies; unsupported changes fail generation. The original generated
+code, guest memory helpers, floating-point semantics, and macOS snapshot are
+preserved. This is an iOS experiment, not an upstream SDK replacement.

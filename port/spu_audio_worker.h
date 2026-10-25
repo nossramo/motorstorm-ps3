@@ -49,21 +49,70 @@ static inline __attribute__((always_inline)) u128 ms_audio_compact_fma(u128 a,u1
 static inline __attribute__((always_inline)) u128 ms_audio_compact_fms(u128 a,u128 b,u128 c,uint64_t old) {
     return ms_audio_compact_fma(a,b,spu__nv_u128(veorq_u32(vld1q_u32(c._u32),vdupq_n_u32(0x80000000u))),old);
 }
+/* Used only after the generated whole-run input guard and exponent proof.
+ * Every intermediate is <= 2**125, so extended/overflow fallback cannot be
+ * needed. Preserve SPU input/output denormal and signed-zero handling, exact
+ * operation order and RTZ. Hardware float operations stay explicit asm. */
+#define MS_AUDIO_BOUNDED_BINARY(NAME, INSTRUCTION) \
+static inline __attribute__((always_inline)) u128 NAME(u128 a,u128 b,uint64_t old) { \
+    (void)old; \
+    uint32x4_t x=ms_audio_compact_normalize(vld1q_u32(a._u32)); \
+    uint32x4_t y=ms_audio_compact_normalize(vld1q_u32(b._u32)), r; \
+    __asm__ volatile(INSTRUCTION " %0.4s, %1.4s, %2.4s" : "=w"(r) : "w"(x),"w"(y)); \
+    return spu__nv_u128(ms_audio_compact_normalize(r)); \
+}
+MS_AUDIO_BOUNDED_BINARY(ms_audio_bounded_fa,"fadd")
+MS_AUDIO_BOUNDED_BINARY(ms_audio_bounded_fm,"fmul")
+#undef MS_AUDIO_BOUNDED_BINARY
+static inline __attribute__((always_inline)) u128 ms_audio_bounded_fs(u128 a,u128 b,uint64_t old) {
+    return ms_audio_bounded_fa(a,spu__nv_u128(veorq_u32(vld1q_u32(b._u32),vdupq_n_u32(0x80000000u))),old);
+}
+static inline __attribute__((always_inline)) u128 ms_audio_bounded_fma(u128 a,u128 b,u128 c,uint64_t old) {
+    (void)old;
+    uint32x4_t x=ms_audio_compact_normalize(vld1q_u32(a._u32));
+    uint32x4_t y=ms_audio_compact_normalize(vld1q_u32(b._u32));
+    uint32x4_t r=ms_audio_compact_normalize(vld1q_u32(c._u32));
+    __asm__ volatile("fmla %0.4s, %1.4s, %2.4s" : "+w"(r) : "w"(x),"w"(y));
+    return spu__nv_u128(ms_audio_compact_normalize(r));
+}
+static inline __attribute__((always_inline)) u128 ms_audio_bounded_fms(u128 a,u128 b,u128 c,uint64_t old) {
+    return ms_audio_bounded_fma(a,b,spu__nv_u128(veorq_u32(vld1q_u32(c._u32),vdupq_n_u32(0x80000000u))),old);
+}
 static inline int ms_audio_worker_scope_safe(const spu_context* ctx) {
     /* LS helpers only touch bytes in this mode. Diagnostic callbacks and
      * another image/policy must never execute with the arithmetic FPCR. */
-    return ctx->image_id == 286484578 && !ctx->policy_mode &&
-           !g_spu_ls_probe && !g_spu_ls_watch_n && !g_spu_smc_watch;
+    if (ctx->image_id != 286484578 || ctx->policy_mode) return 0;
+#if SPU_LS_DIAGNOSTICS
+    /* Unknown (-1) observers still require the original helpers to initialize
+     * them. When probes are compiled out, their initializers are absent too;
+     * the dormant globals must not disable native arithmetic indefinitely. */
+    if (g_spu_ls_probe || g_spu_ls_watch_n || g_spu_smc_watch) return 0;
+#endif
+    return 1;
+}
+/* Only inside a checked Multistream arithmetic scope. The wrapper has already
+ * excluded policy-mode probes, LS watchpoints and self-modifying-code watches.
+ * Preserve quadword alignment, 256 KiB wrapping and per-word byte order while
+ * avoiding the same inactive diagnostic checks on every sample access. */
+static inline __attribute__((always_inline)) u128 ms_audio_ls_read128(const spu_context* ctx, uint32_t lsa) {
+    const uint8_t* p = ctx->ls + (lsa & (SPU_LS_MASK & ~15u));
+    return spu__nv_u128(vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(p))));
+}
+static inline __attribute__((always_inline)) void ms_audio_ls_write128(spu_context* ctx, uint32_t lsa, u128 val) {
+    uint8_t* p = ctx->ls + (lsa & (SPU_LS_MASK & ~15u));
+    vst1q_u8(p, vrev32q_u8(vreinterpretq_u8_u32(vld1q_u32(val._u32))));
 }
 #ifdef MOTORSTORM_AUDIO_WORKER_TEST
 extern int ms_audio_worker_test_mode;
 static inline int ms_audio_worker_mode(void) { return ms_audio_worker_test_mode; }
+static inline int ms_audio_skip(void) { return 0; }
 static inline void ms_audio_worker_capture(spu_context* ctx, unsigned pc, unsigned slot) {}
 #else
 /* Initialized before guest worker creation; no getenv/locking in the hot path. */
 static int ms_audio_merge_enabled;
 static int ms_audio_timing_enabled;
 static int ms_audio_qos_enabled;
+static int ms_audio_skip_enabled;
 static const char* ms_audio_capture_dir;
 __attribute__((constructor)) static void ms_audio_worker_init(void) {
     const char* setting = getenv("MOTORSTORM_AUDIO_MERGE");
@@ -72,8 +121,11 @@ __attribute__((constructor)) static void ms_audio_worker_init(void) {
     ms_audio_timing_enabled = getenv("MOTORSTORM_AUDIO_WORKER_TIMING") != NULL;
     setting = getenv("MOTORSTORM_AUDIO_QOS");
     ms_audio_qos_enabled = setting ? atoi(setting) != 0 : 1;
+    setting = getenv("MOTORSTORM_AUDIO_SKIP");
+    ms_audio_skip_enabled = setting && setting[0] == '1' && setting[1] == '\0';
 }
 static inline int ms_audio_worker_mode(void) { return ms_audio_merge_enabled; }
+static inline int ms_audio_skip(void) { return ms_audio_skip_enabled; }
 static inline void ms_audio_worker_host_setup(const spu_context* ctx) {
 #if defined(__APPLE__)
     static SPU_THREAD_LOCAL int configured;
@@ -85,8 +137,9 @@ static inline void ms_audio_worker_host_setup(const spu_context* ctx) {
      * core selection alone. Called before any scoped guest arithmetic. */
     qos_class_t before = qos_class_self();
     int rc = pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
-    fprintf(stderr, "[audio-worker-qos] before=%u actual=%u rc=%d\n",
-            (unsigned)before, (unsigned)qos_class_self(), rc);
+    fprintf(stderr, "[audio-worker-qos] before=%u actual=%u rc=%d mode=%d scope_safe=%d ls_diagnostics=%d\n",
+            (unsigned)before, (unsigned)qos_class_self(), rc,
+            ms_audio_worker_mode(), ms_audio_worker_scope_safe(ctx), SPU_LS_DIAGNOSTICS);
 #else
     (void)ctx;
 #endif

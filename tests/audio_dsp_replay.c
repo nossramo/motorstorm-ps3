@@ -67,10 +67,16 @@ int main(int argc,char**argv) {
  for(unsigned i=0;i<repeat;i++) {
   ctx=before;ctx.ls=ctx.ls_store;channel_pos=0;g_spu_trampoline_fn=NULL;
   struct timespec t0,t1;clock_gettime(CLOCK_MONOTONIC,&t0);
+#if defined(MOTORSTORM_SPU_THREAD_RTZ)
+  ms_spu_exec_enter();
+#endif
   if(atoi(argv[4])) {
    assert(lifted[before.pc/4]);lifted[before.pc/4](&ctx);
    while(g_spu_trampoline_fn) {spu_lifted_fn fn=g_spu_trampoline_fn;g_spu_trampoline_fn=NULL;fn(&ctx);}
   } else spu_interp_run_until(&ctx,before.pc,after.pc);
+#if defined(MOTORSTORM_SPU_THREAD_RTZ)
+  ms_spu_exec_leave();
+#endif
   assert(channel_pos==channel_size);
   clock_gettime(CLOCK_MONOTONIC,&t1);elapsed+=(t1.tv_sec-t0.tv_sec)+(t1.tv_nsec-t0.tv_nsec)*1e-9;
   assert(ctx.pc==after.pc&&ctx.status==after.status);

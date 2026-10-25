@@ -10,7 +10,8 @@ Git LFS is not required.
 - `port/`: authored runner, platform adapters, native optimization helpers,
   CMake build configuration and tests.
 - `MotorStorm/`: the Xcode project, macOS app entry point and app icons. The
-  macOS target links the game runtime; iOS still has its SwiftUI starter.
+  macOS and iOS entries link separate engine builds. iOS also preserves its
+  touch controls, dependency manifest and reproducible cross-build scripts.
 - `tools/` and `tests/`: source generation, launch, capture, analysis and
   verification tools.
 - `patches/ps3recomp-local.patch`: tracked changes **and new source files** from
@@ -95,6 +96,48 @@ The generated snapshot and compiled files in `build/macos-stable/` are local
 only. The game assets are referenced, not copied or uploaded. The iOS target
 continues building the working tree; changing iOS source cannot change the
 pinned macOS source. Do not edit the generated macOS snapshot in place.
+
+## Saved Duo iOS build: 2026-10-25
+
+The source recovery point is the Git tag `ios-duo-20261025`. The user confirmed
+that the signed mode-7 app runs well on Gummi (Duo). This is qualitative device
+acceptance, not a measured sustained 30 FPS result. Gummi 2 performance remains
+unresolved. The tag packages `MOTORSTORM_WWS_CHAIN=7` as the iOS default; a
+process environment override of `0` selects the retained previous WWS route.
+
+The ignored local directory `output/releases/ios-duo-20261025/` contains:
+
+- `approved-app.tar.gz` and `approved-build.json`: the exact signed app tested
+  on Duo, per-file SHA-256 values and its required launch environment.
+- `packaged-default-app.tar.gz`: the app rebuilt with the tested WWS selection
+  in its launch resource, so ordinary launches select the same route.
+- `working-source-before-save.tar.gz`, the source manifest and Git bundle:
+  the entire authored working state before saving, including local settings.
+- `repository-after-merge.bundle`: the Git history after merging, including
+  the pinned macOS commit and the iOS recovery tag.
+- `historical-apps/` and `cleanup-manifest.json`: compressed older signed apps
+  and the mapping from their former build/log paths. Old uncompressed copies
+  are removed only after every archived file has been hash-verified. Source
+  checkpoints, replay fixtures and measurement evidence remain in place.
+
+To reinstall the exact tested app, extract `approved-app.tar.gz` to a temporary
+directory, then install and launch it on the connected device:
+
+```sh
+xcrun devicectl device install app --device <device-id> '<temporary-directory>/MotorStorm iOS.app'
+xcrun devicectl device process launch --device <device-id> --terminate-existing \
+  --environment-variables '{"MOTORSTORM_WWS_CHAIN":"7"}' com.lithium.motorstorm -- --start-game
+```
+
+The game files and saves must still be on the phone. A development signature
+can expire; the tag and source backup allow rebuilding with a valid identity.
+Use a separate checkout when restoring source so current local work is kept.
+The local archive also needs an external backup to survive disk loss; GitHub
+contains only authored source and history, not these signed apps.
+
+This save does not advance `port/macos-baseline.json`, alter the macOS app or
+delete `build/macos-stable/`. Local macOS signing overrides remain uncommitted
+and are preserved in the pre-save source archive.
 
 ## Updating the backup
 

@@ -1,6 +1,7 @@
 // CPU requests are serviced by the thread that owns Metal/the RSX engine.
 #include "ps3emu/guest_read_sync.h"
 #include "ps3emu/ps3_ftrace.h"
+#include "ps3emu/passive_waits.h"
 #include "rsx_draw_engine.h"
 #include <mutex>
 #include <condition_variable>
@@ -29,6 +30,7 @@ void request(uint32_t address, uint32_t bytes) {
         return;
     }
     const uint64_t trace_start = PS3_FT_ON() ? ps3_ft_now() : 0;
+    const uint64_t passive_start = ps3_metric_begin();
     Request r{address, bytes};
     std::unique_lock<std::mutex> lock(mutex);
     if (tail) tail->next = &r; else head = &r;
@@ -53,6 +55,7 @@ void request(uint32_t address, uint32_t bytes) {
     // Port-local kind 25 measures the whole CPU dependency, including queue
     // delay; the backend readback span alone omits that often dominant wait.
     if (trace_start) ps3_ft_span(25, address, bytes, 0, trace_start, ps3_ft_now());
+    ps3_wait_record(PW_GPU_READ, passive_start, 0);
 }
 }
 extern "C" void motorstorm_gpu_sync_init() {

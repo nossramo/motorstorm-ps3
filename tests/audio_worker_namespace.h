@@ -1,0 +1,22 @@
+#pragma once
+/* Isolate the replay's fail-fast runtime stubs from the real game runtime. */
+#define g_spu_ls_watch_n benchmark_g_spu_ls_watch_n
+#define g_spu_ls_probe benchmark_g_spu_ls_probe
+#define g_wws_read_probe benchmark_g_wws_read_probe
+#define g_wws_code_probe benchmark_g_wws_code_probe
+#define g_spu_smc_watch benchmark_g_spu_smc_watch
+#define g_spu_ls_dbg benchmark_g_spu_ls_dbg
+#define g_spu_trampoline_fn benchmark_g_spu_trampoline_fn
+#define ms_audio_worker_test_mode benchmark_ms_audio_worker_test_mode
+#define spu_ls_watch_slow benchmark_spu_ls_watch_slow
+#define spu_rdch benchmark_spu_rdch
+#define spu_wrch benchmark_spu_wrch
+#define spu_rchcnt benchmark_spu_rchcnt
+#define spu_stop benchmark_spu_stop
+#define spu_halt benchmark_spu_halt
+#define spu_register_function benchmark_spu_register_function
+#define spu_indirect_branch benchmark_spu_indirect_branch
+#define spu_indirect_branch_mt benchmark_spu_indirect_branch_mt
+#define spu_drain_call benchmark_spu_drain_call
+#define spu_img_restore benchmark_spu_img_restore
+#define spu_1136862334bb6208f794040f3a7f26e4991cd6b00eac6229331432566f1535d1_spu_recomp_register benchmark_spu_1136862334bb6208f794040f3a7f26e4991cd6b00eac6229331432566f1535d1_spu_recomp_register

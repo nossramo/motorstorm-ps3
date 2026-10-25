@@ -1,0 +1,8 @@
+{
+  "sdl2": {"repo": "libsdl-org/SDL", "commit": "5d249570393f7a37e037abf22cd6012a4cc56a71"},
+  "glslang": {"repo": "KhronosGroup/glslang", "commit": "e1b562a8bed273a02f30b59b66a5d499793cede5"},
+  "glslang/External/spirv-tools": {"repo": "KhronosGroup/SPIRV-Tools", "commit": "ef96ed763b43b59b33b31b362f09a02b729fa1c9"},
+  "glslang/External/spirv-tools/external/spirv-headers": {"repo": "KhronosGroup/SPIRV-Headers", "commit": "496543121ce6419f23d6fa5d7194ba66c36212d2"},
+  "spirv-cross": {"repo": "KhronosGroup/SPIRV-Cross", "commit": "f11ba9f0b21ba8fc15153d50a2a1ae31ab1cf8f7"},
+  "ffmpeg": {"repo": "FFmpeg/FFmpeg", "commit": "239f2c733de417201d7ad3b3b8b0d9b63285b2b1"}
+}

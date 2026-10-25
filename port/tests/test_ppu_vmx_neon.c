@@ -5,6 +5,12 @@
 #include <stdio.h>
 #include <time.h>
 
+#ifdef MOTORSTORM_VMX_BENCHMARK
+static FILE* vmx_report;
+#define printf(...) fprintf(vmx_report, __VA_ARGS__)
+#define main motorstorm_vmx_benchmark_main
+#endif
+
 static uint32_t rng = 0x213821u;
 static uint32_t next(void) { rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5; return rng; }
 __attribute__((noinline)) static void reference(void* d,const void* a,const void* b,const void* c,uint32_t v)
@@ -29,9 +35,16 @@ static const struct { const char* name; operation ref, neon; } ops[] = {
     {"sub",reference_sub,specialized_sub}, {"nmsub",reference_nmsub,specialized_nmsub}
 };
 static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec+t.tv_nsec*1e-9; }
+static double cpu_now(void) { struct timespec t; assert(clock_gettime(CLOCK_THREAD_CPUTIME_ID,&t)==0); return t.tv_sec+t.tv_nsec*1e-9; }
 
-int main(void)
+int main(int argc, char** argv)
 {
+#ifdef MOTORSTORM_VMX_BENCHMARK
+    if (argc != 2 || !(vmx_report=fopen(argv[1],"w"))) return 2;
+    setvbuf(vmx_report,NULL,_IOLBF,0);
+#else
+    (void)argc; (void)argv;
+#endif
     uint8_t values[3][16], expected[16], actual[16], aliased[3][16];
     const uint32_t edges[] = {0,0x80000000,1,0x80000001,0x007fffff,0x807fffff,
         0x00800000,0x80800000,0x3f800000,0xbf800000,0x3f800001,0x7f7fffff,
@@ -67,10 +80,19 @@ int main(void)
     printf("PASS NEON VMX: %llu lanes, 4 rounding modes, NJ, exceptional values, source aliases\n",tested);
     for (unsigned i=0;i<4;++i) { vmx_sw(values[0],i,0x3f7ffffe); vmx_sw(values[1],i,0x33800000); vmx_sw(values[2],i,0x3f7ffffd); }
     const unsigned iterations=4000000;
-    for (unsigned op=0;op<sizeof ops/sizeof ops[0];++op) for (unsigned mode=0;mode<2;++mode) {
-        double begin=now();
+    /* Alternate order, reporting CPU separately from scheduling/wall delay.
+     * This is an isolated helper benchmark, never a gameplay FPS estimate. */
+    for (unsigned repeat=0;repeat<4;++repeat)
+      for (unsigned op=0;op<sizeof ops/sizeof ops[0];++op) for (unsigned order=0;order<2;++order) {
+        unsigned mode=order^(repeat&1);
+        double begin=now(), cpu_begin=cpu_now();
         for (unsigned i=0;i<iterations;++i) (mode ? ops[op].neon : ops[op].ref)(actual,values[0],values[1],values[2],VMX_NJ);
-        printf("%s %s %.2f ns/vector checksum=%08x\n", ops[op].name, mode ? "NEON" : "scalar", (now()-begin)*1e9/iterations, vmx_w(actual,0));
+        double cpu_elapsed=cpu_now()-cpu_begin, elapsed=now()-begin;
+        printf("%s %s repeat=%u wall=%.2f cpu=%.2f ns/vector checksum=%08x\n", ops[op].name,
+               mode ? "NEON" : "scalar", repeat, elapsed*1e9/iterations, cpu_elapsed*1e9/iterations, vmx_w(actual,0));
     }
+#ifdef MOTORSTORM_VMX_BENCHMARK
+    fclose(vmx_report);
+#endif
     return 0;
 }
