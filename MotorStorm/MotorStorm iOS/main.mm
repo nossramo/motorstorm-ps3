@@ -1,5 +1,6 @@
 #import <UIKit/UIKit.h>
 #import <QuartzCore/CAMetalLayer.h>
+#import <QuartzCore/CAGradientLayer.h>
 #import <AVFAudio/AVFAudio.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import "OfflineDiagnostics.h"
@@ -21,6 +22,60 @@ extern "C" void SDL_SetMainReady(void);
 @end
 @implementation MotorStormMetalView
 + (Class)layerClass { return CAMetalLayer.class; }
+@end
+
+// A static translucent surface: no backdrop blur, display link or render polling.
+// Only layout and touch-state changes update these layers.
+@interface MotorStormControlButton : UIButton
+@property(nonatomic, strong) CAGradientLayer *sheen;
+@end
+@implementation MotorStormControlButton
+- (instancetype)initWithFrame:(CGRect)frame
+{
+    self = [super initWithFrame:frame];
+    if (self) {
+        self.layer.cornerCurve = kCACornerCurveContinuous;
+        self.layer.borderWidth = 0.75;
+        self.layer.cornerRadius = 15;
+        self.adjustsImageWhenHighlighted = NO;
+        self.sheen = [CAGradientLayer layer];
+        [self.layer insertSublayer:self.sheen atIndex:0];
+        [self updateAppearance];
+    }
+    return self;
+}
+- (void)updateAppearance
+{
+    UIColor *accent = [UIColor colorWithRed:1.0 green:0.80 blue:0.28 alpha:1.0];
+    UIColor *foreground = self.highlighted ? accent : [UIColor.whiteColor colorWithAlphaComponent:0.86];
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    self.backgroundColor = self.highlighted ? [accent colorWithAlphaComponent:0.14] :
+                                             [UIColor.blackColor colorWithAlphaComponent:0.10];
+    self.layer.borderColor = (self.highlighted ? [accent colorWithAlphaComponent:0.85] :
+                                                [UIColor.whiteColor colorWithAlphaComponent:0.24]).CGColor;
+    self.sheen.colors = @[(id)[UIColor.whiteColor colorWithAlphaComponent:self.highlighted ? 0.16 : 0.10].CGColor,
+                         (id)[UIColor.whiteColor colorWithAlphaComponent:0.015].CGColor];
+    self.tintColor = foreground;
+    [self setTitleColor:[UIColor.whiteColor colorWithAlphaComponent:0.86] forState:UIControlStateNormal];
+    [self setTitleColor:accent forState:UIControlStateHighlighted];
+    [CATransaction commit];
+}
+- (void)setHighlighted:(BOOL)highlighted
+{
+    [super setHighlighted:highlighted];
+    [self updateAppearance];
+}
+- (void)layoutSubviews
+{
+    [super layoutSubviews];
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    self.sheen.frame = self.bounds;
+    self.sheen.cornerRadius = self.layer.cornerRadius;
+    self.sheen.cornerCurve = kCACornerCurveContinuous;
+    [CATransaction commit];
+}
 @end
 
 static NSDictionary *launchConfiguration(void)
@@ -127,7 +182,7 @@ static void *runGame(void *opaque)
 }
 - (void)addControl:(NSString *)title key:(unsigned)key
 {
-    UIButton *button = [UIButton buttonWithType:UIButtonTypeCustom];
+    UIButton *button = [[MotorStormControlButton alloc] initWithFrame:CGRectZero];
     button.tag = key;
     button.accessibilityIdentifier = [NSString stringWithFormat:@"pad-%u", key];
     button.accessibilityLabel = title;
@@ -137,18 +192,29 @@ static void *runGame(void *opaque)
         case 126: button.accessibilityLabel = @"Throttle / menu up"; break;
         case 125: button.accessibilityLabel = @"Brake / menu down"; break;
     }
-    button.backgroundColor = [UIColor.blackColor colorWithAlphaComponent:0.55];
-    button.layer.cornerRadius = 15;
-    button.layer.borderWidth = 1;
-    button.layer.borderColor = [UIColor.whiteColor colorWithAlphaComponent:0.45].CGColor;
-    button.titleLabel.font = [UIFont boldSystemFontOfSize:17];
-    [button setTitle:title forState:UIControlStateNormal];
+    button.titleLabel.font = [UIFont systemFontOfSize:key == 49 ? 15 : 16
+                                               weight:key == 49 ? UIFontWeightSemibold : UIFontWeightMedium];
+    NSString *symbol = nil;
+    switch (key) {
+        case 123: symbol = @"chevron.left"; break;
+        case 124: symbol = @"chevron.right"; break;
+        case 126: symbol = @"chevron.up"; break;
+        case 125: symbol = @"chevron.down"; break;
+        case 36: symbol = @"checkmark"; break;
+    }
+    if (symbol) {
+        [button setImage:[UIImage systemImageNamed:symbol] forState:UIControlStateNormal];
+        [button setPreferredSymbolConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:22
+            weight:UIImageSymbolWeightMedium] forImageInState:UIControlStateNormal];
+    } else {
+        [button setTitle:title forState:UIControlStateNormal];
+    }
     [button addTarget:self action:@selector(controlDown:) forControlEvents:UIControlEventTouchDown | UIControlEventTouchDragEnter];
     [button addTarget:self action:@selector(controlUp:) forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside | UIControlEventTouchCancel | UIControlEventTouchDragExit];
     [self.controls addSubview:button];
 }
-- (void)controlDown:(UIButton *)sender { rsx_metal_touch_key((unsigned)sender.tag, 1); sender.alpha = 0.55; }
-- (void)controlUp:(UIButton *)sender { rsx_metal_touch_key((unsigned)sender.tag, 0); sender.alpha = 1; }
+- (void)controlDown:(UIButton *)sender { rsx_metal_touch_key((unsigned)sender.tag, 1); sender.highlighted = YES; }
+- (void)controlUp:(UIButton *)sender { rsx_metal_touch_key((unsigned)sender.tag, 0); sender.highlighted = NO; }
 - (void)viewDidLayoutSubviews
 {
     [super viewDidLayoutSubviews];
@@ -180,7 +246,8 @@ static void *runGame(void *opaque)
     CGFloat boostX = driveLeft + (2 * driveSize + driveGap - boostWidth) / 2;
     for (UIButton *b in self.controls.subviews) {
         if (b.tag >= 123 && b.tag <= 126) {
-            b.titleLabel.font = [UIFont boldSystemFontOfSize:driveSize * 0.38];
+            [b setPreferredSymbolConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:driveSize * 0.34
+                weight:UIImageSymbolWeightMedium] forImageInState:UIControlStateNormal];
             b.layer.cornerRadius = driveSize * 0.22;
         }
         switch (b.tag) {

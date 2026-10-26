@@ -313,6 +313,9 @@ buttons on the left, with Boost above them, and brake/throttle side by side on
 the right. Their size adapts to the safe area (up to 104 points instead of 64).
 The handbrake touch button is removed; the top Back button keeps its existing
 input mapping but no longer displays a pause symbol.
+The controls use a subtle static translucent gradient, thin borders and SF
+Symbol arrows, with a warm yellow pressed state. Their geometry is unchanged;
+the style adds no backdrop blur, display timer or per-frame CPU work.
 
 ### iOS performance diagnostics
 
