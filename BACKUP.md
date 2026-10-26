@@ -168,6 +168,23 @@ existing local macOS signing and project edits stay uncommitted. The baseline
 check verified 1,176 source files, and compiled isolation checks verified all
 362 compile commands and the runtime-C-only alignment fix.
 
+## Duo display and touch controls: 2026-10-26
+
+The tag `ios-duo-controls-20261026` preserves device-tested source commit
+`4b48b02`: full-screen presentation on Duo, no startup logo, larger translucent
+controls with Boost above steering, and equal edge margins on the cover display.
+The user accepted the result on both Duo displays. Internal game resolution and
+the runtime are unchanged; this UI release does not establish a new FPS result.
+
+`before-ios-duo-controls-20261026` preserves the previous `main` (`c867c3f`).
+Both recovery tags can be rebuilt in a separate checkout. The merge can also be
+undone without rewriting history using `git revert -m 1 <merge-commit>`.
+Local build/install records and screenshots remain under
+`output/releases/ios-controls-edges-20261026/`; the merge verification and saved
+local project settings are in `output/releases/ios-controls-merge-20261026/`.
+These private records are not published. macOS remains on its existing baseline,
+and local macOS project/signing overrides remain uncommitted.
+
 ## Updating the backup
 
 Before committing further runtime changes:
