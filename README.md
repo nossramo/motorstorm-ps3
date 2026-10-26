@@ -291,15 +291,35 @@ every 1024th call); it is off in normal launches. Replay them with
 measurements. These private game fixtures are not committed or exported with
 the ordinary diagnostics ZIP.
 
-On iOS, opening the app shows the supplied centered logo on black and starts
-MotorStorm automatically. The system launch storyboard is plain black; the logo
-belongs to the app's landscape controller, exactly like the former menu buttons.
-This avoids the upside-down system launch snapshot observed on Duo, without
-rotating the image or adding a launch delay. The logo remains until the first drawable is actually
-presented. The start screen has no title, buttons or FPS overlay. File validation
+On iOS, opening the app starts MotorStorm automatically, with a plain black
+background until the game's first frame. There is no added startup logo, title,
+setup buttons, FPS overlay or artificial delay. Touch controls appear when the
+first drawable is actually presented. File validation
 runs off the UI thread; existing local folders and saved folder bookmarks still
 work. If game files are missing, an error dialog offers folder selection or a
 retry. There is no file picker or confirmation on a normal successful launch.
+
+The iOS Duo fill experiment stretches the final game image to cover landscape
+displays taller than 16:9. It changes only the game view's frame and explicitly
+uses resize gravity; the Metal drawable and game render targets keep their
+guest resolution. Touch controls remain a separate, unscaled view.
+Conventional 16:9 or wider screens keep the previous aspect fit. Launch
+with `MOTORSTORM_IOS_FILL_SCREEN=0` to restore aspect fit without rebuilding;
+the default is enabled. This intentionally changes the game image's proportions
+and does not change the camera's field of view or add rendered detail.
+
+The iOS driving controls sit just below screen center: larger left/right
+buttons on the left, with Boost above them, and brake/throttle side by side on
+the right. Their size adapts to the safe area (up to 104 points instead of 64).
+The handbrake touch button is removed; the top Back button keeps its existing
+input mapping but no longer displays a pause symbol.
+The controls use a subtle static translucent gradient, thin borders and SF
+Symbol arrows, with a warm yellow pressed state. Their geometry is unchanged;
+the style adds no backdrop blur, display timer or per-frame CPU work.
+Horizontal positions follow the screen edges with a small margin, so the Duo
+cover display's asymmetric safe-area inset does not push one group inward when
+rotated. Button sizes and vertical placement still use the same layout rules;
+the inner display's layout is unchanged.
 
 ### iOS performance diagnostics
 

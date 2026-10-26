@@ -1,11 +1,13 @@
 #import <UIKit/UIKit.h>
 #import <QuartzCore/CAMetalLayer.h>
+#import <QuartzCore/CAGradientLayer.h>
 #import <AVFAudio/AVFAudio.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import "OfflineDiagnostics.h"
 #include <pthread.h>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <unistd.h>
 
 extern "C" int motorstorm_main(int, char **);
@@ -22,6 +24,60 @@ extern "C" void SDL_SetMainReady(void);
 + (Class)layerClass { return CAMetalLayer.class; }
 @end
 
+// A static translucent surface: no backdrop blur, display link or render polling.
+// Only layout and touch-state changes update these layers.
+@interface MotorStormControlButton : UIButton
+@property(nonatomic, strong) CAGradientLayer *sheen;
+@end
+@implementation MotorStormControlButton
+- (instancetype)initWithFrame:(CGRect)frame
+{
+    self = [super initWithFrame:frame];
+    if (self) {
+        self.layer.cornerCurve = kCACornerCurveContinuous;
+        self.layer.borderWidth = 0.75;
+        self.layer.cornerRadius = 15;
+        self.adjustsImageWhenHighlighted = NO;
+        self.sheen = [CAGradientLayer layer];
+        [self.layer insertSublayer:self.sheen atIndex:0];
+        [self updateAppearance];
+    }
+    return self;
+}
+- (void)updateAppearance
+{
+    UIColor *accent = [UIColor colorWithRed:1.0 green:0.80 blue:0.28 alpha:1.0];
+    UIColor *foreground = self.highlighted ? accent : [UIColor.whiteColor colorWithAlphaComponent:0.86];
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    self.backgroundColor = self.highlighted ? [accent colorWithAlphaComponent:0.14] :
+                                             [UIColor.blackColor colorWithAlphaComponent:0.10];
+    self.layer.borderColor = (self.highlighted ? [accent colorWithAlphaComponent:0.85] :
+                                                [UIColor.whiteColor colorWithAlphaComponent:0.24]).CGColor;
+    self.sheen.colors = @[(id)[UIColor.whiteColor colorWithAlphaComponent:self.highlighted ? 0.16 : 0.10].CGColor,
+                         (id)[UIColor.whiteColor colorWithAlphaComponent:0.015].CGColor];
+    self.tintColor = foreground;
+    [self setTitleColor:[UIColor.whiteColor colorWithAlphaComponent:0.86] forState:UIControlStateNormal];
+    [self setTitleColor:accent forState:UIControlStateHighlighted];
+    [CATransaction commit];
+}
+- (void)setHighlighted:(BOOL)highlighted
+{
+    [super setHighlighted:highlighted];
+    [self updateAppearance];
+}
+- (void)layoutSubviews
+{
+    [super layoutSubviews];
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    self.sheen.frame = self.bounds;
+    self.sheen.cornerRadius = self.layer.cornerRadius;
+    self.sheen.cornerCurve = kCACornerCurveContinuous;
+    [CATransaction commit];
+}
+@end
+
 static NSDictionary *launchConfiguration(void)
 {
     NSURL *url = [NSBundle.mainBundle URLForResource:@"MotorStormLaunch" withExtension:@"json"];
@@ -31,7 +87,7 @@ static NSDictionary *launchConfiguration(void)
 }
 
 // File validation can touch thousands of files. Keep it off UIKit's thread so
-// the logo is visible and responsive while local/bookmarked storage is checked.
+// the interface remains responsive while local/bookmarked storage is checked.
 static NSURL *validatedGameRoot(NSURL *root, NSDictionary *files)
 {
     if (!root || ![files isKindOfClass:NSDictionary.class] || !files.count) return nil;
@@ -47,7 +103,6 @@ static NSURL *validatedGameRoot(NSURL *root, NSDictionary *files)
 
 @interface MotorStormController : UIViewController <UIDocumentPickerDelegate>
 @property(nonatomic, strong) MotorStormMetalView *gameView;
-@property(nonatomic, strong) UIImageView *logo;
 @property(nonatomic, strong) UIView *controls;
 @property(nonatomic, strong) NSURL *gameRoot;
 @property(nonatomic, strong) NSURL *scopedURL;
@@ -55,6 +110,7 @@ static NSURL *validatedGameRoot(NSURL *root, NSDictionary *files)
 @property(nonatomic) BOOL launchPending;
 @property(nonatomic) BOOL started;
 @property(nonatomic) BOOL gameRunning;
+@property(nonatomic) BOOL fillGameScreen;
 - (void)gameReturned:(int)result;
 @end
 
@@ -96,6 +152,11 @@ static void *runGame(void *opaque)
     self.gameView = [MotorStormMetalView new];
     self.gameView.backgroundColor = UIColor.blackColor;
     self.gameView.userInteractionEnabled = NO;
+    // Only stretch the presented texture. The renderer still owns drawableSize
+    // at the guest resolution; the controls are a separate sibling view.
+    self.gameView.layer.contentsGravity = kCAGravityResize;
+    const char *fillScreen = getenv("MOTORSTORM_IOS_FILL_SCREEN");
+    self.fillGameScreen = !fillScreen || strcmp(fillScreen, "0") != 0;
     [self.view addSubview:self.gameView];
     self.controls = [UIView new];
     self.controls.hidden = YES;
@@ -106,15 +167,9 @@ static void *runGame(void *opaque)
     [self addControl:@"↑" key:126];
     [self addControl:@"↓" key:125];
     [self addControl:@"BOOST" key:49];
-    [self addControl:@"H-BRAKE" key:56];
     [self addControl:@"✓" key:36];
-    [self addControl:@"Ⅱ / Back" key:53];
+    [self addControl:@"Back" key:53];
     [self addControl:@"Camera" key:8];
-    self.logo = [[UIImageView alloc] initWithImage:[UIImage imageNamed:@"LaunchLogo"]];
-    self.logo.contentMode = UIViewContentModeScaleAspectFit;
-    self.logo.accessibilityLabel = @"MotorStorm";
-    self.logo.isAccessibilityElement = YES;
-    [self.view addSubview:self.logo];
 }
 - (void)viewDidAppear:(BOOL)animated
 {
@@ -127,45 +182,84 @@ static void *runGame(void *opaque)
 }
 - (void)addControl:(NSString *)title key:(unsigned)key
 {
-    UIButton *button = [UIButton buttonWithType:UIButtonTypeCustom];
+    UIButton *button = [[MotorStormControlButton alloc] initWithFrame:CGRectZero];
     button.tag = key;
     button.accessibilityIdentifier = [NSString stringWithFormat:@"pad-%u", key];
     button.accessibilityLabel = title;
-    button.backgroundColor = [UIColor.blackColor colorWithAlphaComponent:0.55];
-    button.layer.cornerRadius = 15;
-    button.layer.borderWidth = 1;
-    button.layer.borderColor = [UIColor.whiteColor colorWithAlphaComponent:0.45].CGColor;
-    button.titleLabel.font = [UIFont boldSystemFontOfSize:17];
-    [button setTitle:title forState:UIControlStateNormal];
+    switch (key) {
+        case 123: button.accessibilityLabel = @"Left"; break;
+        case 124: button.accessibilityLabel = @"Right"; break;
+        case 126: button.accessibilityLabel = @"Throttle / menu up"; break;
+        case 125: button.accessibilityLabel = @"Brake / menu down"; break;
+    }
+    button.titleLabel.font = [UIFont systemFontOfSize:key == 49 ? 15 : 16
+                                               weight:key == 49 ? UIFontWeightSemibold : UIFontWeightMedium];
+    NSString *symbol = nil;
+    switch (key) {
+        case 123: symbol = @"chevron.left"; break;
+        case 124: symbol = @"chevron.right"; break;
+        case 126: symbol = @"chevron.up"; break;
+        case 125: symbol = @"chevron.down"; break;
+        case 36: symbol = @"checkmark"; break;
+    }
+    if (symbol) {
+        [button setImage:[UIImage systemImageNamed:symbol] forState:UIControlStateNormal];
+        [button setPreferredSymbolConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:22
+            weight:UIImageSymbolWeightMedium] forImageInState:UIControlStateNormal];
+    } else {
+        [button setTitle:title forState:UIControlStateNormal];
+    }
     [button addTarget:self action:@selector(controlDown:) forControlEvents:UIControlEventTouchDown | UIControlEventTouchDragEnter];
     [button addTarget:self action:@selector(controlUp:) forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside | UIControlEventTouchCancel | UIControlEventTouchDragExit];
     [self.controls addSubview:button];
 }
-- (void)controlDown:(UIButton *)sender { rsx_metal_touch_key((unsigned)sender.tag, 1); sender.alpha = 0.55; }
-- (void)controlUp:(UIButton *)sender { rsx_metal_touch_key((unsigned)sender.tag, 0); sender.alpha = 1; }
+- (void)controlDown:(UIButton *)sender { rsx_metal_touch_key((unsigned)sender.tag, 1); sender.highlighted = YES; }
+- (void)controlUp:(UIButton *)sender { rsx_metal_touch_key((unsigned)sender.tag, 0); sender.highlighted = NO; }
 - (void)viewDidLayoutSubviews
 {
     [super viewDidLayoutSubviews];
     CGRect bounds = self.view.bounds;
     CGFloat scale = MIN(bounds.size.width / 1280.0, bounds.size.height / 720.0);
     CGSize size = CGSizeMake(1280 * scale, 720 * scale);
-    self.gameView.frame = CGRectMake((bounds.size.width-size.width)/2, (bounds.size.height-size.height)/2, size.width, size.height);
+    // Fill Duo's taller landscape display. Conventional 16:9/wider displays
+    // retain the previous fit. A launch override of 0 restores fit everywhere.
+    BOOL tallerLandscape = bounds.size.width > bounds.size.height &&
+                           bounds.size.height > bounds.size.width * (720.0 / 1280.0);
+    self.gameView.frame = self.fillGameScreen && tallerLandscape ? bounds :
+        CGRectMake((bounds.size.width-size.width)/2, (bounds.size.height-size.height)/2, size.width, size.height);
     self.controls.frame = bounds;
-    CGFloat width = MIN(bounds.size.width * 0.72, 720.0);
-    CGSize logoSize = self.logo.image.size;
-    CGFloat height = logoSize.width > 0 ? width * logoSize.height / logoSize.width : 0;
-    self.logo.frame = CGRectMake((bounds.size.width-width)/2, (bounds.size.height-height)/2, width, height);
     UIEdgeInsets safe = self.view.safeAreaInsets;
-    CGFloat left = safe.left + 12, right = bounds.size.width - safe.right - 12;
-    CGFloat bottom = bounds.size.height - safe.bottom - 12;
+    // Anchor the overlay to the screen edges. The Duo cover display reports a
+    // large horizontal safe inset that swaps sides on rotation; applying it to
+    // these controls leaves one entire thumb group unnecessarily far inboard.
+    // Keep safe-area sizing and vertical placement, including on the inner screen.
+    CGFloat left = 12, right = bounds.size.width - 12;
+    // Match the reference's thumb position, just below screen center. Keep the
+    // four driving targets equally large and the right pedals side by side.
+    CGFloat safeWidth = bounds.size.width - safe.left - safe.right;
+    CGFloat driveSize = MIN(104.0, MAX(84.0, safeWidth * 0.11));
+    CGFloat driveGap = MIN(28.0, MAX(16.0, safeWidth * 0.025));
+    CGFloat driveInset = MAX(12.0, MIN(24.0, safeWidth * 0.02));
+    CGFloat driveLeft = driveInset;
+    CGFloat driveRight = bounds.size.width - driveInset;
+    CGFloat boostWidth = 136.0, boostHeight = 52.0, boostGap = 12.0;
+    CGFloat driveY = bounds.size.height * 0.54 - driveSize / 2;
+    CGFloat minimumY = safe.top + 12 + 44 + 16 + boostHeight + boostGap;
+    CGFloat maximumY = bounds.size.height - safe.bottom - 12 - driveSize;
+    driveY = MIN(MAX(driveY, minimumY), maximumY);
+    CGFloat boostX = driveLeft + (2 * driveSize + driveGap - boostWidth) / 2;
     for (UIButton *b in self.controls.subviews) {
+        if (b.tag >= 123 && b.tag <= 126) {
+            [b setPreferredSymbolConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:driveSize * 0.34
+                weight:UIImageSymbolWeightMedium] forImageInState:UIControlStateNormal];
+            b.layer.cornerRadius = driveSize * 0.22;
+        }
         switch (b.tag) {
-            case 123: b.frame=CGRectMake(left,bottom-64,64,64); break;
-            case 124: b.frame=CGRectMake(left+76,bottom-64,64,64); break;
-            case 126: b.frame=CGRectMake(right-64,bottom-140,64,64); break;
-            case 125: b.frame=CGRectMake(right-64,bottom-64,64,64); break;
-            case 49: b.frame=CGRectMake(right-154,bottom-140,78,64); break;
-            case 56: b.frame=CGRectMake(right-154,bottom-64,78,64); break;
+            case 123: b.frame=CGRectMake(driveLeft,driveY,driveSize,driveSize); break;
+            case 124: b.frame=CGRectMake(driveLeft+driveSize+driveGap,driveY,driveSize,driveSize); break;
+            case 126: b.frame=CGRectMake(driveRight-driveSize,driveY,driveSize,driveSize); break;
+            case 125: b.frame=CGRectMake(driveRight-2*driveSize-driveGap,driveY,driveSize,driveSize); break;
+            case 49: b.frame=CGRectMake(boostX,driveY-boostGap-boostHeight,boostWidth,boostHeight); break;
             case 36: b.frame=CGRectMake(right-64,safe.top+12,64,44); break;
             case 53: b.frame=CGRectMake(left,safe.top+12,100,44); break;
             case 8: b.frame=CGRectMake(left+112,safe.top+12,88,44); break;
@@ -285,7 +379,6 @@ static void *runGame(void *opaque)
     rsx_metal_backend_on_first_presented(^{
         MotorStormController *controller = weakSelf;
         if (!controller.gameRunning) return;
-        controller.logo.hidden = YES;
         controller.controls.hidden = NO;
     });
     BootArguments *boot = new BootArguments{strdup([self.gameRoot URLByAppendingPathComponent:@"PS3_GAME/USRDIR/EBOOT.elf"].fileSystemRepresentation), (__bridge_retained void *)self};
@@ -302,7 +395,6 @@ static void *runGame(void *opaque)
 {
     self.gameRunning = NO;
     MSDiagnosticsFinish(result);
-    self.logo.hidden = NO;
     self.controls.hidden = YES;
     UIApplication.sharedApplication.idleTimerDisabled = NO;
     [self showLaunchError:[NSString stringWithFormat:@"Game stopped (%d). Close and reopen MotorStorm to try again.",result] allowFolder:NO];
