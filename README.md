@@ -291,12 +291,10 @@ every 1024th call); it is off in normal launches. Replay them with
 measurements. These private game fixtures are not committed or exported with
 the ordinary diagnostics ZIP.
 
-On iOS, opening the app shows the supplied centered logo on black and starts
-MotorStorm automatically. The system launch storyboard is plain black; the logo
-belongs to the app's landscape controller, exactly like the former menu buttons.
-This avoids the upside-down system launch snapshot observed on Duo, without
-rotating the image or adding a launch delay. The logo remains until the first drawable is actually
-presented. The start screen has no title, buttons or FPS overlay. File validation
+On iOS, opening the app starts MotorStorm automatically, with a plain black
+background until the game's first frame. There is no added startup logo, title,
+setup buttons, FPS overlay or artificial delay. Touch controls appear when the
+first drawable is actually presented. File validation
 runs off the UI thread; existing local folders and saved folder bookmarks still
 work. If game files are missing, an error dialog offers folder selection or a
 retry. There is no file picker or confirmation on a normal successful launch.
@@ -304,8 +302,8 @@ retry. There is no file picker or confirmation on a normal successful launch.
 The iOS Duo fill experiment stretches the final game image to cover landscape
 displays taller than 16:9. It changes only the game view's frame and explicitly
 uses resize gravity; the Metal drawable and game render targets keep their
-guest resolution. Touch controls and the startup logo remain separate, unscaled
-views. Conventional 16:9 or wider screens keep the previous aspect fit. Launch
+guest resolution. Touch controls remain a separate, unscaled view.
+Conventional 16:9 or wider screens keep the previous aspect fit. Launch
 with `MOTORSTORM_IOS_FILL_SCREEN=0` to restore aspect fit without rebuilding;
 the default is enabled. This intentionally changes the game image's proportions
 and does not change the camera's field of view or add rendered detail.

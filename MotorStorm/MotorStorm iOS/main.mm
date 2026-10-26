@@ -32,7 +32,7 @@ static NSDictionary *launchConfiguration(void)
 }
 
 // File validation can touch thousands of files. Keep it off UIKit's thread so
-// the logo is visible and responsive while local/bookmarked storage is checked.
+// the interface remains responsive while local/bookmarked storage is checked.
 static NSURL *validatedGameRoot(NSURL *root, NSDictionary *files)
 {
     if (!root || ![files isKindOfClass:NSDictionary.class] || !files.count) return nil;
@@ -48,7 +48,6 @@ static NSURL *validatedGameRoot(NSURL *root, NSDictionary *files)
 
 @interface MotorStormController : UIViewController <UIDocumentPickerDelegate>
 @property(nonatomic, strong) MotorStormMetalView *gameView;
-@property(nonatomic, strong) UIImageView *logo;
 @property(nonatomic, strong) UIView *controls;
 @property(nonatomic, strong) NSURL *gameRoot;
 @property(nonatomic, strong) NSURL *scopedURL;
@@ -99,7 +98,7 @@ static void *runGame(void *opaque)
     self.gameView.backgroundColor = UIColor.blackColor;
     self.gameView.userInteractionEnabled = NO;
     // Only stretch the presented texture. The renderer still owns drawableSize
-    // at the guest resolution; the controls and logo are separate sibling views.
+    // at the guest resolution; the controls are a separate sibling view.
     self.gameView.layer.contentsGravity = kCAGravityResize;
     const char *fillScreen = getenv("MOTORSTORM_IOS_FILL_SCREEN");
     self.fillGameScreen = !fillScreen || strcmp(fillScreen, "0") != 0;
@@ -117,11 +116,6 @@ static void *runGame(void *opaque)
     [self addControl:@"✓" key:36];
     [self addControl:@"Ⅱ / Back" key:53];
     [self addControl:@"Camera" key:8];
-    self.logo = [[UIImageView alloc] initWithImage:[UIImage imageNamed:@"LaunchLogo"]];
-    self.logo.contentMode = UIViewContentModeScaleAspectFit;
-    self.logo.accessibilityLabel = @"MotorStorm";
-    self.logo.isAccessibilityElement = YES;
-    [self.view addSubview:self.logo];
 }
 - (void)viewDidAppear:(BOOL)animated
 {
@@ -163,10 +157,6 @@ static void *runGame(void *opaque)
     self.gameView.frame = self.fillGameScreen && tallerLandscape ? bounds :
         CGRectMake((bounds.size.width-size.width)/2, (bounds.size.height-size.height)/2, size.width, size.height);
     self.controls.frame = bounds;
-    CGFloat width = MIN(bounds.size.width * 0.72, 720.0);
-    CGSize logoSize = self.logo.image.size;
-    CGFloat height = logoSize.width > 0 ? width * logoSize.height / logoSize.width : 0;
-    self.logo.frame = CGRectMake((bounds.size.width-width)/2, (bounds.size.height-height)/2, width, height);
     UIEdgeInsets safe = self.view.safeAreaInsets;
     CGFloat left = safe.left + 12, right = bounds.size.width - safe.right - 12;
     CGFloat bottom = bounds.size.height - safe.bottom - 12;
@@ -297,7 +287,6 @@ static void *runGame(void *opaque)
     rsx_metal_backend_on_first_presented(^{
         MotorStormController *controller = weakSelf;
         if (!controller.gameRunning) return;
-        controller.logo.hidden = YES;
         controller.controls.hidden = NO;
     });
     BootArguments *boot = new BootArguments{strdup([self.gameRoot URLByAppendingPathComponent:@"PS3_GAME/USRDIR/EBOOT.elf"].fileSystemRepresentation), (__bridge_retained void *)self};
@@ -314,7 +303,6 @@ static void *runGame(void *opaque)
 {
     self.gameRunning = NO;
     MSDiagnosticsFinish(result);
-    self.logo.hidden = NO;
     self.controls.hidden = YES;
     UIApplication.sharedApplication.idleTimerDisabled = NO;
     [self showLaunchError:[NSString stringWithFormat:@"Game stopped (%d). Close and reopen MotorStorm to try again.",result] allowFolder:NO];
