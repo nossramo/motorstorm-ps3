@@ -52,6 +52,9 @@ Open `MotorStorm/MotorStorm.xcodeproj`.
   `com.motorstorm.port.macos`; existing local macOS signing overrides are
   independent.
 
+The macOS app's title bar shows only **MotorStorm**. Its app build disables the
+optional FPS/frame-time title suffix without modifying the pinned runtime.
+
 The game runtime is compiled as Release even when the Xcode scheme says Debug.
 Running from Xcode attaches the debugger; quit the app and open it again from
 the device if you want to judge speed.

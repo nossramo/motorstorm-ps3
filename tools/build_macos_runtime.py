@@ -32,7 +32,10 @@ def baseline_commit(root=ROOT):
 def macos_environment(root=ROOT):
     data = subprocess.check_output(['git', '-C', str(root), 'show',
                                     baseline_commit(root) + ':port/macos-launch.json'])
-    return {key: value.replace('${ROOT}', str(root)) for key, value in json.loads(data).items()}
+    values = {key: value.replace('${ROOT}', str(root)) for key, value in json.loads(data).items()}
+    # App presentation defaults only; keep the pinned engine/profile intact.
+    values.update(PS3_TITLE='MotorStorm', PS3RECOMP_METAL_FPS='0')
+    return values
 
 
 def run(*args, cwd=ROOT, **kwargs):
