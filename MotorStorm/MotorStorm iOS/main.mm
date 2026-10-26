@@ -6,6 +6,7 @@
 #include <pthread.h>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <unistd.h>
 
 extern "C" int motorstorm_main(int, char **);
@@ -55,6 +56,7 @@ static NSURL *validatedGameRoot(NSURL *root, NSDictionary *files)
 @property(nonatomic) BOOL launchPending;
 @property(nonatomic) BOOL started;
 @property(nonatomic) BOOL gameRunning;
+@property(nonatomic) BOOL fillGameScreen;
 - (void)gameReturned:(int)result;
 @end
 
@@ -96,6 +98,11 @@ static void *runGame(void *opaque)
     self.gameView = [MotorStormMetalView new];
     self.gameView.backgroundColor = UIColor.blackColor;
     self.gameView.userInteractionEnabled = NO;
+    // Only stretch the presented texture. The renderer still owns drawableSize
+    // at the guest resolution; the controls and logo are separate sibling views.
+    self.gameView.layer.contentsGravity = kCAGravityResize;
+    const char *fillScreen = getenv("MOTORSTORM_IOS_FILL_SCREEN");
+    self.fillGameScreen = !fillScreen || strcmp(fillScreen, "0") != 0;
     [self.view addSubview:self.gameView];
     self.controls = [UIView new];
     self.controls.hidden = YES;
@@ -149,7 +156,12 @@ static void *runGame(void *opaque)
     CGRect bounds = self.view.bounds;
     CGFloat scale = MIN(bounds.size.width / 1280.0, bounds.size.height / 720.0);
     CGSize size = CGSizeMake(1280 * scale, 720 * scale);
-    self.gameView.frame = CGRectMake((bounds.size.width-size.width)/2, (bounds.size.height-size.height)/2, size.width, size.height);
+    // Fill Duo's taller landscape display. Conventional 16:9/wider displays
+    // retain the previous fit. A launch override of 0 restores fit everywhere.
+    BOOL tallerLandscape = bounds.size.width > bounds.size.height &&
+                           bounds.size.height > bounds.size.width * (720.0 / 1280.0);
+    self.gameView.frame = self.fillGameScreen && tallerLandscape ? bounds :
+        CGRectMake((bounds.size.width-size.width)/2, (bounds.size.height-size.height)/2, size.width, size.height);
     self.controls.frame = bounds;
     CGFloat width = MIN(bounds.size.width * 0.72, 720.0);
     CGSize logoSize = self.logo.image.size;

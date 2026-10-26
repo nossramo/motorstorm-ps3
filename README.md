@@ -301,6 +301,15 @@ runs off the UI thread; existing local folders and saved folder bookmarks still
 work. If game files are missing, an error dialog offers folder selection or a
 retry. There is no file picker or confirmation on a normal successful launch.
 
+The iOS Duo fill experiment stretches the final game image to cover landscape
+displays taller than 16:9. It changes only the game view's frame and explicitly
+uses resize gravity; the Metal drawable and game render targets keep their
+guest resolution. Touch controls and the startup logo remain separate, unscaled
+views. Conventional 16:9 or wider screens keep the previous aspect fit. Launch
+with `MOTORSTORM_IOS_FILL_SCREEN=0` to restore aspect fit without rebuilding;
+the default is enabled. This intentionally changes the game image's proportions
+and does not change the camera's field of view or add rendered detail.
+
 ### iOS performance diagnostics
 
 Normal and connected-device launches both start automatically; the old
