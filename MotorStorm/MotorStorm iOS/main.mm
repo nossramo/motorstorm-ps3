@@ -112,9 +112,8 @@ static void *runGame(void *opaque)
     [self addControl:@"↑" key:126];
     [self addControl:@"↓" key:125];
     [self addControl:@"BOOST" key:49];
-    [self addControl:@"H-BRAKE" key:56];
     [self addControl:@"✓" key:36];
-    [self addControl:@"Ⅱ / Back" key:53];
+    [self addControl:@"Back" key:53];
     [self addControl:@"Camera" key:8];
 }
 - (void)viewDidAppear:(BOOL)animated
@@ -132,6 +131,12 @@ static void *runGame(void *opaque)
     button.tag = key;
     button.accessibilityIdentifier = [NSString stringWithFormat:@"pad-%u", key];
     button.accessibilityLabel = title;
+    switch (key) {
+        case 123: button.accessibilityLabel = @"Left"; break;
+        case 124: button.accessibilityLabel = @"Right"; break;
+        case 126: button.accessibilityLabel = @"Throttle / menu up"; break;
+        case 125: button.accessibilityLabel = @"Brake / menu down"; break;
+    }
     button.backgroundColor = [UIColor.blackColor colorWithAlphaComponent:0.55];
     button.layer.cornerRadius = 15;
     button.layer.borderWidth = 1;
@@ -159,15 +164,31 @@ static void *runGame(void *opaque)
     self.controls.frame = bounds;
     UIEdgeInsets safe = self.view.safeAreaInsets;
     CGFloat left = safe.left + 12, right = bounds.size.width - safe.right - 12;
-    CGFloat bottom = bounds.size.height - safe.bottom - 12;
+    // Match the reference's thumb position, just below screen center. Keep the
+    // four driving targets equally large and the right pedals side by side.
+    CGFloat safeWidth = bounds.size.width - safe.left - safe.right;
+    CGFloat driveSize = MIN(104.0, MAX(84.0, safeWidth * 0.11));
+    CGFloat driveGap = MIN(28.0, MAX(16.0, safeWidth * 0.025));
+    CGFloat driveInset = MAX(12.0, MIN(24.0, safeWidth * 0.02));
+    CGFloat driveLeft = safe.left + driveInset;
+    CGFloat driveRight = bounds.size.width - safe.right - driveInset;
+    CGFloat boostWidth = 136.0, boostHeight = 52.0, boostGap = 12.0;
+    CGFloat driveY = bounds.size.height * 0.54 - driveSize / 2;
+    CGFloat minimumY = safe.top + 12 + 44 + 16 + boostHeight + boostGap;
+    CGFloat maximumY = bounds.size.height - safe.bottom - 12 - driveSize;
+    driveY = MIN(MAX(driveY, minimumY), maximumY);
+    CGFloat boostX = driveLeft + (2 * driveSize + driveGap - boostWidth) / 2;
     for (UIButton *b in self.controls.subviews) {
+        if (b.tag >= 123 && b.tag <= 126) {
+            b.titleLabel.font = [UIFont boldSystemFontOfSize:driveSize * 0.38];
+            b.layer.cornerRadius = driveSize * 0.22;
+        }
         switch (b.tag) {
-            case 123: b.frame=CGRectMake(left,bottom-64,64,64); break;
-            case 124: b.frame=CGRectMake(left+76,bottom-64,64,64); break;
-            case 126: b.frame=CGRectMake(right-64,bottom-140,64,64); break;
-            case 125: b.frame=CGRectMake(right-64,bottom-64,64,64); break;
-            case 49: b.frame=CGRectMake(right-154,bottom-140,78,64); break;
-            case 56: b.frame=CGRectMake(right-154,bottom-64,78,64); break;
+            case 123: b.frame=CGRectMake(driveLeft,driveY,driveSize,driveSize); break;
+            case 124: b.frame=CGRectMake(driveLeft+driveSize+driveGap,driveY,driveSize,driveSize); break;
+            case 126: b.frame=CGRectMake(driveRight-driveSize,driveY,driveSize,driveSize); break;
+            case 125: b.frame=CGRectMake(driveRight-2*driveSize-driveGap,driveY,driveSize,driveSize); break;
+            case 49: b.frame=CGRectMake(boostX,driveY-boostGap-boostHeight,boostWidth,boostHeight); break;
             case 36: b.frame=CGRectMake(right-64,safe.top+12,64,44); break;
             case 53: b.frame=CGRectMake(left,safe.top+12,100,44); break;
             case 8: b.frame=CGRectMake(left+112,safe.top+12,88,44); break;

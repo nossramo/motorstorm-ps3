@@ -308,6 +308,12 @@ with `MOTORSTORM_IOS_FILL_SCREEN=0` to restore aspect fit without rebuilding;
 the default is enabled. This intentionally changes the game image's proportions
 and does not change the camera's field of view or add rendered detail.
 
+The iOS driving controls sit just below screen center: larger left/right
+buttons on the left, with Boost above them, and brake/throttle side by side on
+the right. Their size adapts to the safe area (up to 104 points instead of 64).
+The handbrake touch button is removed; the top Back button keeps its existing
+input mapping but no longer displays a pause symbol.
+
 ### iOS performance diagnostics
 
 Normal and connected-device launches both start automatically; the old
