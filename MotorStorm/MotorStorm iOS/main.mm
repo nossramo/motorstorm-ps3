@@ -229,15 +229,19 @@ static void *runGame(void *opaque)
         CGRectMake((bounds.size.width-size.width)/2, (bounds.size.height-size.height)/2, size.width, size.height);
     self.controls.frame = bounds;
     UIEdgeInsets safe = self.view.safeAreaInsets;
-    CGFloat left = safe.left + 12, right = bounds.size.width - safe.right - 12;
+    // Anchor the overlay to the screen edges. The Duo cover display reports a
+    // large horizontal safe inset that swaps sides on rotation; applying it to
+    // these controls leaves one entire thumb group unnecessarily far inboard.
+    // Keep safe-area sizing and vertical placement, including on the inner screen.
+    CGFloat left = 12, right = bounds.size.width - 12;
     // Match the reference's thumb position, just below screen center. Keep the
     // four driving targets equally large and the right pedals side by side.
     CGFloat safeWidth = bounds.size.width - safe.left - safe.right;
     CGFloat driveSize = MIN(104.0, MAX(84.0, safeWidth * 0.11));
     CGFloat driveGap = MIN(28.0, MAX(16.0, safeWidth * 0.025));
     CGFloat driveInset = MAX(12.0, MIN(24.0, safeWidth * 0.02));
-    CGFloat driveLeft = safe.left + driveInset;
-    CGFloat driveRight = bounds.size.width - safe.right - driveInset;
+    CGFloat driveLeft = driveInset;
+    CGFloat driveRight = bounds.size.width - driveInset;
     CGFloat boostWidth = 136.0, boostHeight = 52.0, boostGap = 12.0;
     CGFloat driveY = bounds.size.height * 0.54 - driveSize / 2;
     CGFloat minimumY = safe.top + 12 + 44 + 16 + boostHeight + boostGap;

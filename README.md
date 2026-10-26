@@ -316,6 +316,10 @@ input mapping but no longer displays a pause symbol.
 The controls use a subtle static translucent gradient, thin borders and SF
 Symbol arrows, with a warm yellow pressed state. Their geometry is unchanged;
 the style adds no backdrop blur, display timer or per-frame CPU work.
+Horizontal positions follow the screen edges with a small margin, so the Duo
+cover display's asymmetric safe-area inset does not push one group inward when
+rotated. Button sizes and vertical placement still use the same layout rules;
+the inner display's layout is unchanged.
 
 ### iOS performance diagnostics
 
